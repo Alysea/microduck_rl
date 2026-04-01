@@ -1,0 +1,594 @@
+"""HTML body template for the sim2real blog post.
+Called from build_blog.py with figure base64 strings.
+"""
+
+
+def html_section(id_, title, content):
+    return f'<section id="{id_}">\n<h2>{title}</h2>\n{content}\n</section>\n'
+
+
+def img_tag(b64, alt="", width="100%"):
+    return f'<img src="data:image/png;base64,{b64}" alt="{alt}" style="width:{width};max-width:900px;display:block;margin:1.5em auto;border-radius:6px;box-shadow:0 2px 12px #0002"/>'
+
+
+def build_body(f1, f2, f3, f4, f5, f6, f7, f8, f_gap):
+    return f"""
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#robot">The Robot and the Challenge</a></li>
+    <li><a href="#motor">The XL330-M288 Motor</a></li>
+    <li><a href="#bam">System Identification with BAM</a></li>
+    <li><a href="#dr">Domain Randomisation</a></li>
+    <li><a href="#rl">RL Training Setup</a></li>
+    <li><a href="#runtime">Runtime and Battery Compensation</a></li>
+    <li><a href="#lean">Lateral Lean Investigation</a></li>
+    <li><a href="#sysid">MuJoCo System Identification on Walking Data</a></li>
+    <li><a href="#action_scale">The action_scale Mystery</a></li>
+    <li><a href="#summary">Summary: The Sim2Real Gap Stack</a></li>
+    <li><a href="#future">Beyond Standard MuJoCo: Actuator Nets &amp; Custom Models</a></li>
+    <li><a href="#next">Open Questions, Opinions, and Next Steps</a></li>
+  </ol>
+</nav>
+
+<!-- ── 1. Robot ── -->
+{html_section("robot", "1. The Robot and the Challenge", '''
+<p>MicroDuck is a miniature bipedal robot weighing <strong>755 g</strong> and standing roughly <strong>25 cm</strong> tall in its crouched home pose.
+It has <strong>15 actuated joints</strong>: 5 per leg (hip yaw, hip roll, hip pitch, knee, ankle), 4 for the neck/head (neck pitch, head pitch, head yaw, head roll),
+and 1 for the mouth (opening/closing) — though the mouth DOF is not part of the learned policy and is controlled independently.
+All joints are driven by <strong>Dynamixel XL330-M288</strong> servo motors running firmware position control.</p>
+
+<p>The runtime is written in <strong>Rust</strong>, running on a Raspberry Pi Zero 2W. ONNX policies are loaded via <code>ort</code> (ONNX Runtime).
+A BNO055 or BNO08X IMU provides orientation and angular velocity via I&sup2;C.
+Motor communication goes through a Dynamixel TTL bus at 1 Mbps. The control loop runs at <strong>50 Hz</strong>.
+An Xbox controller provides velocity commands wirelessly.</p>
+
+<p>The walking policy is trained entirely in simulation using PPO via <strong>mjlab</strong>, a lightweight RL framework built on <strong>MuJoCo Warp</strong> (NVIDIA Warp-based GPU acceleration of MuJoCo, distinct from the JAX-based MJX). mjlab borrows Isaac Lab&rsquo;s manager-based API design but uses MuJoCo as the physics engine. Policies are exported to ONNX and deployed on-robot.
+The central goal is that a policy trained at <code>action_scale=1.0</code> in simulation should transfer directly to the real robot without any gain reduction.</p>
+
+<h3>Why small bipeds are harder</h3>
+<ul>
+  <li><strong>Actuator nonlinearity dominates.</strong> The XL330 has a plastic gear train with a 288:1 ratio. Motor friction and armature inertia are a large fraction of the available torque budget. A 10% error in torque constant has proportionally more effect than on a humanoid.</li>
+  <li><strong>Battery voltage fluctuates.</strong> The XL330 is rated for 3.7-6.0 V. MicroDuck runs on 2S LiPo (7.4 V nominal, 8.4 V full, 6.0 V discharged). Since motor kp is proportional to supply voltage, the effective gains <em>drift during a session</em>.</li>
+  <li><strong>Body asymmetry matters more.</strong> A lateral CoM offset of 2 mm on a 100 g leg segment is a meaningful bias torque. The same offset on a large robot is negligible.</li>
+  <li><strong>Control latency is a larger fraction of the gait cycle.</strong> At 50 Hz, 3 steps of delay = 60 ms, a significant chunk of a ~300 ms step period.</li>
+</ul>
+''')}
+
+<!-- ── 2. Motor ── -->
+{html_section("motor", "2. The XL330-M288 Motor", '''
+<p>All joints use the <strong>Dynamixel XL330-M288-T</strong>, a micro servo from Robotis weighing just 18 g.</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Spec</th><th>Value</th></tr>
+  <tr><td>Weight</td><td>18 g</td></tr>
+  <tr><td>Gear ratio</td><td>288.4 : 1 (plastic spur gears)</td></tr>
+  <tr><td>Motor type</td><td>Cored DC motor</td></tr>
+  <tr><td>Encoder</td><td>Contactless absolute (ams AS5601), 12-bit, 4096 pulses/rev</td></tr>
+  <tr><td>Input voltage</td><td>3.7 &ndash; 6.0 V (recommended 5.0 V)</td></tr>
+  <tr><td>Stall torque (5.0 V)</td><td>0.52 Nm @ 1.47 A</td></tr>
+  <tr><td>Stall torque (6.0 V)</td><td>0.60 Nm @ 1.74 A</td></tr>
+  <tr><td>No-load speed (5.0 V)</td><td>103 RPM (10.8 rad/s)</td></tr>
+  <tr><td>PWM limit</td><td>885 counts (100% duty)</td></tr>
+  <tr><td>Current limit</td><td>1750 mA</td></tr>
+  <tr><td>Communication</td><td>TTL half-duplex, Protocol 2.0, up to 4 Mbps</td></tr>
+  <tr><td>Default position P gain</td><td>400 (register 84, scaled by K_PP = value/128)</td></tr>
+  <tr><td>Operating modes</td><td>Position, Extended Position, Velocity, Current, Current-based Position, PWM</td></tr>
+</table></div>
+
+<div class="callout">
+  <strong>Over-voltage operation.</strong> MicroDuck runs the XL330 at <strong>7.4 V</strong> (2S LiPo), above the rated 6.0 V max. This provides more torque but the firmware voltage limiter must be raised. The motor identification (BAM) is done at vin=7.4 V, matching the actual operating condition.
+  When running at 7.4 V, the firmware kp_fw=200 gives an effective stiffness much higher than at rated voltage. BAM captures this scaling: <code>kp_mj = error_gain &times; kp_fw &times; vin &times; kt / R</code>.
+</div>
+
+<h3>Motor firmware control law</h3>
+<p>In position control mode, the XL330 firmware applies:</p>
+<pre><code>duty_cycle = error_gain &times; kp_fw &times; (goal_position - present_position)
+duty_cycle = clip(duty_cycle, -PWM_LIMIT, PWM_LIMIT)
+voltage = vin &times; duty_cycle
+torque = (voltage &times; kt / R) - (kt&sup2; / R) &times; dq   # back-EMF</code></pre>
+<p>where <code>error_gain = (4096 / 2&pi;) / (KP_DIVISOR &times; PWM_LIMIT) = 0.002877</code> converts radians to the firmware&rsquo;s internal pulse/gain units. KP_DIVISOR=256 was empirically determined (the manual says 128, but measurements show 256).</p>
+''')}
+
+<!-- ── 3. BAM ── -->
+{html_section("bam", "3. System Identification with BAM", f'''
+<h3>3.1 What is BAM?</h3>
+<p><strong>BAM (Better Actuator Model)</strong> is an open-source motor identification framework
+(<a href="https://arxiv.org/abs/2410.08650" style="color:var(--accent)">Duclusaud, Passault, Padois &amp; Ly, 2024</a>).
+A pendulum arm is attached to the motor output; position, velocity, and PWM are logged while the motor tracks reference trajectories.
+A physics model is then fitted using <strong>CMA-ES</strong> (via Optuna), minimising the <strong>Mean Absolute Error</strong> between simulated and measured position traces.
+Data is split 75/25 for identification/validation.</p>
+
+<h3>3.2 The Six Motor Models</h3>
+<p>BAM defines six friction models of increasing complexity. Each defines the maximum friction budget &tau;<sub>f</sub><sup>m</sup> available to oppose motion:</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Model</th><th>#Params</th><th>Friction budget &tau;<sub>f</sub><sup>m</sup></th><th>What it adds</th></tr>
+  <tr><td><strong>M1</strong> Coulomb-Viscous</td><td>2</td>
+      <td><code>K_v|dq| + K_c</code></td>
+      <td>Baseline. Standard in MuJoCo/Isaac.</td></tr>
+  <tr><td><strong>M2</strong> Stribeck</td><td>5</td>
+      <td><code>M1 + K_c<sup>s</sup> exp(-(|dq|/dq*)^&alpha;)</code></td>
+      <td>Extra static friction near zero velocity (Stribeck effect).</td></tr>
+  <tr><td><strong>M3</strong> Load-dependent</td><td>3</td>
+      <td><code>M1 + K_l |&tau;<sub>m</sub> - &tau;<sub>e</sub>|</code></td>
+      <td>Friction proportional to net gearbox load.</td></tr>
+  <tr><td><strong>M4</strong> Stribeck + Load</td><td>7</td>
+      <td><code>M2 + K_l|load| + K_l<sup>s</sup>|load| exp(...)</code></td>
+      <td>Combined Stribeck and load-dependent, including Stribeck-load interaction.</td></tr>
+  <tr><td><strong>M5</strong> Directional</td><td>9</td>
+      <td><code>M4 but K_m&tau;<sub>m</sub> and K_e&tau;<sub>e</sub> split</code></td>
+      <td>Separates motor-side vs external-side friction (directional gearbox efficiency).</td></tr>
+  <tr><td><strong>M6</strong> Quadratic</td><td>11</td>
+      <td><code>M5 + K_m<sup>q</sup>&tau;<sub>m</sub>&sup2; + K_e<sup>q</sup>&tau;<sub>e</sub>&sup2;</code></td>
+      <td>Quadratic load-dependent terms (observed in harmonic drives).</td></tr>
+</table></div>
+
+<p>The BAM paper reports that for Dynamixel spur-gear servos (MX-64, MX-106), <strong>M4-M5 give the best results</strong> (2-3&times; MAE reduction over M1).
+For harmonic drives (eRob80:100), M6 is best. For the XL330 specifically, we explored M1 and M6. M5 (directional) is likely the sweet spot for the XL330
+and should be explored in future work.</p>
+
+<h3>3.3 Testbench Setup</h3>
+<p>A rigid arm of length 0.1 m is attached to the motor output. Different arm masses (0.112, 0.534, 1.012 kg) and springs are used
+to vary the loading conditions. Four trajectory types are recorded at 200 Hz (dt=0.005 s):</p>
+<ul>
+  <li><strong>sin_time_square</strong> &mdash; sinusoidal position with frequency increasing as t&sup2; (sweeps phase/amplitude response)</li>
+  <li><strong>sin_sin</strong> &mdash; double sinusoid with rich frequency content</li>
+  <li><strong>up_and_down</strong> &mdash; slow lift-and-lower, emphasises static friction and Stribeck transitions</li>
+  <li><strong>lift_and_drop</strong> &mdash; lifts mass then releases (torque_enable=false), isolates viscous friction from back-EMF</li>
+</ul>
+
+<h3>3.4 Data Contamination and Filtering</h3>
+<p>The original dataset had <strong>53 recordings</strong>. Analysis revealed that recordings with heavy arm mass (0.223+ kg) and stiff springs (k&ge;800)
+hit <strong>motor torque saturation</strong>: the motor was at maximum PWM with near-zero velocity.</p>
+
+<div class="callout warn">
+  <strong>Contamination mechanism:</strong>
+  Saturated frames (high voltage, zero velocity) inflate the estimated resistance R &mdash;
+  the model explains &ldquo;why didn&rsquo;t it move? must be high R&rdquo;. Then kt compensates downward to preserve the duty-cycle-torque ratio.
+  Net effect: old M1 identified a motor that was <strong>29% weaker</strong> than reality.
+</div>
+
+{img_tag(f2, "Stall detection in BAM data", "100%")}
+<figure>
+  <figcaption><strong>Figure 1.</strong> Stall detection: frames where the motor strains against its voltage limit (high V, zero speed, large position error) are flagged. Files &ge;10% stall fraction are discarded.</figcaption>
+</figure>
+
+<p>Stall criterion: <code>|&omega;| &lt; 0.05 AND |goal-pos| &gt; 0.2 rad AND |V| &gt; 3 V</code>.
+Filter reduced the dataset: <strong>53 &rarr; 22 clean recordings</strong> (17 sin_time_square, 3 sin_sin, 2 up_and_down; all lift_and_drop removed).
+Original data preserved in <code>processed.bak/</code>.</p>
+
+<h3>3.5 M1 Identification Results</h3>
+{img_tag(f1, "Motor identification results comparison")}
+<figure>
+  <figcaption><strong>Figure 2.</strong> Key motor parameters across identification runs. Faded bars = contaminated data.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+  <tr><th>Parameter</th><th>Old M1</th><th>New M1</th><th>Change</th></tr>
+  <tr><td><code>kt</code> (Nm/A)</td><td>0.2007</td><td>0.1819</td><td>&minus;9%</td></tr>
+  <tr><td><code>R</code> (&Omega;)</td><td>2.867</td><td><strong>2.009</strong></td><td><strong>&minus;30%</strong></td></tr>
+  <tr><td><code>armature</code> (kg&middot;m&sup2;)</td><td>0.00153</td><td>0.00207</td><td>+35%</td></tr>
+  <tr><td><code>friction_base</code> (Nm)</td><td>0.0161</td><td><strong>0.0317</strong></td><td><strong>+97%</strong></td></tr>
+  <tr><td><code>friction_viscous</code></td><td>0.0182</td><td>0.0243</td><td>+34%</td></tr>
+  <tr><td><strong>Stall torque</strong> @ 7.4V</td><td>0.518 Nm</td><td><strong>0.670 Nm</strong></td><td><strong>+29%</strong></td></tr>
+</table></div>
+
+<h3>3.6 M6 Identification Results</h3>
+<div class="table-wrap"><table>
+  <tr><th>Parameter</th><th>Old M6</th><th>New M6</th><th>Change</th></tr>
+  <tr><td><code>kt</code></td><td>0.325</td><td>0.247</td><td>&minus;24%</td></tr>
+  <tr><td><code>R</code></td><td>2.649</td><td>2.437</td><td>&minus;8%</td></tr>
+  <tr><td><code>load_friction_motor</code></td><td>0.429</td><td><strong>0.177</strong></td><td><strong>&minus;59%</strong></td></tr>
+  <tr><td><code>load_friction_external</code></td><td>0.002</td><td><strong>0.333</strong></td><td><strong>+15483%</strong></td></tr>
+  <tr><td><code>dtheta_stribeck</code></td><td>2.579</td><td><strong>0.108</strong></td><td><strong>&minus;96%</strong></td></tr>
+  <tr><td><strong>Stall torque</strong> @ 7.4V</td><td>0.908 Nm</td><td>0.750 Nm</td><td>&minus;17%</td></tr>
+</table></div>
+
+<p>Three major changes: (1) <strong>dtheta_stribeck</strong> dropped from 2.58 to 0.108 rad/s &mdash; now physically correct (near-zero velocity);
+(2) <strong>load_friction_external</strong> went from near-zero to 0.333 &mdash; the dominant load-dependent friction mechanism, invisible in contaminated data;
+(3) <strong>load_friction_motor</strong> halved &mdash; old data falsely correlated motor torque with friction due to saturation.</p>
+
+{img_tag(f3, "M6 friction model decomposition")}
+<figure>
+  <figcaption><strong>Figure 3.</strong> Left: M6 friction decomposed into components at typical walking loads. Right: Old vs new M6, with MuJoCo&rsquo;s modelling limit shown. The red-shaded region is friction the sim cannot represent.</figcaption>
+</figure>
+
+<h3>3.7 MuJoCo Export and Its Limits</h3>
+<p>MuJoCo supports: <code>kp</code>, <code>damping</code>, <code>frictionloss</code>, <code>armature</code>, <code>forcerange</code>. This maps to M1. <strong>M2&ndash;M6 terms have no direct MuJoCo equivalent.</strong>
+The BAM export script warns: &ldquo;Model other than m1 can&rsquo;t be exported exactly to MuJoCo.&rdquo;</p>
+
+<div class="table-wrap"><table>
+  <tr><th>MuJoCo param</th><th>Old M6 (trained on)</th><th>New M6 (planned)</th><th>New M1</th></tr>
+  <tr><td><code>kp</code></td><td>0.522</td><td><strong>0.432</strong></td><td>0.386</td></tr>
+  <tr><td><code>damping</code></td><td>0.0480</td><td>0.0418</td><td>0.0408</td></tr>
+  <tr><td><code>frictionloss</code></td><td>0.0060</td><td>0.0078</td><td><strong>0.0317</strong></td></tr>
+  <tr><td><code>armature</code></td><td>0.00196</td><td>0.00223</td><td>0.00207</td></tr>
+  <tr><td><code>forcerange</code></td><td>&plusmn;0.908 Nm</td><td>&plusmn;0.750 Nm</td><td>&plusmn;0.670 Nm</td></tr>
+</table></div>
+
+<div class="callout">
+  <strong>frictionloss discrepancy M6 (0.008) vs M1 (0.032):</strong>
+  M6 decomposes friction into Coulomb + Stribeck + load terms; M1 lumps everything into friction_base.
+  Near zero velocity, M6&rsquo;s total is ~0.021 Nm. The remaining gap (vs M1&rsquo;s 0.032) reflects unmodelled load friction implicitly captured by M1&rsquo;s holistic fit.
+</div>
+''')}
+
+<!-- ── 4. DR ── -->
+{html_section("dr", "4. Domain Randomisation", f'''
+<p>Domain randomisation (DR) is the primary strategy for robustifying the policy against sim-to-real mismatches.
+Parameters are re-sampled at each episode reset.</p>
+
+{img_tag(f4, "Domain randomisation parameters overview")}
+<figure>
+  <figcaption><strong>Figure 4.</strong> All DR parameters and their magnitudes.</figcaption>
+</figure>
+
+<h3>4.1 Physical Parameters</h3>
+<div class="table-wrap"><table>
+  <tr><th>Parameter</th><th>Range</th><th>Motivation</th></tr>
+  <tr><td>Centre of mass offset</td><td>&plusmn;3 mm / axis</td><td>Manufacturing asymmetry, cable routing, CoM estimation error</td></tr>
+  <tr><td>Motor Kp gain</td><td>&times;(0.85, 1.15)</td><td>Firmware gain uncertainty, temperature drift, per-motor variability</td></tr>
+  <tr><td>Motor Kd gain</td><td>&times;(0.90, 1.10)</td><td>Damping estimation error</td></tr>
+  <tr><td>Body mass</td><td>&times;(0.95, 1.05)</td><td>Payload, wear, battery state</td></tr>
+  <tr><td>Body inertia</td><td>&times;(0.95, 1.05)</td><td>Coupled with mass randomisation (physically consistent)</td></tr>
+  <tr><td>IMU mounting angle</td><td>&plusmn;1&deg;</td><td>Sensor misalignment, mechanical flex</td></tr>
+</table></div>
+
+<p>Currently <strong>disabled</strong> (too destabilising): joint friction randomisation, joint damping randomisation, base orientation initialisation.</p>
+
+<h3>4.2 Dynamic Perturbations</h3>
+<p><strong>Velocity pushes:</strong> Every 3-6 s, a velocity impulse of &plusmn;0.3 m/s is applied to the base.
+Trains recovery from external perturbations.</p>
+<p><strong>Neck offset:</strong> Head target randomised every 2-5 s up to &plusmn;0.3 rad (curriculum-gated, starts at iteration 12K).
+Trains robustness to head-induced inertial perturbations.</p>
+
+<h3>4.3 Observation Noise and Delays</h3>
+<div class="table-wrap"><table>
+  <tr><th>Observation</th><th>Noise</th><th>Delay</th></tr>
+  <tr><td>Base angular velocity</td><td>Uniform &plusmn;0.024 rad/s</td><td>0-3 steps (0-60 ms)</td></tr>
+  <tr><td>Projected gravity</td><td>Uniform &plusmn;0.007</td><td>0-3 steps</td></tr>
+  <tr><td>Joint position</td><td>Uniform &plusmn;0.0006 rad</td><td>None (same bus read)</td></tr>
+  <tr><td>Joint velocity</td><td>Uniform &plusmn;0.024 rad/s</td><td>None</td></tr>
+</table></div>
+<p>Delays are resampled every 64 steps. Actuator commands are also delayed by 0-3 steps, modelling firmware processing + USB round-trip.</p>
+
+<h3>4.4 Known DR Gaps</h3>
+<div class="callout warn">
+  <strong>What DR does NOT cover:</strong>
+  <ul style="margin-top:0.5rem">
+    <li><strong>Load-dependent friction</strong> &mdash; MuJoCo only has velocity-dependent friction. M6&rsquo;s <code>load_friction_external=0.333</code> is significant and unmodelled. Kp/Kd DR partially compensates but doesn&rsquo;t model the mechanism correctly.</li>
+    <li><strong>Battery voltage drift</strong> &mdash; supply voltage drops ~25% over a discharge cycle (8.4V &rarr; 6.3V), changing motor kp proportionally. Not randomised in sim (but see runtime voltage compensation below).</li>
+    <li><strong>Motor nonlinearity</strong> &mdash; back-EMF clipping, PWM saturation, Stribeck effect absent from sim actuator.</li>
+    <li><strong>Hardware asymmetry</strong> &mdash; left/right manufacturing differences, per-motor friction variation.</li>
+  </ul>
+</div>
+
+<div class="callout ok">
+  <strong>Opinion: what should be improved.</strong>
+  <ul style="margin-top:0.5rem">
+    <li>Battery voltage DR seems like low-hanging fruit: randomise <code>kp</code> multiplicatively by &times;(0.75, 1.15) to cover the voltage range, rather than the current &times;(0.85, 1.15).</li>
+    <li>Per-motor gain randomisation (different kp per joint) would better capture the per-unit variability vs the current global scale factor.</li>
+    <li>The CoM randomisation range (&plusmn;3 mm) may be too narrow given the observed 7-8&deg; lean. Either widen to &plusmn;5-8 mm or add a directional bias.</li>
+    <li>Joint friction randomisation was disabled because it was &ldquo;too destabilising&rdquo; &mdash; but that may indicate the range was too wide. A narrower range (e.g., frictionloss &times;(0.8, 1.5)) could work and would help close the load-friction gap.</li>
+  </ul>
+</div>
+''')}
+
+<!-- ── 5. RL ── -->
+{html_section("rl", "5. RL Training Setup", f'''
+<h3>5.1 Algorithm: PPO with GAE</h3>
+<div class="param-grid">
+  <div class="param-card"><div class="label">Discount &gamma;</div><div class="value">0.99</div></div>
+  <div class="param-card"><div class="label">GAE &lambda;</div><div class="value">0.95</div></div>
+  <div class="param-card"><div class="label">PPO clip &epsilon;</div><div class="value">0.20</div></div>
+  <div class="param-card"><div class="label">PPO epochs</div><div class="value">5</div></div>
+  <div class="param-card"><div class="label">Mini-batches</div><div class="value">4</div></div>
+  <div class="param-card"><div class="label">Learning rate</div><div class="value">1e-3 (adaptive)</div></div>
+  <div class="param-card"><div class="label">Desired KL</div><div class="value">0.01</div></div>
+  <div class="param-card"><div class="label">Entropy coeff</div><div class="value">0.01</div></div>
+  <div class="param-card"><div class="label">Envs &times; steps</div><div class="value">4096 &times; 24</div></div>
+  <div class="param-card"><div class="label">Max iterations</div><div class="value">50,000</div></div>
+</div>
+
+<h3>5.2 Network Architecture</h3>
+<p>Asymmetric actor-critic with privileged critic observations (base linear velocity, foot heights, terrain scan):</p>
+<pre><code>Actor:  [51] &rarr; ELU[512] &rarr; ELU[256] &rarr; ELU[128] &rarr; [14]   (joint position offsets)
+Critic: [54+] &rarr; ELU[512] &rarr; ELU[256] &rarr; ELU[128] &rarr; [1]   (value function)</code></pre>
+
+<h3>5.3 Observation Space (51D actor)</h3>
+<pre><code>dims  0: 3  &mdash; base angular velocity (body frame)          3D
+dims  3: 6  &mdash; projected gravity vector (body frame)       3D
+dims  6:20  &mdash; joint positions relative to default pose   14D
+dims 20:34  &mdash; joint velocities                           14D
+dims 34:48  &mdash; last action                                14D
+dims 48:51  &mdash; velocity command [vx, vy, &omega;z]              3D</code></pre>
+
+<h3>5.4 Reward Function</h3>
+<div class="table-wrap"><table>
+  <tr><th>Term</th><th>Weight</th><th>Purpose</th></tr>
+  <tr><td>Track linear velocity</td><td>3.0</td><td>Gaussian, &sigma;&sup2;=0.15, track vx/vy</td></tr>
+  <tr><td>Track angular velocity</td><td>3.0</td><td>Gaussian, &sigma;&sup2;=0.40, track &omega;z</td></tr>
+  <tr><td>Upright</td><td>1.0</td><td>Penalise trunk tilt</td></tr>
+  <tr><td>Pose</td><td>2.0</td><td>Soft joint-angle targets (wide &sigma; during walking)</td></tr>
+  <tr><td>CoM height</td><td>1.2</td><td>Keep CoM in 0.08-0.11 m range</td></tr>
+  <tr><td>Air time</td><td>5.0</td><td>Reward swing phases 0.10-0.25 s</td></tr>
+  <tr><td>Foot clearance</td><td>&mdash;</td><td>Lift feet &ge; 2 cm during swing</td></tr>
+  <tr><td>Foot slip</td><td>&minus;0.1</td><td>Penalise sliding at contact</td></tr>
+  <tr><td>Stillness at zero cmd</td><td>3.0</td><td>Penalise motion when v_cmd=0</td></tr>
+  <tr><td><strong>Action rate L2</strong></td><td>&minus;0.6&rarr;&minus;1.0</td><td><strong>Penalise &Vert;a<sub>t</sub>&minus;a<sub>t-1</sub>&Vert;&sup2; &mdash; key for sim2real</strong></td></tr>
+  <tr><td>Joint torques L2</td><td>&minus;1e-3</td><td>Energy efficiency</td></tr>
+  <tr><td>Body angular velocity</td><td>&minus;0.05</td><td>Reduce trunk wobble</td></tr>
+  <tr><td>Angular momentum</td><td>&minus;0.02</td><td>Reduce spinning tendency</td></tr>
+</table></div>
+
+<div class="callout ok">
+  <strong>action_rate_l2 is the most important sim2real regulariser.</strong>
+  It directly penalises high-frequency oscillations. Its weight is curriculum-ramped so early training explores freely.
+</div>
+
+{img_tag(f5, "Curriculum learning schedules")}
+<figure>
+  <figcaption><strong>Figure 5.</strong> Curriculum axes: action rate penalty, standing environment fraction, max command velocity, neck perturbation amplitude.</figcaption>
+</figure>
+
+<h3>5.5 Symmetry</h3>
+<p>Mirror loss (coeff=0.5) enforces bilateral symmetry: <code>L_mirror = 0.5 &times; MSE(&pi;(o), flip(&pi;(flip(o))))</code>.
+Left/right joint indices are swapped and signs negated for yaw/roll axes.</p>
+''')}
+
+<!-- ── 6. Runtime ── -->
+{html_section("runtime", "6. Runtime and Battery Compensation", '''
+<p>The on-robot runtime is written in Rust (<code>microduck_runtime</code>), running on a <strong>Raspberry Pi Zero 2W</strong>.
+Policy inference uses ONNX Runtime (ort) with 2 threads, matching the Pi&rsquo;s dual-core ARM.</p>
+
+<h3>6.1 Control Loop</h3>
+<pre><code>loop at 50 Hz:
+    motor_state = motors.read_state()           # bulk sync_read: current, velocity, position (10 bytes &times; 14 motors)
+    imu_data    = imu.read()                    # BNO055/BNO08X quaternion &rarr; projected gravity + gyro
+    obs         = build_observation(motor_state, imu_data, last_action, command)
+    action      = policy.infer(obs, command)     # ONNX Runtime
+    targets     = DEFAULT_POSE + action * effective_action_scale
+    motors.write_goal_positions(targets)
+    sleep_until(next_tick)                       # maintain 50 Hz</code></pre>
+
+<p>Motor communication is via TTL at 1 Mbps. Bulk sync_read fetches 10 bytes per motor (2 current + 4 velocity + 4 position) in a single bus transaction.
+The IMU runs on a separate I&sup2;C bus.</p>
+
+<h3>6.2 Battery Voltage Compensation</h3>
+<p>The XL330 motor kp is proportional to supply voltage: <code>kp &prop; vin</code>. As the battery discharges (8.4V &rarr; 6.3V over a session),
+the effective motor stiffness drops ~25%. A policy trained at a fixed vin=7.4V will experience different dynamics depending on battery state.</p>
+
+<p>The runtime implements <strong>voltage-adaptive action scaling</strong> (<code>--voltage-adapt</code> flag):</p>
+<pre><code>effective_action_scale = action_scale &times; (nominal_voltage / measured_voltage)
+                       = action_scale &times; (7.4 / voltage_ema)</code></pre>
+
+<p>where <code>voltage_ema</code> is an exponential moving average of the motor bus voltage, updated every second.
+When the battery is full (8.4V), the effective scale is reduced (7.4/8.4 = 0.88&times;); when depleted (6.5V), it&rsquo;s increased (7.4/6.5 = 1.14&times;).
+This compensates for the voltage-proportional gain change without retraining.</p>
+
+<div class="callout">
+  <strong>Recording metadata.</strong> When recording walking data (for sysid or analysis), the runtime saves the measured voltage alongside the action_scale.
+  This allows post-hoc correction: <code>effective_scale = base_scale &times; (7.4 / recorded_voltage)</code>.
+</div>
+
+<h3>6.3 Other Runtime Details</h3>
+<ul>
+  <li><strong>PID gains:</strong> kp_fw=200, ki=0, kd=0 (set at startup via <code>--kp 200</code>)</li>
+  <li><strong>PWM slope:</strong> set to 255 (fastest PWM ramp, checked and corrected at startup)</li>
+  <li><strong>Fall detection:</strong> runtime detects falls via projected gravity and can auto-recover using the standing policy</li>
+  <li><strong>Mouth motor:</strong> independent control (ID 34), not part of the policy observation/action space</li>
+  <li><strong>Gamepad:</strong> Xbox controller via gilrs. Left stick = linear velocity, right stick = angular velocity. Y button = head control mode, B = body pose mode</li>
+  <li><strong>Battery benchmark mode:</strong> walks until battery dies, logging time and voltage</li>
+</ul>
+
+<div class="callout warn">
+  <strong>Opinion: voltage compensation is treating a symptom.</strong>
+  The correct fix would be to include battery voltage as a training observation or to domain-randomise vin during training.
+  The runtime compensation works in practice but breaks the assumption that the policy was trained for a fixed voltage.
+  A voltage-aware policy could make better decisions (e.g., slower gait when voltage is low).
+</div>
+''')}
+
+<!-- ── 7. Lean ── -->
+{html_section("lean", "7. Lateral Lean Investigation", f'''
+<p><strong>Observation:</strong> The real robot consistently leans ~7-8&deg; to the left when walking.</p>
+
+{img_tag(f7, "Lateral lean sim vs real")}
+<figure>
+  <figcaption><strong>Figure 6.</strong> Lateral lean: simulation shows zero bias, real robot shows ~7.5&deg; persistent lean. Source is hardware asymmetry, not policy.</figcaption>
+</figure>
+
+<div class="callout ok">
+  <strong>Confirmed:</strong> The policy does not cause the lean. Source is physical &mdash; likely CoM offset from cable routing, left/right motor friction differences, or IMU mounting tilt.
+</div>
+''')}
+
+<!-- ── 8. Sysid ── -->
+{html_section("sysid", "8. MuJoCo System Identification on Walking Data", f'''
+<h3>8.1 Full-Trajectory Rollout: Failure</h3>
+<p>Standard sysid (multi-step rollout with parameter gradients) fails for biped walking: trajectory diverges within 5-10 steps
+due to contact desynchronisation. The gradient carries no useful signal.</p>
+
+<h3>8.2 One-Step Sysid</h3>
+<p>Alternative: reset state from measurement each frame, step once, compare. Avoids divergence but biases toward lower gains
+(lower kp = smaller move = smaller one-step residual, regardless of correctness).</p>
+
+{img_tag(f8, "Sysid identifiability analysis")}
+<figure>
+  <figcaption><strong>Figure 7.</strong> One-step sysid biases toward low gains. Useful for friction/contact identification, not for actuator gains.</figcaption>
+</figure>
+
+<p><strong>Conclusion:</strong> MuJoCo sysid on walking data is fundamentally limited by trajectory instability.
+BAM on testbench data remains the right approach for motor parameters.</p>
+''')}
+
+<!-- ── 9. action_scale ── -->
+{html_section("action_scale", "9. The action_scale Mystery", f'''
+<p>Policy trained at <code>action_scale=1.0</code>: real robot shakes violently. Needs &asymp;0.65 to walk.</p>
+
+{img_tag(f6, "action_scale root cause analysis")}
+<figure>
+  <figcaption><strong>Figure 8.</strong> Root cause: the real motor delivers more torque than the sim assumed. Reducing action_scale compensates by shrinking the position error.</figcaption>
+</figure>
+
+<h3>Root Cause Chain</h3>
+<ol>
+  <li><strong>Motor strength mismatch:</strong> Old M1 (contaminated): stall=0.518 Nm. Real (new M1): 0.670 Nm. Motor 29% stronger than sim assumed. Policy learned large actions; real motor overshoots.</li>
+  <li><strong>Load-dependent friction:</strong> Real joints carry body weight &rarr; M6 load_friction adds 0.03-0.15 Nm friction absent from sim. Partially offsets motor strength but not enough.</li>
+  <li><strong>After new M1 retraining:</strong> Still needed action_scale ~0.6-0.7. Residual gap = unmodelled load friction.</li>
+  <li><strong>Rejected fix: randomising action_scale.</strong> Treats symptom, not cause. Policy becomes conservative everywhere. Correct fix: improve motor model.</li>
+</ol>
+''')}
+
+<!-- ── 10. Summary ── -->
+{html_section("summary", "10. Summary: The Sim2Real Gap Stack", f'''
+{img_tag(f_gap, "Sim2real gap summary")}
+<figure>
+  <figcaption><strong>Figure 9.</strong> All identified sim2real gap sources, estimated impact, and mitigation status.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+  <tr><th>Gap</th><th>Mechanism</th><th>Mitigation</th><th>Status</th></tr>
+  <tr><td>Motor strength (kt, R)</td><td>BAM data contamination</td><td>New M1/M6 clean data</td><td style="color:#e74c3c">Fix ready, retrain needed</td></tr>
+  <tr><td>Motor Coulomb friction</td><td>Same contamination</td><td>New M1 frictionloss=0.032</td><td style="color:#e74c3c">Fix ready, retrain needed</td></tr>
+  <tr><td>Load-dependent friction</td><td>M6 terms, no MuJoCo equiv</td><td>None standard; see &sect;11</td><td style="color:#c0392b">Ongoing gap</td></tr>
+  <tr><td>Battery voltage drift</td><td>vin drops 8.4&rarr;6.3V</td><td>Runtime --voltage-adapt</td><td style="color:#f39c12">Runtime fix (not in training)</td></tr>
+  <tr><td>Lateral CoM asymmetry</td><td>Hardware manufacturing</td><td>DR &plusmn;3 mm</td><td style="color:#f39c12">Partially mitigated</td></tr>
+  <tr><td>Actuator/sensor delay</td><td>Firmware + bus latency</td><td>Delay DR 0-3 steps</td><td style="color:#27ae60">Mitigated</td></tr>
+  <tr><td>Sensor noise</td><td>IMU, encoder quantisation</td><td>Noise injection</td><td style="color:#27ae60">Mitigated</td></tr>
+  <tr><td>IMU mounting error</td><td>Mechanical misalignment</td><td>DR &plusmn;1&deg;</td><td style="color:#27ae60">Mitigated</td></tr>
+  <tr><td>Motor gain variability</td><td>Temperature, per-unit</td><td>Kp DR &plusmn;15%</td><td style="color:#27ae60">Mitigated</td></tr>
+  <tr><td>Stribeck friction</td><td>Near-zero velocity physics</td><td>Not modelled</td><td style="color:#c0392b">Known gap</td></tr>
+</table></div>
+
+<h3>Parameter Evolution</h3>
+<div class="table-wrap"><table>
+  <tr><th>Stage</th><th>kp</th><th>frictionloss</th><th>forcerange</th><th>action_scale</th></tr>
+  <tr><td>Old M1 (contaminated)</td><td>0.522</td><td>0.016</td><td>&plusmn;0.518 Nm</td><td>~0.65</td></tr>
+  <tr><td>New M1 (clean)</td><td>0.386</td><td>0.032</td><td>&plusmn;0.670 Nm</td><td>~0.60-0.70</td></tr>
+  <tr><td><strong>New M6 (clean) &mdash; planned</strong></td><td><strong>0.432</strong></td><td>0.008</td><td><strong>&plusmn;0.750 Nm</strong></td><td><strong>TBD</strong></td></tr>
+</table></div>
+''')}
+
+<!-- ── 11. Future ── -->
+{html_section("future", "11. Beyond Standard MuJoCo: Actuator Nets &amp; Custom Models", '''
+<p>The fundamental problem: MuJoCo&rsquo;s built-in actuator model (kp + damping + frictionloss) cannot represent load-dependent friction, Stribeck effects, or the full BAM M6 model.
+mjlab uses <strong>MuJoCo Warp</strong> (NVIDIA Warp-based GPU acceleration) rather than MJX (JAX-based). This means custom actuator models must be implemented as Warp kernels rather than JAX functions. MuJoCo Warp does not yet support automatic differentiation through the sim, but Warp kernels are JIT-compiled to CUDA and run at full GPU speed.
+Several approaches could close this gap:</p>
+
+<h3>11.1 Actuator Networks</h3>
+<p>Pioneered by <strong>Hwangbo et al. (Science Robotics, 2019)</strong> for ANYmal: train a small MLP on real motor data
+(input: desired position, current position, velocity &rarr; output: torque), then use this net as the actuator model during RL training.
+The network implicitly captures friction nonlinearity, backlash, Stribeck, load-dependence &mdash; everything BAM models explicitly, plus phenomena the analytical model misses.</p>
+
+<div class="callout ok">
+  <strong>This is the most promising approach for MicroDuck.</strong>
+  BAM already has excellent testbench data at multiple loads and velocities. An actuator net could be trained directly on this data.
+  The BAM M6 identification effectively validates what the net should learn.
+</div>
+
+<p><strong>Implementation path in MuJoCo Warp (mjlab&rsquo;s backend):</strong> MuJoCo Warp runs the physics pipeline on GPU via NVIDIA Warp.
+Custom actuator dynamics can be implemented as <strong>Warp kernels</strong> that modify <code>data.qfrc_applied</code> before stepping.
+Note: MuJoCo Warp does <em>not</em> support PLUGIN-type actuators, so custom models must be applied as external force overrides.
+Warp kernels are JIT-compiled to CUDA &mdash; no speed penalty vs the built-in model. However, unlike MJX (JAX-based), MuJoCo Warp does not yet support automatic differentiation, so the actuator net would need to be trained separately (not end-to-end through the sim).</p>
+
+<pre><code># Pseudocode for actuator net in MuJoCo Warp
+import warp as wp
+import torch  # or warp.torch interop
+
+def custom_actuator_step(model, data, actuator_net):
+    # Compute desired position from ctrl
+    q_desired = data.ctrl[joint_indices]
+    q_current = data.qpos[joint_indices]
+    dq = data.qvel[joint_indices]
+
+    # Actuator net: trained on BAM testbench data
+    net_input = wp.concat([q_desired, q_current, dq])
+    torque = actuator_net(net_input)  # small MLP, runs on GPU
+
+    # Apply as external force (replaces built-in actuator)
+    data.qfrc_applied[joint_indices] = torque
+    return data</code></pre>
+
+<h3>11.2 Analytical BAM Model in MuJoCo Warp</h3>
+<p>Instead of a neural net, implement the full BAM M5 or M6 friction model analytically as a Warp kernel.
+This is simpler (no training data needed beyond BAM identification) and directly uses the identified parameters:</p>
+<pre><code>@wp.kernel
+def m6_friction_kernel(dq: wp.array, tau_motor: wp.array, tau_external: wp.array,
+                       params: M6Params, friction_out: wp.array):
+    i = wp.tid()
+    strib = wp.exp(-wp.pow(wp.abs(dq[i]) / params.dtheta_stribeck, params.alpha))
+    f = (params.friction_base * wp.sign(dq[i])
+       + params.friction_stribeck * strib * wp.sign(dq[i])
+       + params.load_friction_motor * wp.abs(tau_motor[i]) * wp.sign(dq[i])
+       + params.load_friction_external * wp.abs(tau_external[i]) * wp.sign(dq[i])
+       + params.friction_viscous * dq[i])
+    friction_out[i] = f</code></pre>
+
+<p>The challenge is computing <code>tau_motor</code> and <code>tau_external</code> inside the step. Motor torque requires the voltage control law;
+external torque requires reading constraint/gravity forces from <code>data.qfrc_bias</code>. Both are available in MuJoCo Warp&rsquo;s data structure.</p>
+
+<div class="callout">
+  <strong>Opinion: start with the analytical model.</strong> An actuator net requires careful data collection and training.
+  The BAM M5/M6 analytical model is already identified, tested, and validated. Implementing it as a Warp kernel is a weekend project.
+  If it doesn&rsquo;t close the gap, <em>then</em> train an actuator net.
+</div>
+
+<h3>11.3 Feasibility Assessment</h3>
+<div class="table-wrap"><table>
+  <tr><th>Approach</th><th>Effort</th><th>Expected impact</th><th>Risk</th></tr>
+  <tr><td>Update XML with new M6 export</td><td>Low (1 hour)</td><td>Moderate (+12% kp accuracy)</td><td>Low</td></tr>
+  <tr><td>Analytical M6 in MuJoCo Warp</td><td>Medium (days)</td><td>High (full load-friction)</td><td>Medium (Warp kernel integration)</td></tr>
+  <tr><td>Actuator net in MuJoCo Warp</td><td>High (weeks)</td><td>Highest (captures everything)</td><td>Medium (training stability, no auto-diff through sim)</td></tr>
+  <tr><td>DR-only compensation</td><td>Low (hours)</td><td>Moderate (hides gap)</td><td>Low (but doesn&rsquo;t fix root cause)</td></tr>
+</table></div>
+''')}
+
+<!-- ── 12. Next steps ── -->
+{html_section("next", "12. Open Questions, Opinions, and Next Steps", '''
+<h3>Immediate actions</h3>
+<ol>
+  <li><strong>Retrain with New M6 export params</strong> (kp=0.432, forcerange=0.750, damping=0.042). Low effort, should close ~50% of action_scale gap.</li>
+  <li><strong>Widen Kp DR range</strong> to cover battery voltage variation: &times;(0.75, 1.15) instead of &times;(0.85, 1.15).</li>
+  <li><strong>Try M5 identification</strong> on clean data. M5 (directional) is the best model for Dynamixel spur gears per the BAM paper. We only tried M1 and M6.</li>
+</ol>
+
+<h3>Medium-term improvements</h3>
+<ol>
+  <li><strong>Implement M5/M6 analytical friction in MuJoCo Warp.</strong> The identified parameters are ready. Write a Warp kernel that applies BAM friction as <code>qfrc_applied</code>. This eliminates the biggest known gap (load-dependent friction).</li>
+  <li><strong>Add battery voltage to observation space.</strong> The runtime already measures it. A voltage-aware policy could adapt its aggressiveness to battery state instead of relying on runtime compensation.</li>
+  <li><strong>Measure real CoM offset.</strong> Suspend the robot and measure the lean angle to quantify the CoM offset. Use this to set an asymmetric bias in training.</li>
+  <li><strong>Per-motor friction randomisation.</strong> Each of the 14 XL330s has slightly different friction. Randomising frictionloss per-joint would help.</li>
+</ol>
+
+<h3>Research directions</h3>
+<ol>
+  <li><strong>Actuator net from BAM data.</strong> Train a small MLP on the 22 clean testbench recordings. Integrate into MuJoCo Warp training loop as a Warp/PyTorch module. Could capture phenomena that even M6 misses.</li>
+  <li><strong>Re-record BAM data with chirp trajectory.</strong> The current dataset lacks armature identification coverage. A chirp (frequency sweep) at low mass would better excite the inertial dynamics.</li>
+  <li><strong>Short-window sysid.</strong> One-step sysid biased actuator gains, but multi-step sysid fails due to divergence. A middle ground: use short (5-10 step) windows with periodic resets and optimise via CMA-ES or finite differences. Could recover better parameters than pure one-step. (Note: MuJoCo Warp does not yet support auto-diff, so gradient-based sysid would require MJX or finite-difference approximations.)</li>
+</ol>
+
+<h3>What works well</h3>
+<ul>
+  <li>The <strong>action_rate_l2 curriculum</strong> is highly effective. Without it, policies are unusable on real hardware.</li>
+  <li><strong>Observation delays</strong> (0-3 steps on both sensors and actuators) capture the real latency well.</li>
+  <li><strong>Mirror loss</strong> is elegant and effective for bilateral gaits.</li>
+  <li>The <strong>Rust runtime</strong> is fast and reliable. Bulk sync_read for 14 motors in one bus transaction is important for timing.</li>
+  <li><strong>BAM&rsquo;s stall detection</strong> (our contribution) dramatically improved identification quality. The old contaminated params were the single biggest source of sim2real gap.</li>
+</ul>
+
+<h3>What needs work</h3>
+<ul>
+  <li>The <strong>MuJoCo actuator model</strong> is the bottleneck. Standard kp+damping+frictionloss misses too much physics for small servo motors with plastic gears.</li>
+  <li><strong>Battery voltage</strong> is a first-order effect that&rsquo;s not in the training loop at all.</li>
+  <li>The <strong>lateral lean</strong> suggests the CoM model is wrong and/or left-right motor characteristics differ significantly. Neither is addressed in training.</li>
+  <li><strong>Terrain transfer</strong> is entirely untested on the real robot.</li>
+</ul>
+''')}
+
+</div><!-- /wrapper -->
+"""
+
+    return body
