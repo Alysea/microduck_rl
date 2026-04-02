@@ -29,6 +29,7 @@ def build_body(f1, f2, f3, f4, f5, f6, f7, f8, f_gap):
     <li><a href="#summary">Summary: The Sim2Real Gap Stack</a></li>
     <li><a href="#future">Beyond Standard MuJoCo: Actuator Nets &amp; Custom Models</a></li>
     <li><a href="#next">Open Questions, Opinions, and Next Steps</a></li>
+    <li><a href="#update-apr2">Update (2 Apr 2026): BAM M6 Actuator in MuJoCo Warp</a></li>
   </ol>
 </nav>
 
@@ -585,6 +586,74 @@ external torque requires reading constraint/gravity forces from <code>data.qfrc_
   <li><strong>Battery voltage</strong> is a first-order effect that&rsquo;s not in the training loop at all.</li>
   <li>The <strong>lateral lean</strong> suggests the CoM model is wrong and/or left-right motor characteristics differ significantly. Neither is addressed in training.</li>
   <li><strong>Terrain transfer</strong> is entirely untested on the real robot.</li>
+</ul>
+''')}
+
+<!-- ── 13. Update ── -->
+{html_section("update-apr2", "Update &mdash; 2 April 2026: BAM M6 Actuator in MuJoCo Warp", '''
+<p>Following the analysis above, we implemented the full BAM M6 friction model as a custom mjlab actuator and validated it against real testbench data. This section documents the implementation, the bug we found, and the results so far.</p>
+
+<h3>13.1 Implementation</h3>
+<p>We created a <code>BamM6Actuator</code> class that replaces MuJoCo&rsquo;s built-in <code>&lt;position&gt;</code> actuator with direct torque control implementing the full BAM chain:</p>
+<ol>
+  <li><strong>XL330 firmware control law:</strong> position error &rarr; duty cycle (clipped to &plusmn;1.0) &rarr; voltage</li>
+  <li><strong>DC motor equation:</strong> voltage &rarr; motor torque, with back-EMF subtraction (<code>kt&sup2;/R &times; vel</code>)</li>
+  <li><strong>M6 friction:</strong> Coulomb + Stribeck + directional motor-load + external-load + quadratic + viscous</li>
+  <li><strong>Static friction clipping:</strong> BAM&rsquo;s Algorithm 1 &mdash; friction cannot exceed the torque needed to stop the joint in one timestep</li>
+</ol>
+
+<p>The existing XML <code>&lt;position&gt;</code> actuators are converted to <code>&lt;motor&gt;</code> actuators (direct torque mode) via <code>set_to_motor()</code> in the MuJoCo spec.
+Joint damping and frictionloss are zeroed out &mdash; all friction is handled by the M6 model.
+The actuator wraps cleanly in mjlab&rsquo;s <code>DelayedActuator</code> for delay randomisation.</p>
+
+<h3>13.2 The Sign Bug</h3>
+<p>Initial training with the M6 actuator made sim2real <strong>worse</strong> (action_scale dropped from 0.65 to 0.5).
+We validated the kernel against BAM&rsquo;s own Python simulator by replaying real testbench recordings in MuJoCo and comparing position traces.</p>
+
+<p>The validation revealed a <strong>sign convention mismatch</strong> between BAM and MuJoCo:</p>
+
+<div class="callout warn">
+  <strong>The bug:</strong> BAM computes gravity bias as <code>bias = m &times; g &times; l &times; sin(q)</code> with <code>g = &minus;9.81</code>,
+  so <code>bias_torque</code> is <em>negative</em> when gravity pulls in the positive-q direction.
+  MuJoCo&rsquo;s <code>qfrc_bias</code> uses the <em>opposite</em> convention &mdash; it&rsquo;s positive in the same scenario.
+  <br><br>
+  This caused the directional friction formula <code>|K_e &times; ext &minus; K_m &times; mot|</code> to compute the wrong gearbox load:
+  friction was <em>underestimated</em> when motor and gravity opposed each other (the common case during walking),
+  and <em>overestimated</em> when they were aligned.
+</div>
+
+<p><strong>Fix:</strong> negate <code>qfrc_bias</code> before using it as BAM&rsquo;s <code>external_torque</code> in the friction model.
+The <code>tau_stop</code> computation (for static friction clipping) correctly uses the un-negated MuJoCo convention since it predicts the actual MuJoCo dynamics.</p>
+
+<h3>13.3 Testbench Validation Results</h3>
+<p>After the fix, we replayed 10 real testbench recordings through both BAM&rsquo;s Python simulator and MuJoCo with our M6 kernel:</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Comparison</th><th>MAE (rad)</th><th>Notes</th></tr>
+  <tr><td>BAM Python vs Real</td><td>0.030</td><td>BAM&rsquo;s own simulator &mdash; the reference</td></tr>
+  <tr><td><strong>MuJoCo M6 vs Real</strong></td><td><strong>0.029</strong></td><td>Our kernel matches reality as well as BAM does</td></tr>
+  <tr><td>BAM vs MuJoCo M6</td><td>0.024</td><td>Residual gap from CAD mass model vs BAM&rsquo;s point-mass simplification</td></tr>
+</table></div>
+
+<p>The MuJoCo M6 kernel now matches real testbench data with the same accuracy as BAM&rsquo;s own simulator.
+The remaining BAM-vs-MuJoCo gap (0.024 rad) is expected: MuJoCo uses the full CAD geometry for the testbench arm (distributed mass, mesh inertia), while BAM uses a simplified point-mass pendulum (<code>I = m &times; l&sup2;</code>).</p>
+
+<h3>13.4 Why M1 Export Was Wrong for MuJoCo</h3>
+<p>An important conceptual insight emerged during this work. We initially planned to use M6&rsquo;s exported kt/R values in MuJoCo&rsquo;s standard actuator model (which only supports M1-level physics). This was wrong:</p>
+<ul>
+  <li>M6 parameters are <strong>co-optimised</strong>. Its kt, R, and friction_base only make sense <em>together with</em> the load-dependent friction terms.</li>
+  <li>Stripping the load terms and using M6&rsquo;s kt/R in an M1 model gives a motor that&rsquo;s too strong with too little friction &mdash; worse than using M1 parameters directly.</li>
+  <li><strong>New M1</strong> (identified on clean data) is the correct export for MuJoCo&rsquo;s standard model. M1&rsquo;s higher <code>friction_base=0.032</code> implicitly absorbs load-dependent friction as a best-fit constant.</li>
+  <li>To actually benefit from M6 physics, <strong>you must implement the full model</strong> &mdash; which is what the custom actuator does.</li>
+</ul>
+
+<h3>13.5 Current Status and Next Steps</h3>
+<ul>
+  <li><strong>Sign bug fixed, kernel validated.</strong> MuJoCo M6 matches real testbench data (MAE 0.029 rad).</li>
+  <li><strong>Retraining in progress</strong> with the corrected kernel. The previous training (with the sign bug) converged normally but gave worse sim2real &mdash; the corrected version should improve.</li>
+  <li><strong>Remaining question:</strong> does the M6 model (identified on a single-joint pendulum testbench) capture the friction physics of multi-joint walking?
+    The testbench arm loads are small (0.1 Nm max); robot joint loads during walking can be larger.
+    If retraining doesn&rsquo;t close the action_scale gap, re-recording BAM data at more representative loads or using an actuator net trained on walking data would be the next step.</li>
 </ul>
 ''')}
 
