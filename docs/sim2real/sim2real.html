@@ -935,6 +935,77 @@ The old good policy may have just been lucky (robust to the specific sim2real ga
 
 <p>With fresh BAM data, a validated M6 kernel, and a corrected XML model, the simulation accuracy should improve enough that the rsl_rl version becomes less critical &mdash; a robust sim2real gap of near-zero means the policy doesn&rsquo;t need to be &ldquo;lucky&rdquo; to transfer.</p>
 
+<h3>14.11 Fresh BAM Data and Re-identification</h3>
+<p>New testbench data was recorded on a fresh XL330 motor with a lab power supply at 7.4V (current limit set correctly this time).
+The dataset covers 4 masses (0.08, 0.15, 0.202, 0.26 kg), 4 trajectories (sin_time_square, sin_sin, up_and_down, lift_and_drop), and kp=100&ndash;500. Total: 80 recordings.</p>
+
+<div class="callout warn">
+  <strong>Casualties of data collection:</strong> Recording at 0.5 kg with kp=400 stripped a gear tooth in the XL330, destroying the motor.
+  The XL330&rsquo;s plastic spur gears cannot handle sustained high-torque tracking at heavy loads.
+  Final dataset uses max 0.26 kg (0.255 Nm max external torque).
+</div>
+
+<p>Winding resistance was measured directly with a multimeter: <strong>R = 2.5&Omega;</strong>.
+This was used to constrain the identification (R bounded to 2.4&ndash;2.6&Omega;) after discovering that with R as a free parameter,
+the optimizer consistently pushed R to its upper bound (3.0) and inflated kt to compensate &mdash;
+an identifiability issue caused by the entanglement of kt, R, and back-EMF damping with light-load data.</p>
+
+<h4>Identification Results (R constrained to 2.4&ndash;2.6&Omega;)</h4>
+
+<p>Initial identification used only masses 0.08&ndash;0.26 kg. The dataset was then extended with <strong>0.52 kg</strong> recordings
+(lift_and_drop, up_and_down, sin_time_square at kp=100&ndash;200) to improve load-friction identifiability.</p>
+
+<h4>Identification Results (R constrained to 2.4&ndash;2.6&Omega;, with 0.52 kg data)</h4>
+
+<div class="table-wrap"><table>
+  <tr><th></th><th>kt</th><th>R</th><th>Stall</th><th>MJ kp</th><th>f_base</th><th>f_visc</th><th>armature</th></tr>
+  <tr><td><strong>M1 (fresh, R=2.5)</strong></td><td>0.263</td><td>2.60</td><td>0.749 Nm</td><td>0.431</td><td>0.0132</td><td>0.0171</td><td>0.00176</td></tr>
+  <tr><td>M5 (fresh, R=2.5)</td><td>0.411</td><td>2.55</td><td>1.194 Nm</td><td>0.687</td><td>0.0056</td><td>0.0049</td><td>0.00171</td></tr>
+  <tr><td>M6 (fresh, R=2.5)</td><td>0.389</td><td>2.43</td><td>1.185 Nm</td><td>0.682</td><td>0.0012</td><td>0.0050</td><td>0.00167</td></tr>
+  <tr><td><em>M1 (old motor, ref)</em></td><td><em>0.182</em></td><td><em>2.01</em></td><td><em>0.670 Nm</em></td><td><em>0.386</em></td><td><em>0.0317</em></td><td><em>0.0243</em></td><td><em>0.00207</em></td></tr>
+  <tr><td><em>M6 (old motor, ref)</em></td><td><em>0.247</em></td><td><em>2.44</em></td><td><em>0.750 Nm</em></td><td><em>0.432</em></td><td><em>0.0078</em></td><td><em>0.0168</em></td><td><em>0.00223</em></td></tr>
+</table></div>
+
+<h4>M5/M6 load-friction terms</h4>
+<div class="table-wrap"><table>
+  <tr><th></th><th>load_motor</th><th>load_ext</th><th>d&theta;_strib</th><th>&alpha;</th></tr>
+  <tr><td>M5 (fresh, with 0.52kg)</td><td>0.085</td><td>0.098</td><td>0.807</td><td>0.502</td></tr>
+  <tr><td>M6 (fresh, with 0.52kg)</td><td>0.224</td><td>0.085</td><td>2.689</td><td>0.604</td></tr>
+  <tr><td><em>M5 (fresh, without 0.52kg)</em></td><td><em>0.140</em></td><td><em>0.282</em></td><td><em>0.523</em></td><td><em>1.923</em></td></tr>
+  <tr><td><em>M6 (fresh, without 0.52kg)</em></td><td><em>0.251</em></td><td><em>0.241</em></td><td><em>0.444</em></td><td><em>2.465</em></td></tr>
+  <tr><td><em>M6 (old motor, ref)</em></td><td><em>0.177</em></td><td><em>0.333</em></td><td><em>0.108</em></td><td><em>2.109</em></td></tr>
+</table></div>
+
+<h4>Key Finding: Structural Identifiability Problem in M5/M6</h4>
+<p><strong>Even with 0.52 kg data (0.51 Nm max external torque), the kt inflation problem persists.</strong>
+M5 and M6 still show kt~0.39&ndash;0.41, stall torque ~1.19 Nm (60% above datasheet), and friction_viscous ~0.005 (vs M1&rsquo;s 0.017).</p>
+
+<p>The 0.52 kg data helped marginally: friction_viscous improved from 0.001 to 0.005 (4&times;), and
+<code>load_friction_external</code> dropped from 0.24&ndash;0.28 to 0.085&ndash;0.098 (confirming the previous values were inflated by data scarcity).
+But the fundamental problem is <strong>structural, not data-limited</strong>: on a single-DOF pendulum, back-EMF damping (<code>kt&sup2;/R &times; vel</code>)
+and viscous friction (<code>friction_viscous &times; vel</code>) are perfectly collinear. No amount of pendulum data can separate them
+when the M5/M6 load-dependent terms absorb the static torque constraints that would otherwise pin kt/R.</p>
+
+<p><strong>M1 is unaffected</strong> because it has no load-dependent terms &mdash; kt/R must simultaneously explain static torque and dynamic damping.
+M1 results are identical with and without the 0.52 kg data (kt=0.263 vs 0.265), confirming it was already well-constrained.</p>
+
+<p>Velocity damping breakdown (back-EMF + viscous):</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>back-EMF (kt&sup2;/R)</th><th>friction_viscous</th><th>Total</th></tr>
+  <tr><td>M1 (fresh)</td><td>0.027</td><td>0.017</td><td>0.044</td></tr>
+  <tr><td>M5 (fresh)</td><td>0.066</td><td>0.005</td><td>0.071</td></tr>
+  <tr><td>M6 (fresh)</td><td>0.062</td><td>0.005</td><td>0.067</td></tr>
+</table></div>
+
+<div class="callout ok">
+  <strong>Decision: train with M1 newest (R=2.5).</strong>
+  The M1 parameters (kt=0.263, R=2.60, stall=0.75 Nm) are physically consistent, stable across dataset variations, and trustworthy.
+  The fresh motor is genuinely different from the old motor: higher kt/R ratio (0.101 vs 0.091), lower friction_base (0.013 vs 0.032), lower friction_viscous (0.017 vs 0.024).
+  For future M5/M6 use with the BAM M6 kernel, pinning friction_viscous to M1&rsquo;s value (~0.017) during M5/M6 identification would break the kt/viscous entanglement.
+</div>
+
+<p><strong>Training in progress</strong> with M1 newest (R=2.5) values in the XML actuator, symmetry disabled.</p>
+
 </section>
 
 
