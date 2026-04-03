@@ -1004,7 +1004,44 @@ M1 results are identical with and without the 0.52 kg data (kt=0.263 vs 0.265), 
   For future M5/M6 use with the BAM M6 kernel, pinning friction_viscous to M1&rsquo;s value (~0.017) during M5/M6 identification would break the kt/viscous entanglement.
 </div>
 
-<p><strong>Training in progress</strong> with M1 newest (R=2.5) values in the XML actuator, symmetry disabled.</p>
+<h3>14.12 Results: Fresh M1 Params &mdash; Major Improvement</h3>
+<p>Training with the fresh motor M1 params (kt=0.263, R=2.60, symmetry off) produced <strong>the best sim2real transfer since the mjlab upgrade</strong>:</p>
+<ul>
+  <li><strong>action_scale improved to ~0.8</strong> (up from 0.65 with old params). This is the biggest action_scale improvement we&rsquo;ve achieved.</li>
+  <li>Forward walking works well &mdash; approaching the quality of the old best policy.</li>
+  <li>Turning and backward walking still cause occasional backward falls, suggesting a <strong>forward CoM bias</strong> in the sim model vs reality.</li>
+  <li>Head shaking while standing at action_scale=0.8 &mdash; the head/neck joints are unloaded and may have different friction characteristics than leg joints (all 14 joints share the same BAM params).</li>
+</ul>
+
+<h3>14.13 CoM Randomisation Curriculum</h3>
+<p>To address the backward falling without destabilising early training, we added a <strong>curriculum on CoM randomisation range</strong>:</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Training step</th><th>CoM range</th></tr>
+  <tr><td>0 &ndash; 1000 iterations</td><td>&plusmn;3 mm (original value)</td></tr>
+  <tr><td>1000 &ndash; 2000 iterations</td><td>&plusmn;5 mm</td></tr>
+  <tr><td>2000+ iterations</td><td>&plusmn;8 mm</td></tr>
+</table></div>
+
+<p>Direct jump to &plusmn;8 mm caused the policy to learn a weird gait with excessive head motion &mdash;
+the larger CoM uncertainty was too disruptive for early training.
+The curriculum lets the policy first learn a stable gait with small CoM variation, then gradually become robust to larger offsets.</p>
+
+<p><strong>Training in progress</strong> with CoM curriculum + fresh M1 params + symmetry off.</p>
+
+<h3>14.14 Summary of Progress</h3>
+<div class="table-wrap"><table>
+  <tr><th>Configuration</th><th>action_scale on real robot</th><th>Walk quality</th></tr>
+  <tr><td>Old best policy (Feb, old mjlab)</td><td>~0.65</td><td>Excellent</td></tr>
+  <tr><td>New mjlab + old params + symmetry ON</td><td>~0.50</td><td>Poor</td></tr>
+  <tr><td>New mjlab + M6 kernel + symmetry OFF</td><td>~0.65</td><td>OK</td></tr>
+  <tr><td>New mjlab + old XML actuator (isolation)</td><td>~0.65</td><td>OK</td></tr>
+  <tr><td><strong>New mjlab + fresh M1 params + symmetry OFF</strong></td><td><strong>~0.80</strong></td><td><strong>Good (forward), backward falls</strong></td></tr>
+  <tr><td>+ CoM curriculum (&plusmn;3&rarr;&plusmn;8 mm)</td><td>TBD</td><td>Training in progress</td></tr>
+</table></div>
+
+<p>The action_scale progression (0.50 &rarr; 0.65 &rarr; 0.80) shows that each fix contributed meaningfully:
+disabling symmetry, fixing motor params with fresh BAM data on a measured R, and training with the correct motor for the robot being tested.</p>
 
 </section>
 
