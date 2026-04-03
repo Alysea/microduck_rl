@@ -706,15 +706,94 @@ While this is theoretically sound for a symmetric robot, MicroDuck has significa
 </ul>
 <p>A symmetric policy <em>cannot</em> compensate for these asymmetries. The old policy (no mirror loss) was free to learn asymmetric compensatory strategies, which may explain its superior real-world robustness.</p>
 
-<h3>14.5 Current Experiment</h3>
-<p>Retraining in progress with:</p>
+<h3>14.5 Results: Symmetry Off + M6 Kernel + DR Fix</h3>
+<p>Retraining with symmetry disabled, M6 kernel (sign-fixed), and motor gain DR fixed produced <strong>significantly better sim2real transfer</strong> than previous new-mjlab attempts.
+However, the walk quality still didn&rsquo;t match the old best policy (run <code>hhfzw7an</code>). The policy required <code>action_scale &asymp; 0.65</code> and walked reasonably but with less robustness than the old policy.</p>
+
+<p>This confirmed that symmetry was a <em>major</em> factor, but not the only one. Something else changed between the old and new training setups.</p>
+
+<h3>14.6 Isolation Experiment: Reproducing the Old Setup on New mjlab</h3>
+<p>To isolate whether the remaining gap comes from the M6 kernel or from mjlab internals, we set up a controlled experiment reproducing the old good training setup as closely as possible on the current mjlab version:</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Setting</th><th>Value (matching old run <code>hhfzw7an</code>)</th></tr>
+  <tr><td>Actuator</td><td>XML <code>&lt;position&gt;</code> (MuJoCo built-in PD), not M6 kernel</td></tr>
+  <tr><td>Motor params</td><td>Old contaminated M6 export: kp=0.52, damping=0.048, frictionloss=0.006</td></tr>
+  <tr><td>Symmetry</td><td>Disabled</td></tr>
+  <tr><td>air_time weight</td><td>5.0</td></tr>
+  <tr><td>air_time thresholds</td><td>min=0.10, max=0.25</td></tr>
+  <tr><td>All DR params</td><td>Identical (CoM &plusmn;3mm, Kp &plusmn;15%, Kd &plusmn;10%, mass &plusmn;5%, IMU &plusmn;1&deg;)</td></tr>
+</table></div>
+
+<p>The only difference from the old good run is the mjlab framework version itself (0.1.0 &rarr; 1.2.0).</p>
+
+<h3>14.7 Result: Still Worse</h3>
+<p>The isolation experiment produced policies <strong>comparable to the M6 kernel training but still clearly worse than the old best policy</strong>.
+Since the physics, DR, noise, delays, rewards, and actuator model are all identical to the old run, the regression must come from the framework upgrade itself.</p>
+
+<h3>14.8 Root Cause: rsl_rl Version Jump</h3>
+<p>Deeper investigation revealed:</p>
 <ul>
-  <li>BAM M6 actuator kernel (sign-fixed, testbench-validated)</li>
-  <li>Motor gain DR fixed for BamM6Actuator</li>
-  <li><strong>Symmetry disabled</strong> (<code>ENABLE_SYMMETRY = False</code>)</li>
+  <li><strong>rsl_rl went from 3.3.0 to 5.0.1</strong> &mdash; a major version jump</li>
+  <li>The PPO implementation was significantly refactored: the single <code>ActorCritic</code> module was split into separate <code>actor</code>/<code>critic</code> <code>MLPModel</code>s</li>
+  <li>Batch storage, gradient computation, and the optimizer chain were all restructured</li>
+  <li>The core loss formulas (surrogate, value clipping, entropy) appear equivalent, but subtle differences in gradient flow or normalization could change what policies are learned</li>
 </ul>
-<p>If this closes the gap with the old policy, the symmetry loss was the main regression cause.
-If not, we&rsquo;ll investigate other mjlab upgrade changes (contact solver, integrator defaults, observation pipeline).</p>
+
+<p>We also verified that all base environment defaults in the new mjlab match the old version:</p>
+<ul>
+  <li>Physics: <code>timestep=0.005</code>, <code>integrator=implicitfast</code>, <code>solver=newton</code>, <code>iterations=10</code>, <code>decimation=4</code> &mdash; identical</li>
+  <li>Push robot: we fully override with our params (x/y only, &plusmn;0.3 m/s, interval 3&ndash;6 s) &mdash; identical</li>
+  <li>Reset: <code>z=(0.12, 0.13)</code>, no velocity randomization &mdash; identical</li>
+  <li>New default events (<code>encoder_bias</code>, <code>base_com</code>): explicitly deleted in our config</li>
+</ul>
+
+<p>Pinning rsl_rl back to 3.3.0 is the obvious test, but the new mjlab API expects rsl_rl 5.0.1 interfaces (separate actor/critic models, new config dataclasses), making a simple version pin impractical without significant adaptation work.</p>
+
+<h3>14.9 Current Status</h3>
+<p>The situation as of 3 April 2026:</p>
+<div class="table-wrap"><table>
+  <tr><th>Component</th><th>Status</th></tr>
+  <tr><td>BAM M6 actuator kernel</td><td style="color:#27ae60">Validated against testbench data (MAE 0.029 rad)</td></tr>
+  <tr><td>qfrc_bias sign bug</td><td style="color:#27ae60">Fixed</td></tr>
+  <tr><td>Motor gain DR for BamM6</td><td style="color:#27ae60">Fixed</td></tr>
+  <tr><td>Symmetry mirror loss</td><td style="color:#27ae60">Identified as harmful, disabled</td></tr>
+  <tr><td>rsl_rl 3.3.0 &rarr; 5.0.1 regression</td><td style="color:#e74c3c">Identified but not yet resolved</td></tr>
+</table></div>
+
+<h3>14.10 New Strategy: Perfect the Sim</h3>
+<p>Rather than chasing the rsl_rl regression, we&rsquo;re shifting focus to making the simulation as accurate as possible.
+The reasoning: if the sim perfectly matches reality, <em>any</em> well-trained policy should transfer &mdash; no &ldquo;luck&rdquo; required.
+The old good policy may have just been lucky (robust to the specific sim2real gaps by chance), while a more accurate sim would make all policies transfer reliably.</p>
+
+<h4>Fresh BAM Data Collection Plan</h4>
+<p>Re-recording testbench data on a fresh XL330 motor with controlled conditions:</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Parameter</th><th>Plan</th><th>Rationale</th></tr>
+  <tr><td>Power supply</td><td><strong>Lab supply at 7.4V</strong> (matching runtime nominal_voltage). Additional runs at 6.5V and 8.4V for voltage validation.</td><td>Eliminates battery voltage drift. Extra voltages validate the voltage-proportional kp assumption.</td></tr>
+  <tr><td>Arm mass</td><td>0.112 kg (light) + 0.3&ndash;0.5 kg (medium). Avoid &gt;0.8 kg.</td><td>Light for base friction/armature. Medium for load-dependent terms. Heavy caused saturation before.</td></tr>
+  <tr><td>Firmware kp</td><td>kp_fw=200 (primary) + 100, 300, 400 (validation)</td><td>200 matches runtime. Others for cross-validation.</td></tr>
+  <tr><td>Trajectories</td><td>sin_time_square, sin_sin, up_and_down, <strong>+ chirp</strong> (frequency sweep 0.1&ndash;5 Hz)</td><td>Chirp excites inertial dynamics better for armature identification.</td></tr>
+  <tr><td>Multiple motors</td><td>2&ndash;3 different XL330 units</td><td>Captures per-motor variability, informs DR ranges.</td></tr>
+  <tr><td>Motor condition</td><td>Fresh motor (not worn)</td><td>Avoids gear wear artefacts from the old motor.</td></tr>
+</table></div>
+
+<h4>XML Model Audit</h4>
+<p>Full audit of the MuJoCo robot model against the real robot. Key checks:</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Check</th><th>XML value</th><th>Action</th></tr>
+  <tr><td>Total mass</td><td>0.770 kg</td><td>Weigh real robot with battery. Real robot is ~755g &mdash; 2% off, worth correcting.</td></tr>
+  <tr><td>CoM position (home pose)</td><td>[10mm forward, 0mm lateral, 150mm up]</td><td>Real robot leans 7&ndash;8&deg; left, suggesting lateral CoM offset not captured in XML. Measure by suspending the robot or from IMU standing data.</td></tr>
+  <tr><td>Joint limits</td><td>14 hinge joints, asymmetric left/right</td><td>Verify each joint&rsquo;s physical range matches XML. A wrong limit means the policy explores unreachable poses.</td></tr>
+  <tr><td>Body masses</td><td>Individual link masses from CAD</td><td>Check head assembly (98g), trunk (350g), feet (15g each). Cable mass, battery mass, PCB mass may differ from CAD.</td></tr>
+  <tr><td>Collision geometry</td><td>Foot collision geoms</td><td>Verify foot contact shape/position matches real TPU foot pads. Contact point location directly affects balance.</td></tr>
+  <tr><td>Joint axes</td><td>All z-axis hinge joints</td><td>Already found hip pitch/roll inversion on new robot. Triple-check all 14 joints.</td></tr>
+  <tr><td>Foot friction</td><td>DR range (0.3, 1.2)</td><td>Measure actual surface friction. If walking on a specific surface, narrow the range.</td></tr>
+</table></div>
+
+<p>With fresh BAM data, a validated M6 kernel, and a corrected XML model, the simulation accuracy should improve enough that the rsl_rl version becomes less critical &mdash; a robust sim2real gap of near-zero means the policy doesn&rsquo;t need to be &ldquo;lucky&rdquo; to transfer.</p>
 ''')}
 
 </div><!-- /wrapper -->
