@@ -116,6 +116,7 @@ figure img { width: 100%; border-radius: var(--radius); box-shadow: var(--shadow
     <li><a href="#future">Beyond Standard MuJoCo: Actuator Nets &amp; Custom Models</a></li>
     <li><a href="#next">Open Questions, Opinions, and Next Steps</a></li>
     <li><a href="#update-apr2">Update (2 Apr 2026): BAM M6 Actuator in MuJoCo Warp</a></li>
+    <li><a href="#update-apr3">Update (3 Apr 2026): Debugging the Training Regression</a></li>
   </ol>
 </nav>
 
@@ -791,6 +792,69 @@ The remaining BAM-vs-MuJoCo gap (0.024 rad) is expected: MuJoCo uses the full CA
     The testbench arm loads are small (0.1 Nm max); robot joint loads during walking can be larger.
     If retraining doesn&rsquo;t close the action_scale gap, re-recording BAM data at more representative loads or using an actuator net trained on walking data would be the next step.</li>
 </ul>
+
+</section>
+
+
+<!-- ── 14. Update 3 Apr ── -->
+<section id="update-apr3">
+<h2>Update &mdash; 3 April 2026: Debugging the Training Regression</h2>
+
+<p>After fixing the sign bug and retraining with the corrected M6 kernel, sim2real transfer was <em>still</em> worse than the old best policy (from February, commit <code>41b4a41</code>).
+The old policy &mdash; trained with contaminated BAM values on an older version of mjlab &mdash; consistently outperformed all new policies on both the old and new robots.
+This pointed to a <strong>training pipeline regression</strong>, not an actuator model problem.</p>
+
+<h3>14.1 The Clue: Old Policy Robustness</h3>
+<p>Key observations:</p>
+<ul>
+  <li>The old policy (run <code>hhfzw7an</code>, Feb 26) transfers well even to a <em>new robot</em> with different mass distribution. It&rsquo;s remarkably robust.</li>
+  <li>All policies trained after the mjlab upgrade (late March onwards) transfer poorly &mdash; regardless of actuator model (XML or M6).</li>
+  <li>The regression correlates with the mjlab version upgrade, not with any specific actuator or reward change.</li>
+  <li>A hardware debugging red herring: the new robot had hip pitch and hip roll <strong>inverted left-right</strong>. The old policy still walked (barely) even with this mounting error, further demonstrating its robustness.</li>
+</ul>
+
+<h3>14.2 Systematic Comparison: Old vs New</h3>
+<p>We compared wandb configs between the old good run (<code>hhfzw7an</code>) and a recent run (<code>0894egj0</code>):</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Change</th><th>Old (good)</th><th>New (bad)</th><th>Suspected impact</th></tr>
+  <tr><td><strong>Symmetry mirror loss</strong></td><td>None (disabled)</td><td>coeff=0.5</td><td style="color:#e74c3c"><strong>High</strong> &mdash; constrains policy to symmetric gaits, reduces ability to compensate for real-world asymmetries</td></tr>
+  <tr><td><strong>Motor gain DR with BamM6</strong></td><td>Works (XmlPosition)</td><td>Silent no-op!</td><td style="color:#e74c3c"><strong>High</strong> &mdash; policy trains with zero gain variation, brittle to real motor differences</td></tr>
+  <tr><td>air_time weight</td><td>5.0</td><td>6.0</td><td>Low</td></tr>
+  <tr><td>Contact sensor mode</td><td>subtree</td><td>geom</td><td>Low (same result, different API)</td></tr>
+  <tr><td>obs_groups naming</td><td>&ldquo;policy&rdquo;</td><td>&ldquo;actor&rdquo;</td><td>None (API rename)</td></tr>
+</table></div>
+
+<h3>14.3 The Motor Gain DR Bug</h3>
+<p>The <code>randomize_delayed_actuator_gains</code> function checked <code>isinstance(base_actuator, XmlPositionActuator)</code> before applying gain randomisation.
+With the BamM6Actuator, this check fails silently &mdash; <strong>no gain randomisation happens at all</strong>.
+The policy trains with perfectly consistent motors across all environments, making it brittle to the real robot&rsquo;s per-motor variability, temperature drift, and voltage changes.</p>
+
+<div class="callout warn">
+  <strong>Fix applied:</strong> The BamM6Actuator now has <code>kp_scale</code> and <code>kd_scale</code> per-environment tensors.
+  The DR function detects BamM6Actuator and calls <code>set_gains()</code> to apply per-env scaling to the firmware kp and back-EMF damping.
+  Verified: after reset, <code>kp_scale</code> varies across environments (e.g., 0.97&ndash;1.01 with the &plusmn;15% range).
+</div>
+
+<h3>14.4 The Symmetry Hypothesis</h3>
+<p>The mirror loss (coeff=0.5) was introduced after the old good policy. It forces the policy to produce identical actions for left-right mirrored observations.
+While this is theoretically sound for a symmetric robot, MicroDuck has significant real-world asymmetries:</p>
+<ul>
+  <li>7&ndash;8&deg; lateral lean (CoM offset or IMU mounting)</li>
+  <li>Per-motor friction differences (14 individual XL330s)</li>
+  <li>Cable routing asymmetry</li>
+</ul>
+<p>A symmetric policy <em>cannot</em> compensate for these asymmetries. The old policy (no mirror loss) was free to learn asymmetric compensatory strategies, which may explain its superior real-world robustness.</p>
+
+<h3>14.5 Current Experiment</h3>
+<p>Retraining in progress with:</p>
+<ul>
+  <li>BAM M6 actuator kernel (sign-fixed, testbench-validated)</li>
+  <li>Motor gain DR fixed for BamM6Actuator</li>
+  <li><strong>Symmetry disabled</strong> (<code>ENABLE_SYMMETRY = False</code>)</li>
+</ul>
+<p>If this closes the gap with the old policy, the symmetry loss was the main regression cause.
+If not, we&rsquo;ll investigate other mjlab upgrade changes (contact solver, integrator defaults, observation pipeline).</p>
 
 </section>
 

@@ -643,3 +643,20 @@ if __name__ == "__main__":
     print(f"Written to {outpath}")
     size_mb = os.path.getsize(outpath) / 1e6
     print(f"File size: {size_mb:.1f} MB")
+
+    # Auto-upload to GitHub Gist
+    gist_id_path = os.path.join(OUTDIR, ".gist-id")
+    if os.path.exists(gist_id_path):
+        import subprocess
+        gist_id = open(gist_id_path).read().strip()
+        env = {**os.environ, "GITHUB_TOKEN": ""}  # avoid stale token
+        try:
+            subprocess.run(
+                ["gh", "gist", "edit", gist_id, "--filename", "sim2real.html", outpath],
+                check=True, env=env, capture_output=True, text=True,
+            )
+            print(f"Gist updated: https://gist.github.com/apirrone/{gist_id}")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"Gist upload failed: {e}")
+    else:
+        print("No .gist-id file — skipping gist upload (run: gh gist create --public ...)")
