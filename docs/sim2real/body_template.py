@@ -31,6 +31,7 @@ def build_body(f1, f2, f3, f4, f5, f6, f7, f8, f_gap):
     <li><a href="#next">Open Questions, Opinions, and Next Steps</a></li>
     <li><a href="#update-apr2">Update (2 Apr 2026): BAM M6 Actuator in MuJoCo Warp</a></li>
     <li><a href="#update-apr3">Update (3 Apr 2026): Debugging the Training Regression</a></li>
+    <li><a href="#update-apr4">Update (4 Apr 2026): Next Experiments</a></li>
   </ol>
 </nav>
 
@@ -909,6 +910,67 @@ despite being robust to &plusmn;8 mm CoM offsets in sim. This suggests the issue
 
 <p>The action_scale progression (0.50 &rarr; 0.65 &rarr; 0.80) shows that each fix contributed meaningfully:
 disabling symmetry, fixing motor params with fresh BAM data on a measured R, and training with the correct motor for the robot being tested.</p>
+''')}
+
+
+{html_section("update-apr4", "Update (4 Apr 2026): Next Experiments", '''
+<p>With the CoM curriculum not fully resolving the backward-falling issue, we analysed the remaining gap systematically and identified four concrete experiments to try next.</p>
+
+<h3>Why Are We Still Behind the Old Best Policy?</h3>
+
+<p>Several hypotheses, ranked by likelihood:</p>
+
+<ol>
+  <li><strong>80g mass approximation.</strong> The real robot is ~80g heavier than the CAD model (screws, wires, PCB, connectors).
+  We lumped all 80g onto <code>trunk_base</code>, but the real mass is distributed &mdash; some of it at knee level, foot level, along the arms.
+  Adding it all at the top makes the simulated robot artificially top-heavy, raising the CoM and increasing the pitch moment of inertia.
+  This would directly cause backward-falling instability: the sim robot is harder to tip than the real one in the forward direction, and easier to tip backward.
+  <strong>Fix:</strong> redistribute the 80g more realistically &mdash; e.g. 40g at trunk_base, remainder at knee or foot attachment points near where the PCB/battery actually sits.</li>
+
+  <li><strong>rsl_rl 3.3.0 &rarr; 5.0.1 architecture change.</strong> The upgrade split the actor and critic into separate MLP modules with different weight initialisation.
+  Even if the PPO math is identical, the inductive bias of the network may differ. The old policy&rsquo;s weights may have had properties (e.g. more conservative action magnitudes) that naturally transferred better.
+  This is hard to isolate without retraining with the pinned old version.</li>
+
+  <li><strong>Per-motor friction variation.</strong> All 14 joints use identical BAM params in sim, but real servos vary by unit.
+  The neck/head joints in particular are unloaded and may have very different friction characteristics than the loaded leg joints.
+  The head shaking at action_scale=0.8 is a symptom of this.</li>
+
+  <li><strong>Floor friction mismatch.</strong> The old policy was trained with floor friction randomised over (0.3, 1.2) with a base of 0.6 &mdash;
+  covering everything from slippery tile to carpet. With the new grippier footpad, the real robot now operates at friction ~1.0.
+  If the policy was trained spending most time in low-friction envs, it may have learned a gait optimised for sliding feet rather than planting them.</li>
+</ol>
+
+<h3>Experiment 1: Redistribute the 80g Mass</h3>
+<p>Instead of all 80g on <code>trunk_base</code>, split it more realistically.
+The real robot&rsquo;s extra mass comes from: battery connector + wiring harness (near trunk, but lower), PCB board (mid-torso), screws at every joint (distributed).
+A rough but better split: ~40g at trunk_base (upper torso electronics), ~20g at each hip yaw link (screws + wire strain relief).
+This lowers the effective CoM and reduces pitch inertia, which should help backward stability.</p>
+
+<h3>Experiment 2: Tighter Floor Friction for the Grippier Footpad</h3>
+<p>The new footpad material is significantly grippier. We updated the sim accordingly:</p>
+<ul>
+  <li><strong>Base friction:</strong> 0.6 &rarr; 1.0 (in the robot XML collision geometry)</li>
+  <li><strong>Randomisation range:</strong> (0.3, 1.2) &rarr; (0.7, 1.3) &mdash; removes the low-friction tail the policy was wasting capacity on</li>
+</ul>
+<p>This should produce a more planted gait and potentially fix the sliding/tipping seen on turns.</p>
+
+<h3>Experiment 3: Later Checkpoint Export</h3>
+<p>Current export strategy: wait for CoM curriculum to end (iter 2000), then +500 steps = export at ~2500.
+The concern is that this may be too early &mdash; the policy has only had 500 iterations to consolidate under full randomisation.
+We&rsquo;ll try exporting at 3500&ndash;4000 iterations (reward plateau after curriculum), watching for the common pattern where
+the <em>best sim checkpoint is the worst real-robot checkpoint</em> because it over-exploits sim-specific dynamics.
+The right timing is just after the reward plateaus, not the absolute peak.</p>
+
+<h3>Experiment 4: Pinned friction_viscous for M6 Identification</h3>
+<p>The structural identifiability problem in M5/M6 (back-EMF and viscous friction are collinear on a pendulum testbench)
+means kt is inflated and friction_viscous is under-estimated in M6 fits.
+The fix: pin friction_viscous to M1&rsquo;s value (~0.017) during M6 identification, which breaks the entanglement and lets kt converge to its true value.
+If kt comes out close to the M1 value (~0.263), the M6 load-friction terms can then be trusted for training with the full BAM M6 kernel.</p>
+
+<div class="callout warn">
+  <strong>Current status:</strong> Experiments 1&ndash;3 are queued for the next training run. Experiment 4 requires re-running BAM identification with the viscous pin.
+  We are close &mdash; action_scale 0.8 with good forward walking suggests the remaining gap is a few targeted fixes rather than a fundamental problem.
+</div>
 ''')}
 
 </div><!-- /wrapper -->
