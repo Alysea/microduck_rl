@@ -887,7 +887,14 @@ M1 results are identical with and without the 0.52 kg data (kt=0.263 vs 0.265), 
 the larger CoM uncertainty was too disruptive for early training.
 The curriculum lets the policy first learn a stable gait with small CoM variation, then gradually become robust to larger offsets.</p>
 
-<p><strong>Training in progress</strong> with CoM curriculum + fresh M1 params + symmetry off.</p>
+<p>Result: the CoM curriculum did <strong>not</strong> fix the backward falling. The policy still tips over when turning or walking backward,
+despite being robust to &plusmn;8 mm CoM offsets in sim. This suggests the issue is not (only) CoM offset but possibly:</p>
+<ul>
+  <li><strong>Inaccurate body inertias</strong> &mdash; the CAD model may not reflect the real mass distribution (battery placement, cables, PCB weight)</li>
+  <li><strong>Contact model mismatch</strong> &mdash; foot geometry, friction coefficient, or ground compliance differ between sim and real</li>
+  <li><strong>Actuator asymmetry</strong> &mdash; real motors have per-unit friction differences not captured by uniform DR</li>
+  <li><strong>The rsl_rl 5.0.1 PPO</strong> may produce policies that are less robust to backward motion specifically (the old best policy handled this fine)</li>
+</ul>
 
 <h3>14.14 Summary of Progress</h3>
 <div class="table-wrap"><table>
@@ -897,7 +904,7 @@ The curriculum lets the policy first learn a stable gait with small CoM variatio
   <tr><td>New mjlab + M6 kernel + symmetry OFF</td><td>~0.65</td><td>OK</td></tr>
   <tr><td>New mjlab + old XML actuator (isolation)</td><td>~0.65</td><td>OK</td></tr>
   <tr><td><strong>New mjlab + fresh M1 params + symmetry OFF</strong></td><td><strong>~0.80</strong></td><td><strong>Good (forward), backward falls</strong></td></tr>
-  <tr><td>+ CoM curriculum (&plusmn;3&rarr;&plusmn;8 mm)</td><td>TBD</td><td>Training in progress</td></tr>
+  <tr><td>+ CoM curriculum (&plusmn;3&rarr;&plusmn;8 mm)</td><td>~0.80</td><td>Same &mdash; still falls backward on turns/reverse</td></tr>
 </table></div>
 
 <p>The action_scale progression (0.50 &rarr; 0.65 &rarr; 0.80) shows that each fix contributed meaningfully:
