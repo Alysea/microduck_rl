@@ -32,6 +32,7 @@ def build_body(f1, f2, f3, f4, f5, f6, f7, f8, f_gap):
     <li><a href="#update-apr2">Update (2 Apr 2026): BAM M6 Actuator in MuJoCo Warp</a></li>
     <li><a href="#update-apr3">Update (3 Apr 2026): Debugging the Training Regression</a></li>
     <li><a href="#update-apr4">Update (4 Apr 2026): Next Experiments</a></li>
+    <li><a href="#update-apr5">Update (5 Apr 2026): Tuesday Test Checklist</a></li>
   </ol>
 </nav>
 
@@ -970,6 +971,56 @@ If kt comes out close to the M1 value (~0.263), the M6 load-friction terms can t
 <div class="callout warn">
   <strong>Current status:</strong> Experiments 1&ndash;3 are queued for the next training run. Experiment 4 requires re-running BAM identification with the viscous pin.
   We are close &mdash; action_scale 0.8 with good forward walking suggests the remaining gap is a few targeted fixes rather than a fundamental problem.
+</div>
+''')}
+
+
+{html_section("update-apr5", "Update (5 Apr 2026): Tuesday Test Checklist", '''
+<p>A new policy has been trained with two changes applied simultaneously:</p>
+<ul>
+  <li><strong>New default neck/head pose:</strong> neck_pitch=&minus;20&deg;, head_pitch=+20&deg; (head stays flat &mdash; DOFs are inverted &mdash; but the neck assembly tilts backward, shifting head mass rearward to align CoM over the feet)</li>
+  <li><strong>Tighter floor friction:</strong> base friction 0.6&rarr;1.0, randomisation range (0.3,&thinsp;1.2)&rarr;(0.7,&thinsp;1.3) to match the new grippier footpad</li>
+</ul>
+
+<p>Robot access resumes Tuesday. Things to test, in order:</p>
+
+<h3>1. Basic Transfer &mdash; Does the New Policy Walk?</h3>
+<p>Two policies to test:</p>
+<div class="table-wrap"><table>
+  <tr><th>Run</th><th>Changes vs previous best</th></tr>
+  <tr><td><code>pollen-robotics/mjlab_microduck/elque458</code></td><td>New friction only (base 1.0, range 0.7&ndash;1.3)</td></tr>
+  <tr><td><code>pollen-robotics/mjlab_microduck/izc73yop</code></td><td>New friction <strong>+</strong> neck&minus;20&deg;/head+20&deg; default pose</td></tr>
+</table></div>
+<div class="callout">
+  <code>uv run play Mjlab-Velocity-Flat-MicroDuck --wandb-run-path pollen-robotics/mjlab_microduck/elque458 --action-scale 0.8</code><br/>
+  <code>uv run play Mjlab-Velocity-Flat-MicroDuck --wandb-run-path pollen-robotics/mjlab_microduck/izc73yop --action-scale 0.8</code>
+</div>
+
+<h3>2. Head Shaking &mdash; Test the Low-Pass Filter</h3>
+<p>At action_scale=0.8 the head oscillates while standing still because the neck/head joints are lightly loaded and the BAM friction model was identified under load.
+A low-pass filter has been added to the runtime (<code>--head-low-pass</code>, default &alpha;=0.3).
+Test with and without it:</p>
+<div class="callout">
+  <code>microduck --action-scale 0.8 --head-low-pass</code><br/>
+  <code>microduck --action-scale 0.8 --head-low-pass --head-low-pass-alpha 0.5</code>
+</div>
+<p>If &alpha;=0.3 is too sluggish for intentional head movements (head mode), try 0.5. If still shaky, try 0.2.</p>
+
+<h3>3. Backward Falling &mdash; Is the CoM Fix Working?</h3>
+<p>The &minus;20&deg;/+20&deg; neck/head default was specifically designed to align the CoM over the feet.
+Test: walk forward, then turn, then walk backward. The key question is whether the robot still falls backward on turns and reverse &mdash; this is the clearest symptom of a forward-biased CoM in the model.</p>
+
+<h3>4. Friction Feel &mdash; Is the Gait More Planted?</h3>
+<p>With floor friction base raised to 1.0 and the low-friction tail removed from training, the policy should produce a more confident, planted gait.
+Subjectively: does it feel less &ldquo;slidy&rdquo; than before? Does it handle turning better on the test surface?</p>
+
+<h3>5. Checkpoint Comparison (if time)</h3>
+<p>The current export is at ~2500 iterations (500 after CoM curriculum ends). Try also exporting at ~3500&ndash;4000 (reward plateau).
+Later checkpoints sometimes transfer worse due to sim over-fitting, but sometimes better if the curriculum consolidation needed more time.</p>
+
+<div class="callout warn">
+  <strong>Priority order:</strong> 1 (does it work at all?) &rarr; 3 (backward falling fixed?) &rarr; 2 (head shaking) &rarr; 4 (gait feel) &rarr; 5 (checkpoint timing).
+  If backward falling is not fixed, the most likely remaining causes are: (a) the 80g extra mass is all on trunk_base instead of distributed, (b) the rsl_rl 5.0.1 architecture change.
 </div>
 ''')}
 
