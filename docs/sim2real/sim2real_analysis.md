@@ -514,7 +514,51 @@ The next planned step is to update with New M6 values and retrain, then measure 
 
 ---
 
-## 11. Open Questions and Next Steps
+## 11. The mjlab Update Regression
+
+### 11.1 What Happened
+
+After extensive work on BAM motor identification, reward tuning, DR improvements, and adding new features (ground pick task, roller env, mouth DOF experiments), walking policies began failing systematically on the real robot. Training appeared to succeed — air_time rewards spiked, wandb curves looked healthy — but on hardware the robot fell forward or backward and couldn't take more than 3 steps. Every run was far below the quality of the last known-good policy.
+
+Months of investigation focused on the wrong culprits: motor model, CoM placement, reward weights, observation noise. All were plausible but none explained why a policy that _looked_ good in simulation was so much worse in transfer.
+
+### 11.2 Root Cause: Framework Dependency Update
+
+The regression was traced to a single commit: **`dbaec69`** ("updating mjlab to latest release"), which bumped:
+
+| Dependency | Before (working) | After (broken) |
+|---|---|---|
+| mjlab rev | `d1d32d8b86e68fe317356de2561f4efc63ffcc29` | `5af32e378dcb93c9e881ace83cc5a3f5d373fe60` |
+| rsl-rl-lib | 3.3.0 | 5.0.1 |
+| mujoco | 3.4.0 | 3.6.0 |
+| warp-lang | 1.11.0 | 1.12.0 |
+
+The update touched every env cfg file (renamed observation groups `"policy"` → `"actor"/"critic"`, restructured the RL config, changed the DR API), and likely changed subtle simulation behaviour — contact dynamics, constraint solver parameters, or warp kernel numerics — in ways that were invisible in simulation but catastrophic in transfer.
+
+### 11.3 The Fix
+
+Roll back to the last known-good mjlab revision and lock all dependencies exactly:
+
+```toml
+# pyproject.toml
+mjlab = { git = "https://github.com/mujocolab/mjlab.git", rev = "d1d32d8b86e68fe317356de2561f4efc63ffcc29" }
+
+override-dependencies = [
+    "mujoco>=3.4.0",
+]
+```
+
+With the old `uv.lock` restored (mujoco 3.4.0, warp 1.11.0, rsl-rl-lib 3.3.0), the first retrained policy matched the quality of the original good policy.
+
+### 11.4 Lesson
+
+**Framework updates are not free.** Even a "minor" update to the simulation backend (warp kernels, contact solver, MuJoCo numerics) can silently break sim2real without any visible degradation in training metrics. The policy still converges, the rewards still look reasonable — but the sim physics it learned are now slightly different from the real world in a way that compounds at deployment time.
+
+**Protocol going forward:** before updating any simulation dependency, train a short walk policy with the new version and test it on hardware. If it requires a higher action_scale reduction than the known-good baseline, the update has introduced a regression and should be reverted.
+
+---
+
+## 12. Open Questions and Next Steps
 
 1. **Does retraining with New M6 close the action_scale gap?** Expected: yes partially. M6 gives kp=0.432 vs current 0.386 (+12%), and forcerange=0.750 vs 0.670 (+12%). But unmodelled load-friction still exists.
 
