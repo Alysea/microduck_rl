@@ -476,13 +476,63 @@ BAM on testbench data remains the right approach for motor parameters.</p>
 </table></div>
 ''')}
 
-<!-- ── 11. Future ── -->
-{html_section("future", "11. Beyond Standard MuJoCo: Actuator Nets &amp; Custom Models", '''
+<!-- ── 11. mjlab Regression ── -->
+{html_section("mjlab_regression", "11. The mjlab Update Regression", '''
+<h3>11.1 What Happened</h3>
+<p>After extensive work on BAM motor identification, reward tuning, DR improvements, and adding new features
+(ground pick task, roller env, mouth DOF experiments), walking policies began failing systematically on the
+real robot. Training appeared to succeed — air_time rewards spiked, wandb curves looked healthy — but on
+hardware the robot fell forward or backward and couldn&rsquo;t take more than 3 steps. Every run was far
+below the quality of the last known-good policy.</p>
+<p>Months of investigation focused on the wrong culprits: motor model, CoM placement, reward weights,
+observation noise. All were plausible but none explained why a policy that <em>looked</em> good in simulation
+was so much worse in transfer.</p>
+
+<h3>11.2 Root Cause: Framework Dependency Update</h3>
+<p>The regression was traced to a single commit: <code>dbaec69</code> (&ldquo;updating mjlab to latest release&rdquo;), which bumped:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Dependency</th><th>Before (working)</th><th>After (broken)</th></tr></thead>
+  <tbody>
+    <tr><td>mjlab rev</td><td><code>d1d32d8b&hellip;</code></td><td><code>5af32e37&hellip;</code></td></tr>
+    <tr><td>rsl-rl-lib</td><td>3.3.0</td><td>5.0.1</td></tr>
+    <tr><td>mujoco</td><td>3.4.0</td><td>3.6.0</td></tr>
+    <tr><td>warp-lang</td><td>1.11.0</td><td>1.12.0</td></tr>
+  </tbody>
+</table></div>
+<p>The update touched every env cfg file (renamed observation groups <code>"policy"</code> &rarr; <code>"actor"/"critic"</code>,
+restructured the RL config, changed the DR API), and likely changed subtle simulation behaviour &mdash;
+contact dynamics, constraint solver parameters, or warp kernel numerics &mdash; in ways that were
+invisible in simulation but catastrophic in transfer.</p>
+
+<h3>11.3 The Fix</h3>
+<p>Roll back to the last known-good mjlab revision and lock all dependencies exactly:</p>
+<pre><code># pyproject.toml
+mjlab = { git = "https://github.com/mujocolab/mjlab.git",
+          rev = "d1d32d8b86e68fe317356de2561f4efc63ffcc29" }
+
+override-dependencies = [
+    "mujoco&gt;=3.4.0",
+]</code></pre>
+<p>With the old <code>uv.lock</code> restored (mujoco 3.4.0, warp 1.11.0, rsl-rl-lib 3.3.0), the first
+retrained policy matched the quality of the original good policy.</p>
+
+<h3>11.4 Lesson</h3>
+<p><strong>Framework updates are not free.</strong> Even a &ldquo;minor&rdquo; update to the simulation backend (warp kernels,
+contact solver, MuJoCo numerics) can silently break sim2real without any visible degradation in training
+metrics. The policy still converges, the rewards still look reasonable &mdash; but the sim physics it
+learned are now slightly different from the real world in a way that compounds at deployment time.</p>
+<p><strong>Protocol going forward:</strong> before updating any simulation dependency, train a short walk policy with
+the new version and test it on hardware. If it requires a higher action_scale reduction than the
+known-good baseline, the update has introduced a regression and should be reverted.</p>
+''')}
+
+<!-- ── 12. Future ── -->
+{html_section("future", "12. Beyond Standard MuJoCo: Actuator Nets &amp; Custom Models", '''
 <p>The fundamental problem: MuJoCo&rsquo;s built-in actuator model (kp + damping + frictionloss) cannot represent load-dependent friction, Stribeck effects, or the full BAM M6 model.
 mjlab uses <strong>MuJoCo Warp</strong> (NVIDIA Warp-based GPU acceleration) rather than MJX (JAX-based). This means custom actuator models must be implemented as Warp kernels rather than JAX functions. MuJoCo Warp does not yet support automatic differentiation through the sim, but Warp kernels are JIT-compiled to CUDA and run at full GPU speed.
 Several approaches could close this gap:</p>
 
-<h3>11.1 Actuator Networks</h3>
+<h3>12.1 Actuator Networks</h3>
 <p>Pioneered by <strong>Hwangbo et al. (Science Robotics, 2019)</strong> for ANYmal: train a small MLP on real motor data
 (input: desired position, current position, velocity &rarr; output: torque), then use this net as the actuator model during RL training.
 The network implicitly captures friction nonlinearity, backlash, Stribeck, load-dependence &mdash; everything BAM models explicitly, plus phenomena the analytical model misses.</p>
@@ -516,7 +566,7 @@ def custom_actuator_step(model, data, actuator_net):
     data.qfrc_applied[joint_indices] = torque
     return data</code></pre>
 
-<h3>11.2 Analytical BAM Model in MuJoCo Warp</h3>
+<h3>12.2 Analytical BAM Model in MuJoCo Warp</h3>
 <p>Instead of a neural net, implement the full BAM M5 or M6 friction model analytically as a Warp kernel.
 This is simpler (no training data needed beyond BAM identification) and directly uses the identified parameters:</p>
 <pre><code>@wp.kernel
@@ -540,7 +590,7 @@ external torque requires reading constraint/gravity forces from <code>data.qfrc_
   If it doesn&rsquo;t close the gap, <em>then</em> train an actuator net.
 </div>
 
-<h3>11.3 Feasibility Assessment</h3>
+<h3>12.3 Feasibility Assessment</h3>
 <div class="table-wrap"><table>
   <tr><th>Approach</th><th>Effort</th><th>Expected impact</th><th>Risk</th></tr>
   <tr><td>Update XML with new M6 export</td><td>Low (1 hour)</td><td>Moderate (+12% kp accuracy)</td><td>Low</td></tr>
@@ -550,8 +600,8 @@ external torque requires reading constraint/gravity forces from <code>data.qfrc_
 </table></div>
 ''')}
 
-<!-- ── 12. Next steps ── -->
-{html_section("next", "12. Open Questions, Opinions, and Next Steps", '''
+<!-- ── 13. Next steps ── -->
+{html_section("next", "13. Open Questions, Opinions, and Next Steps", '''
 <h3>Immediate actions</h3>
 <ol>
   <li><strong>Retrain with New M6 export params</strong> (kp=0.432, forcerange=0.750, damping=0.042). Low effort, should close ~50% of action_scale gap.</li>

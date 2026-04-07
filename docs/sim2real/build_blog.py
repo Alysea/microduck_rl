@@ -649,7 +649,7 @@ if __name__ == "__main__":
     if os.path.exists(gist_id_path):
         import subprocess
         gist_id = open(gist_id_path).read().strip()
-        env = {**os.environ, "GITHUB_TOKEN": ""}  # avoid stale token
+        env = {**os.environ, "GITHUB_TOKEN": ""}  # clear stale token, fall back to keyring
         try:
             subprocess.run(
                 ["gh", "gist", "edit", gist_id, "--filename", "sim2real.html", outpath],
