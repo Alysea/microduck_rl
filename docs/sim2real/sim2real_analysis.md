@@ -598,3 +598,24 @@ With the old `uv.lock` restored (mujoco 3.4.0, warp 1.11.0, rsl-rl-lib 3.3.0), t
 | New M6 (clean) — **planned** | **0.432** | 0.008 | **±0.750 Nm** | **TBD** |
 
 The gap between Old M1 kp=0.522 and the real robot's effective kp is what forced action_scale downward. New M6 moves in the right direction. Whether it fully closes the gap depends on how much of the remaining mismatch is load-friction (unmodellable) vs electromechanical error (now corrected).
+
+---
+
+## Update (7 Apr 2026): Training Duration Hurts Sim2Real
+
+### Finding: Earlier Checkpoints Transfer Better
+
+Over-training in simulation degrades sim2real transfer. With the rolled-back mjlab (rev `d1d32d8b`):
+
+- **Final checkpoint** (normal training length): robot shakes at action_scale=0.65.
+- **~2000 iterations**: clean transfer, no shaking.
+
+### Why This Happens
+
+As training continues past the point where the policy can walk robustly, the optimizer exploits simulation-specific dynamics — precise contact timing, exact actuator curves, numerical artefacts in warp kernels. These fine-tuned strategies are brittle and break down on hardware.
+
+Short-trained policies use a more conservative, averaged strategy that tolerates model mismatch naturally.
+
+### Protocol
+
+Export at **~2000 iterations** as the primary candidate. Test on hardware before training further. The action_scale sweep should be done on the early checkpoint, not the final one.

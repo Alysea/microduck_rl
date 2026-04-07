@@ -1228,6 +1228,31 @@ Later checkpoints sometimes transfer worse due to sim over-fitting, but sometime
 </section>
 
 
+<!-- ── Update 7 Apr ── -->
+<section id="update-apr7">
+<h2>Update (7 Apr 2026): Training Duration Hurts Sim2Real</h2>
+
+<h3>Finding: Earlier Checkpoints Transfer Better</h3>
+<p>A new result confirms something hinted at in the Tuesday checklist: <strong>over-training in simulation degrades sim2real transfer</strong>.</p>
+<p>With the rolled-back mjlab (rev <code>d1d32d8b</code>), a freshly trained walk policy shows:</p>
+<ul>
+  <li>At the <strong>final checkpoint</strong> (normal training length): robot shakes at action_scale=0.65. The policy has over-fit to simulator dynamics.</li>
+  <li>At <strong>~2000 iterations</strong>: clean transfer, no shaking. The policy has learned robust locomotion before memorising simulation artefacts.</li>
+</ul>
+
+<h3>Why This Happens</h3>
+<p>As training continues past the point where the policy can walk robustly, the optimizer keeps pushing reward higher by exploiting <em>simulation-specific</em> dynamics &mdash; precise contact timing, exact actuator response curves, or numerical artefacts in the warp kernels. These fine-tuned strategies are brittle: they rely on the sim being exactly right, and any sim2real gap (friction, motor lag, inertia errors) causes them to break down as high-frequency oscillation.</p>
+<p>Short-trained policies have learned a more conservative, averaged strategy that tolerates model mismatch naturally.</p>
+
+<h3>Protocol Going Forward</h3>
+<div class="callout">
+  <strong>Rule of thumb:</strong> export at <strong>~2000 iterations</strong> as the primary candidate. Test on hardware before training further. Only continue training if the early checkpoint is already close to the goal and doesn&rsquo;t exhibit oscillation.
+</div>
+<p>This also means the action_scale sweep should be done at the early checkpoint, not the final one. A policy that needs action_scale=0.5 at the final checkpoint may work fine at 0.65&ndash;0.8 at 2000 iterations.</p>
+
+</section>
+
+
 </div><!-- /wrapper -->
 
 </div><!-- /wrapper -->
