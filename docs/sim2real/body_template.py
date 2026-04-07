@@ -27,12 +27,15 @@ def build_body(f1, f2, f3, f4, f5, f6, f7, f8, f_gap):
     <li><a href="#sysid">MuJoCo System Identification on Walking Data</a></li>
     <li><a href="#action_scale">The action_scale Mystery</a></li>
     <li><a href="#summary">Summary: The Sim2Real Gap Stack</a></li>
+    <li><a href="#actuator_params">Current Actuator Parameters</a></li>
     <li><a href="#future">Beyond Standard MuJoCo: Actuator Nets &amp; Custom Models</a></li>
     <li><a href="#next">Open Questions, Opinions, and Next Steps</a></li>
+    <li><a href="#sim2real_recipes">Sim2Real Tips &amp; Recipes</a></li>
     <li><a href="#update-apr2">Update (2 Apr 2026): BAM M6 Actuator in MuJoCo Warp</a></li>
     <li><a href="#update-apr3">Update (3 Apr 2026): Debugging the Training Regression</a></li>
     <li><a href="#update-apr4">Update (4 Apr 2026): Next Experiments</a></li>
     <li><a href="#update-apr5">Update (5 Apr 2026): Tuesday Test Checklist</a></li>
+    <li><a href="#update-apr7">Update (7 Apr 2026): Two Key Findings</a></li>
   </ol>
 </nav>
 
@@ -476,63 +479,25 @@ BAM on testbench data remains the right approach for motor parameters.</p>
 </table></div>
 ''')}
 
-<!-- ── 11. mjlab Regression ── -->
-{html_section("mjlab_regression", "11. The mjlab Update Regression", '''
-<h3>11.1 What Happened</h3>
-<p>After extensive work on BAM motor identification, reward tuning, DR improvements, and adding new features
-(ground pick task, roller env, mouth DOF experiments), walking policies began failing systematically on the
-real robot. Training appeared to succeed — air_time rewards spiked, wandb curves looked healthy — but on
-hardware the robot fell forward or backward and couldn&rsquo;t take more than 3 steps. Every run was far
-below the quality of the last known-good policy.</p>
-<p>Months of investigation focused on the wrong culprits: motor model, CoM placement, reward weights,
-observation noise. All were plausible but none explained why a policy that <em>looked</em> good in simulation
-was so much worse in transfer.</p>
-
-<h3>11.2 Root Cause: Framework Dependency Update</h3>
-<p>The regression was traced to a single commit: <code>dbaec69</code> (&ldquo;updating mjlab to latest release&rdquo;), which bumped:</p>
-<div class="table-wrap"><table>
-  <thead><tr><th>Dependency</th><th>Before (working)</th><th>After (broken)</th></tr></thead>
-  <tbody>
-    <tr><td>mjlab rev</td><td><code>d1d32d8b&hellip;</code></td><td><code>5af32e37&hellip;</code></td></tr>
-    <tr><td>rsl-rl-lib</td><td>3.3.0</td><td>5.0.1</td></tr>
-    <tr><td>mujoco</td><td>3.4.0</td><td>3.6.0</td></tr>
-    <tr><td>warp-lang</td><td>1.11.0</td><td>1.12.0</td></tr>
-  </tbody>
-</table></div>
-<p>The update touched every env cfg file (renamed observation groups <code>"policy"</code> &rarr; <code>"actor"/"critic"</code>,
-restructured the RL config, changed the DR API), and likely changed subtle simulation behaviour &mdash;
-contact dynamics, constraint solver parameters, or warp kernel numerics &mdash; in ways that were
-invisible in simulation but catastrophic in transfer.</p>
-
-<h3>11.3 The Fix</h3>
-<p>Roll back to the last known-good mjlab revision and lock all dependencies exactly:</p>
-<pre><code># pyproject.toml
-mjlab = { git = "https://github.com/mujocolab/mjlab.git",
-          rev = "d1d32d8b86e68fe317356de2561f4efc63ffcc29" }
-
-override-dependencies = [
-    "mujoco&gt;=3.4.0",
-]</code></pre>
-<p>With the old <code>uv.lock</code> restored (mujoco 3.4.0, warp 1.11.0, rsl-rl-lib 3.3.0), the first
-retrained policy matched the quality of the original good policy.</p>
-
-<h3>11.4 Lesson</h3>
-<p><strong>Framework updates are not free.</strong> Even a &ldquo;minor&rdquo; update to the simulation backend (warp kernels,
-contact solver, MuJoCo numerics) can silently break sim2real without any visible degradation in training
-metrics. The policy still converges, the rewards still look reasonable &mdash; but the sim physics it
-learned are now slightly different from the real world in a way that compounds at deployment time.</p>
-<p><strong>Protocol going forward:</strong> before updating any simulation dependency, train a short walk policy with
-the new version and test it on hardware. If it requires a higher action_scale reduction than the
-known-good baseline, the update has introduced a regression and should be reverted.</p>
+<!-- ── 10b. Current actuator params ── -->
+{html_section("actuator_params", "10b. Current Actuator Parameters in Training XML", '''
+<p>The training XML (<code>joints_properties.xml</code>) currently uses:</p>
+<pre><code>&lt;default class="chosen_actuator"&gt;
+  &lt;joint damping="0.041" frictionloss="0.032" armature="0.002"/&gt;
+  &lt;position kp="0.386" kv="0.0" forcerange="-0.67 0.67" ctrlrange="-10.0 10.0"/&gt;
+&lt;/default&gt;</code></pre>
+<p>These correspond approximately to <strong>New M1</strong> values (kp=0.386, forcerange=0.670 Nm).
+Compared to what New M6 suggests (kp=0.432, forcerange=0.750 Nm), the current params are ~10% conservative on both gains and torque.</p>
+<p>The next planned step is to update with New M6 values and retrain, then measure the required <code>action_scale</code> empirically.</p>
 ''')}
 
-<!-- ── 12. Future ── -->
-{html_section("future", "12. Beyond Standard MuJoCo: Actuator Nets &amp; Custom Models", '''
+<!-- ── 11. Future ── -->
+{html_section("future", "11. Beyond Standard MuJoCo: Actuator Nets &amp; Custom Models", '''
 <p>The fundamental problem: MuJoCo&rsquo;s built-in actuator model (kp + damping + frictionloss) cannot represent load-dependent friction, Stribeck effects, or the full BAM M6 model.
 mjlab uses <strong>MuJoCo Warp</strong> (NVIDIA Warp-based GPU acceleration) rather than MJX (JAX-based). This means custom actuator models must be implemented as Warp kernels rather than JAX functions. MuJoCo Warp does not yet support automatic differentiation through the sim, but Warp kernels are JIT-compiled to CUDA and run at full GPU speed.
 Several approaches could close this gap:</p>
 
-<h3>12.1 Actuator Networks</h3>
+<h3>11.1 Actuator Networks</h3>
 <p>Pioneered by <strong>Hwangbo et al. (Science Robotics, 2019)</strong> for ANYmal: train a small MLP on real motor data
 (input: desired position, current position, velocity &rarr; output: torque), then use this net as the actuator model during RL training.
 The network implicitly captures friction nonlinearity, backlash, Stribeck, load-dependence &mdash; everything BAM models explicitly, plus phenomena the analytical model misses.</p>
@@ -566,7 +531,7 @@ def custom_actuator_step(model, data, actuator_net):
     data.qfrc_applied[joint_indices] = torque
     return data</code></pre>
 
-<h3>12.2 Analytical BAM Model in MuJoCo Warp</h3>
+<h3>11.2 Analytical BAM Model in MuJoCo Warp</h3>
 <p>Instead of a neural net, implement the full BAM M5 or M6 friction model analytically as a Warp kernel.
 This is simpler (no training data needed beyond BAM identification) and directly uses the identified parameters:</p>
 <pre><code>@wp.kernel
@@ -590,7 +555,7 @@ external torque requires reading constraint/gravity forces from <code>data.qfrc_
   If it doesn&rsquo;t close the gap, <em>then</em> train an actuator net.
 </div>
 
-<h3>12.3 Feasibility Assessment</h3>
+<h3>11.3 Feasibility Assessment</h3>
 <div class="table-wrap"><table>
   <tr><th>Approach</th><th>Effort</th><th>Expected impact</th><th>Risk</th></tr>
   <tr><td>Update XML with new M6 export</td><td>Low (1 hour)</td><td>Moderate (+12% kp accuracy)</td><td>Low</td></tr>
@@ -600,8 +565,8 @@ external torque requires reading constraint/gravity forces from <code>data.qfrc_
 </table></div>
 ''')}
 
-<!-- ── 13. Next steps ── -->
-{html_section("next", "13. Open Questions, Opinions, and Next Steps", '''
+<!-- ── 12. Next steps ── -->
+{html_section("next", "12. Open Questions, Opinions, and Next Steps", '''
 <h3>Immediate actions</h3>
 <ol>
   <li><strong>Retrain with New M6 export params</strong> (kp=0.432, forcerange=0.750, damping=0.042). Low effort, should close ~50% of action_scale gap.</li>
@@ -639,6 +604,44 @@ external torque requires reading constraint/gravity forces from <code>data.qfrc_
   <li><strong>Battery voltage</strong> is a first-order effect that&rsquo;s not in the training loop at all.</li>
   <li>The <strong>lateral lean</strong> suggests the CoM model is wrong and/or left-right motor characteristics differ significantly. Neither is addressed in training.</li>
   <li><strong>Terrain transfer</strong> is entirely untested on the real robot.</li>
+</ul>
+''')}
+
+<!-- ── Sim2Real Recipes ── -->
+{html_section("sim2real_recipes", "What Actually Worked: MicroDuck Sim2Real Lessons", '''
+<p>Concrete findings from this project, in roughly the order we discovered them.</p>
+
+<h3>Motor Identification</h3>
+<ul>
+  <li><strong>BAM testbench data can be contaminated without obvious signs.</strong> Our initial M1/M6 fits used data from servos with dirty commutators. The identified params looked plausible but inflated friction and distorted kt/R. Re-running identification on cleaned servos produced noticeably different &mdash; and better-transferring &mdash; params.</li>
+  <li><strong>The XL330 firmware kp register is not MuJoCo&rsquo;s kp.</strong> Direct translation fails. We used the BAM voltage-control law to derive the equivalent MuJoCo kp from the firmware register value, supply voltage, and encoder resolution. Getting this right was necessary to match sim stiffness to the real robot.</li>
+</ul>
+
+<h3>Domain Randomisation</h3>
+<ul>
+  <li><strong>Kp DR covers battery discharge.</strong> As the LiPo drains, effective motor gain drops. Randomising Kp &times;(0.85, 1.15) made the policy robust to this without needing explicit voltage compensation in training.</li>
+  <li><strong>Floor friction DR range matters.</strong> We trained with friction (0.3, 1.2) to cover slippery to grippy surfaces. After switching to a grippier footpad, tightening the range to (0.7, 1.3) produced a more planted, confident gait &mdash; the policy stopped wasting capacity on low-friction strategies it no longer needed.</li>
+  <li><strong>Observation and action delay randomisation is necessary on USB-connected hardware.</strong> USB scheduling jitter means the actual delay varies per step. Without 0&ndash;3 step delay DR, the policy was brittle to this.</li>
+</ul>
+
+<h3>Training</h3>
+<ul>
+  <li><strong>Export early (~2000 iterations), not at the reward peak.</strong> At 2000 iterations the policy walks robustly and transfers cleanly (action_scale ~0.65). Continuing to train pushes the reward higher but the policy starts exploiting simulator-specific dynamics &mdash; exact contact timing, warp kernel artefacts &mdash; that don&rsquo;t exist on hardware. The result is high-frequency oscillation even at the same action_scale that worked earlier.</li>
+  <li><strong>Symmetry loss hurt our sim2real transfer.</strong> With symmetry enabled, the policy couldn&rsquo;t develop asymmetric compensation for the real robot&rsquo;s left-right motor variation and CoM offset. Disabling it improved transfer significantly.</li>
+  <li><strong>Lock your simulation dependencies and treat them like production code.</strong> A single commit that bumped mjlab/MuJoCo/warp introduced a months-long regression that was invisible in training metrics. Rolling back to the exact working versions (committed <code>uv.lock</code>) immediately fixed it. Before updating any sim dependency, train a short walk policy and test on hardware.</li>
+</ul>
+
+<h3>Physical Model</h3>
+<ul>
+  <li><strong>The 80g of unmodelled mass (wiring, PCB, screws) matters.</strong> Lumping it all on the trunk raised the CoM and increased pitch inertia, causing backward-falling instability on the real robot. A more realistic distribution is needed.</li>
+  <li><strong>Small joint offsets shift the CoM significantly on a small robot.</strong> Setting neck_pitch=&minus;20&deg; and head_pitch=+20&deg; moved enough head mass rearward to visibly improve stability. The absolute mass moved is small (&lt;100g) but the moment arm is large relative to foot width.</li>
+</ul>
+
+<h3>Deployment</h3>
+<ul>
+  <li><strong>Battery voltage compensation in the runtime runtime is necessary.</strong> We measure voltage each step and scale actions by Vin/Vnom. Without it, the robot walks fine on a full battery and poorly on a depleted one.</li>
+  <li><strong>Head/neck joints need a low-pass filter when unloaded.</strong> These joints have very little inertia and the firmware gain is tuned for loaded leg joints. At action_scale=0.8 they oscillate when standing still. An exponential filter (&alpha;&asymp;0.3) on the runtime command eliminates this with no visible effect on intentional head movement.</li>
+  <li><strong>action_scale needs to be swept empirically on the real robot.</strong> Despite careful sysid, the remaining sim2real gap means you can&rsquo;t predict the right scale from training alone. We start at 0.5 and increment until the gait becomes unstable.</li>
 </ul>
 ''')}
 
@@ -1075,24 +1078,48 @@ Later checkpoints sometimes transfer worse due to sim over-fitting, but sometime
 ''')}
 
 <!-- ── Update 7 Apr ── -->
-{html_section("update-apr7", "Update (7 Apr 2026): Training Duration Hurts Sim2Real", '''
-<h3>Finding: Earlier Checkpoints Transfer Better</h3>
-<p>A new result confirms something hinted at in the Tuesday checklist: <strong>over-training in simulation degrades sim2real transfer</strong>.</p>
-<p>With the rolled-back mjlab (rev <code>d1d32d8b</code>), a freshly trained walk policy shows:</p>
-<ul>
-  <li>At the <strong>final checkpoint</strong> (normal training length): robot shakes at action_scale=0.65. The policy has over-fit to simulator dynamics.</li>
-  <li>At <strong>~2000 iterations</strong>: clean transfer, no shaking. The policy has learned robust locomotion before memorising simulation artefacts.</li>
-</ul>
-
-<h3>Why This Happens</h3>
-<p>As training continues past the point where the policy can walk robustly, the optimizer keeps pushing reward higher by exploiting <em>simulation-specific</em> dynamics &mdash; precise contact timing, exact actuator response curves, or numerical artefacts in the warp kernels. These fine-tuned strategies are brittle: they rely on the sim being exactly right, and any sim2real gap (friction, motor lag, inertia errors) causes them to break down as high-frequency oscillation.</p>
-<p>Short-trained policies have learned a more conservative, averaged strategy that tolerates model mismatch naturally.</p>
-
-<h3>Protocol Going Forward</h3>
-<div class="callout">
-  <strong>Rule of thumb:</strong> export at <strong>~2000 iterations</strong> as the primary candidate. Test on hardware before training further. Only continue training if the early checkpoint is already close to the goal and doesn&rsquo;t exhibit oscillation.
+{html_section("update-apr7", "Update (7 Apr 2026): Two Key Findings", '''
+<h3>Finding 1: The mjlab Update Was the Root Cause All Along</h3>
+<p>After months investigating sim2real failures (motor model, CoM placement, reward weights, observation noise),
+the true culprit was a single dependency update commit <code>dbaec69</code> (&ldquo;updating mjlab to latest release&rdquo;) that bumped:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Dependency</th><th>Before (working)</th><th>After (broken)</th></tr></thead>
+  <tbody>
+    <tr><td>mjlab rev</td><td><code>d1d32d8b&hellip;</code></td><td><code>5af32e37&hellip;</code></td></tr>
+    <tr><td>rsl-rl-lib</td><td>3.3.0</td><td>5.0.1</td></tr>
+    <tr><td>mujoco</td><td>3.4.0</td><td>3.6.0</td></tr>
+    <tr><td>warp-lang</td><td>1.11.0</td><td>1.12.0</td></tr>
+  </tbody>
+</table></div>
+<p>The update likely changed subtle simulation behaviour &mdash; contact dynamics, constraint solver parameters,
+or warp kernel numerics &mdash; in ways invisible during training but catastrophic at deployment.
+Rolling back to the old <code>uv.lock</code> and retraining immediately produced a policy matching the quality
+of the original good policy.</p>
+<pre><code># pyproject.toml
+mjlab = { git = "https://github.com/mujocolab/mjlab.git",
+          rev = "d1d32d8b86e68fe317356de2561f4efc63ffcc29" }
+override-dependencies = ["mujoco&gt;=3.4.0"]</code></pre>
+<div class="callout warn">
+  <strong>Lesson:</strong> Framework updates are not free. Even a &ldquo;minor&rdquo; sim backend bump can silently break
+  sim2real with no visible degradation in training metrics. Before updating any simulation dependency,
+  train a short walk policy and test on hardware &mdash; if action_scale drops vs the known-good baseline, revert.
 </div>
-<p>This also means the action_scale sweep should be done at the early checkpoint, not the final one. A policy that needs action_scale=0.5 at the final checkpoint may work fine at 0.65&ndash;0.8 at 2000 iterations.</p>
+
+<h3>Finding 2: Over-Training Hurts Sim2Real</h3>
+<p>With the rolled-back mjlab, a second finding emerged: <strong>training too long degrades transfer</strong>.</p>
+<ul>
+  <li>At the <strong>final checkpoint</strong> (normal training length): robot shakes at action_scale=0.65.</li>
+  <li>At <strong>~2000 iterations</strong>: clean transfer, no shaking.</li>
+</ul>
+<p>Past the point where the policy walks robustly, the optimizer exploits simulation-specific dynamics &mdash;
+precise contact timing, exact actuator curves, numerical artefacts in warp kernels. These strategies are
+brittle: any sim2real gap causes them to break down as high-frequency oscillation.
+Short-trained policies use a more conservative strategy that tolerates model mismatch naturally.</p>
+<div class="callout">
+  <strong>Protocol:</strong> export at <strong>~2000 iterations</strong> as the primary candidate. Test on hardware before
+  training further. Run the action_scale sweep on the early checkpoint &mdash; a policy needing
+  action_scale=0.5 at the end may work fine at 0.65&ndash;0.8 at iter 2000.
+</div>
 ''')}
 
 </div><!-- /wrapper -->
