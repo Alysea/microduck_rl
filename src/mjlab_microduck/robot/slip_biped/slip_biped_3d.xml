@@ -1,0 +1,113 @@
+<mujoco model="slip_biped_3d">
+  <!--
+    3D version of the SLIP biped toy.  Same masses / dimensions / passive
+    springs as slip_biped_2d.xml.  Differences:
+      * Floating base — single <freejoint> on torso (replaces slider_x +
+        slider_z + hinge_pitch planar mount).  Now mjlab's stock floating-
+        base helpers (projected_gravity, base_lin_vel, reset_root_state_…)
+        all work directly.
+      * Each leg gains a hip_roll hinge (X axis) declared *before* the
+        existing hip_pitch.  Standard humanoid layout: outer joint = roll,
+        inner = pitch.  4 actuators total → 4-D action.
+
+    Total mass remains 0.75 kg.  Nominal standing height ~0.132 m torso
+    centre (~0.124 m after static spring sag).
+  -->
+
+  <compiler angle="radian" autolimits="true"/>
+
+  <option timestep="0.001" iterations="50" solver="Newton"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512"
+             rgb1="0.25 0.26 0.28" rgb2="0.32 0.33 0.35"/>
+    <material name="grid" texture="grid" texrepeat="2 2" reflectance="0.1"/>
+  </asset>
+
+  <default>
+    <joint armature="0.001" damping="0.02"/>
+    <geom friction="0.8 0.1 0.1" rgba="0.7 0.7 0.8 1"/>
+    <default class="leg">
+      <geom type="capsule" size="0.008"/>
+    </default>
+    <default class="foot">
+      <geom type="sphere" size="0.012" rgba="0.2 0.2 0.2 1" friction="1.0 0.1 0.1"/>
+    </default>
+    <default class="hip_act">
+      <!-- Position control. kp=5 N·m/rad, kv=0.1 N·m·s/rad, torque clipped
+           at ±0.5 Nm (≈ XL330 stall torque, the right scale for a 0.75 kg
+           toy). Same defaults as 2D so the policy transfer story stays
+           clean. -->
+      <position kp="5" kv="0.1" ctrlrange="-1.57 1.57"
+                forcelimited="true" forcerange="-0.5 0.5"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 2" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="0 0 0.05" material="grid"/>
+
+    <body name="torso" pos="0 0 0.132">
+      <freejoint name="torso_freejoint"/>
+
+      <geom name="torso_box" type="box" size="0.02 0.025 0.02" mass="0.65"
+            rgba="0.3 0.5 0.9 1"/>
+      <site name="imu" pos="0 0 0"/>
+
+      <!-- ── Left leg ─────────────────────────────────────────────────── -->
+      <body name="left_upper_leg" pos="0 0.025 -0.02">
+        <!-- roll → pitch (humanoid convention).  Roll has a tighter range
+             since legs aren't expected to abduct far in this toy. -->
+        <joint name="left_hip_roll"  type="hinge" axis="1 0 0" range="-0.6 0.6"/>
+        <joint name="left_hip_pitch" type="hinge" axis="0 1 0" range="-1.57 1.57"/>
+        <geom class="leg" fromto="0 0 0   0 0 -0.05" mass="0.025"/>
+
+        <body name="left_lower_leg" pos="0 0 -0.05">
+          <joint name="left_spring" type="slide" axis="0 0 1"
+                 range="0 0.03" stiffness="500" damping="0.2"
+                 springref="0" armature="0"/>
+          <geom class="leg" fromto="0 0 0   0 0 -0.05" mass="0.020"
+                rgba="0.55 0.55 0.65 1"/>
+          <geom class="foot" name="left_foot" pos="0 0 -0.05" mass="0.005"/>
+        </body>
+      </body>
+
+      <!-- ── Right leg (mirror about XZ plane) ────────────────────────── -->
+      <body name="right_upper_leg" pos="0 -0.025 -0.02">
+        <joint name="right_hip_roll"  type="hinge" axis="1 0 0" range="-0.6 0.6"/>
+        <joint name="right_hip_pitch" type="hinge" axis="0 1 0" range="-1.57 1.57"/>
+        <geom class="leg" fromto="0 0 0   0 0 -0.05" mass="0.025"/>
+
+        <body name="right_lower_leg" pos="0 0 -0.05">
+          <joint name="right_spring" type="slide" axis="0 0 1"
+                 range="0 0.03" stiffness="500" damping="0.2"
+                 springref="0" armature="0"/>
+          <geom class="leg" fromto="0 0 0   0 0 -0.05" mass="0.020"
+                rgba="0.55 0.55 0.65 1"/>
+          <geom class="foot" name="right_foot" pos="0 0 -0.05" mass="0.005"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position class="hip_act" name="left_hip_roll_act"   joint="left_hip_roll"/>
+    <position class="hip_act" name="left_hip_pitch_act"  joint="left_hip_pitch"/>
+    <position class="hip_act" name="right_hip_roll_act"  joint="right_hip_roll"/>
+    <position class="hip_act" name="right_hip_pitch_act" joint="right_hip_pitch"/>
+  </actuator>
+
+  <sensor>
+    <framepos    name="torso_pos"  objtype="body" objname="torso"/>
+    <framequat   name="torso_quat" objtype="body" objname="torso"/>
+    <framelinvel name="torso_lvel" objtype="body" objname="torso"/>
+    <frameangvel name="torso_avel" objtype="body" objname="torso"/>
+    <jointpos name="left_spring_compression"  joint="left_spring"/>
+    <jointpos name="right_spring_compression" joint="right_spring"/>
+  </sensor>
+</mujoco>

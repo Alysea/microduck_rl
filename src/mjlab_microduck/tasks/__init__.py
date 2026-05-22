@@ -36,6 +36,38 @@ from .testbench_env_cfg import (
     make_testbench_env_cfg,
     MicroduckTestbenchRlCfg,
 )
+from .slip_biped_balance_env_cfg import (
+    make_slip_biped_balance_env_cfg,
+    SlipBipedBalanceRlCfg,
+)
+from .slip_biped_balance_3d_env_cfg import (
+    make_slip_biped_balance_3d_env_cfg,
+    SlipBipedBalance3DRlCfg,
+)
+from .slip_biped_hop_3d_env_cfg import (
+    make_slip_biped_hop_3d_env_cfg,
+    SlipBipedHop3DRlCfg,
+)
+from .slip_biped_velocity_3d_env_cfg import (
+    make_slip_biped_velocity_3d_env_cfg,
+    SlipBipedVelocity3DRlCfg,
+)
+from .slip_biped_run_3d_env_cfg import (
+    make_slip_biped_run_3d_env_cfg,
+    SlipBipedRun3DRlCfg,
+)
+from .microduck_hop_sprung_env_cfg import (
+    make_microduck_hop_sprung_env_cfg,
+    MicroduckHopSprungRlCfg,
+)
+from .microduck_hop_forward_sprung_env_cfg import (
+    make_microduck_hop_forward_sprung_env_cfg,
+    MicroduckHopForwardSprungRlCfg,
+)
+from .microduck_velocity_sprung_env_cfg import (
+    make_microduck_velocity_sprung_env_cfg,
+    MicroduckVelocitySprungRlCfg,
+)
 
 def _make_roller_get_base_metadata():
     """Return a get_base_metadata replacement that skips joints with no actuator.
@@ -172,3 +204,85 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 print("✓ Testbench task registered: Mjlab-Testbench-XL330")
+
+# SLIP biped 2D toy — first RL experiment on the sprung-leg model
+register_mjlab_task(
+    task_id="Mjlab-Balance-SlipBiped-2D",
+    env_cfg=make_slip_biped_balance_env_cfg(),
+    play_env_cfg=make_slip_biped_balance_env_cfg(play=True),
+    rl_cfg=SlipBipedBalanceRlCfg,
+    runner_cls=None,  # default OnPolicyRunner is fine — no symmetry
+)
+print("✓ SLIP biped balance task registered: Mjlab-Balance-SlipBiped-2D")
+
+# SLIP biped 3D — same don't-fall task, free joint + hip_roll added
+register_mjlab_task(
+    task_id="Mjlab-Balance-SlipBiped-3D",
+    env_cfg=make_slip_biped_balance_3d_env_cfg(),
+    play_env_cfg=make_slip_biped_balance_3d_env_cfg(play=True),
+    rl_cfg=SlipBipedBalance3DRlCfg,
+    runner_cls=None,
+)
+print("✓ SLIP biped balance task registered: Mjlab-Balance-SlipBiped-3D")
+
+# SLIP biped 3D — hop in place (bounce vertically without horizontal drift)
+register_mjlab_task(
+    task_id="Mjlab-Hop-SlipBiped-3D",
+    env_cfg=make_slip_biped_hop_3d_env_cfg(),
+    play_env_cfg=make_slip_biped_hop_3d_env_cfg(play=True),
+    rl_cfg=SlipBipedHop3DRlCfg,
+    runner_cls=None,
+)
+print("✓ SLIP biped hop task registered: Mjlab-Hop-SlipBiped-3D")
+
+# SLIP biped 3D — forward velocity tracking (first locomotion task)
+register_mjlab_task(
+    task_id="Mjlab-Velocity-SlipBiped-3D",
+    env_cfg=make_slip_biped_velocity_3d_env_cfg(),
+    play_env_cfg=make_slip_biped_velocity_3d_env_cfg(play=True),
+    rl_cfg=SlipBipedVelocity3DRlCfg,
+    runner_cls=None,
+)
+print("✓ SLIP biped velocity task registered: Mjlab-Velocity-SlipBiped-3D")
+
+# SLIP biped 3D — running (fast forward velocity, airborne phases encouraged)
+register_mjlab_task(
+    task_id="Mjlab-Run-SlipBiped-3D",
+    env_cfg=make_slip_biped_run_3d_env_cfg(),
+    play_env_cfg=make_slip_biped_run_3d_env_cfg(play=True),
+    rl_cfg=SlipBipedRun3DRlCfg,
+    runner_cls=None,
+)
+print("✓ SLIP biped run task registered: Mjlab-Run-SlipBiped-3D")
+
+# MicroDuck sprung-shank prototype: hop in place
+register_mjlab_task(
+    task_id="Mjlab-Hop-MicroDuck-Sprung",
+    env_cfg=make_microduck_hop_sprung_env_cfg(),
+    play_env_cfg=make_microduck_hop_sprung_env_cfg(play=True),
+    rl_cfg=MicroduckHopSprungRlCfg,
+    runner_cls=None,
+)
+print("✓ MicroDuck sprung hop task registered: Mjlab-Hop-MicroDuck-Sprung")
+
+# MicroDuck sprung-shank prototype: hop forward at commanded velocity
+register_mjlab_task(
+    task_id="Mjlab-HopForward-MicroDuck-Sprung",
+    env_cfg=make_microduck_hop_forward_sprung_env_cfg(),
+    play_env_cfg=make_microduck_hop_forward_sprung_env_cfg(play=True),
+    rl_cfg=MicroduckHopForwardSprungRlCfg,
+    runner_cls=None,
+)
+print("✓ MicroDuck sprung hop-forward task registered: Mjlab-HopForward-MicroDuck-Sprung")
+
+# MicroDuck sprung-shank velocity task — built on the stock velocity env
+# template with feet_air_time + foot-quality rewards (same recipe as the
+# rigid microduck task). Encourages alternating walking/running gait.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Flat-MicroDuck-Sprung",
+    env_cfg=make_microduck_velocity_sprung_env_cfg(),
+    play_env_cfg=make_microduck_velocity_sprung_env_cfg(play=True),
+    rl_cfg=MicroduckVelocitySprungRlCfg,
+    runner_cls=None,
+)
+print("✓ MicroDuck sprung velocity task registered: Mjlab-Velocity-Flat-MicroDuck-Sprung")

@@ -1,0 +1,120 @@
+<mujoco model="slip_biped_2d">
+  <!--
+    SLIP-style toy biped, constrained to the sagittal (XZ) plane.
+
+      torso ──┬── (left)  hip_pitch ─ upper_leg ─ spring(slide) ─ lower_leg + foot
+              └── (right) hip_pitch ─ upper_leg ─ spring(slide) ─ lower_leg + foot
+
+    2D constraint: the torso is mounted to world via three explicit joints
+    (slider_x, slider_z, hinge_pitch) instead of a free joint, eliminating
+    lateral / yaw / roll DoFs. Going to 3D = replace these three with a free
+    joint and add a hip_roll hinge on each upper_leg.
+
+    Sizes / masses match MicroDuck's overall scale: torso center ~0.13 m,
+    total mass ~0.32 kg.
+  -->
+
+  <compiler angle="radian" autolimits="true"/>
+
+  <option timestep="0.001" iterations="50" solver="Newton"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" width="512" height="512"
+             rgb1="0.25 0.26 0.28" rgb2="0.32 0.33 0.35"/>
+    <material name="grid" texture="grid" texrepeat="2 2" reflectance="0.1"/>
+  </asset>
+
+  <default>
+    <joint armature="0.001" damping="0.02"/>
+    <geom friction="0.8 0.1 0.1" rgba="0.7 0.7 0.8 1"/>
+    <default class="leg">
+      <geom type="capsule" size="0.008"/>
+    </default>
+    <default class="foot">
+      <geom type="sphere" size="0.012" rgba="0.2 0.2 0.2 1" friction="1.0 0.1 0.1"/>
+    </default>
+    <default class="hip_act">
+      <!-- Position control. ctrl is hip target angle in rad.  kp=5 N·m/rad
+           supports body weight at <0.1 rad error; kv=0.1 ≈ critical damping
+           for the upper-leg inertia.  forcerange caps the output torque so
+           large position errors (or noisy RL actions) can't launch the leg —
+           ±0.5 Nm is roughly an XL330's stall torque, an appropriate scale
+           for a 0.75 kg toy. -->
+      <position kp="5" kv="0.1" ctrlrange="-1.57 1.57"
+                forcelimited="true" forcerange="-0.5 0.5"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 2" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="0 0 0.05" material="grid"/>
+
+    <!-- Initial torso z chosen so the foot sphere just touches the floor when
+         the spring is at rest (uncompressed). Static gravity then compresses
+         each spring by ~2.4 mm, settling the torso to ~0.130 m. -->
+    <body name="torso" pos="0 0 0.132">
+      <!-- 2D planar mount: x translation, z translation, pitch rotation. -->
+      <joint name="slider_x"    type="slide" axis="1 0 0" damping="0" armature="0"/>
+      <joint name="slider_z"    type="slide" axis="0 0 1" damping="0" armature="0"/>
+      <joint name="hinge_pitch" type="hinge" axis="0 1 0" damping="0" armature="0"/>
+
+      <geom name="torso_box" type="box" size="0.02 0.025 0.02" mass="0.65"
+            rgba="0.3 0.5 0.9 1"/>
+      <site name="imu" pos="0 0 0"/>
+
+      <!-- ── Left leg ─────────────────────────────────────────────────── -->
+      <body name="left_upper_leg" pos="0 0.025 -0.02">
+        <joint name="left_hip_pitch" type="hinge" axis="0 1 0" range="-1.57 1.57"/>
+        <geom class="leg" fromto="0 0 0   0 0 -0.05" mass="0.025"/>
+
+        <body name="left_lower_leg" pos="0 0 -0.05">
+          <!-- Passive linear spring along the leg axis.
+               axis="0 0 1": +q = compression (foot moves up toward hip).
+               range="0 0.03": rest at q=0, up to 30 mm compression.
+               springref="0": equilibrium at full extension.
+               stiffness=500 N/m, damping=2 N·s/m. -->
+          <joint name="left_spring" type="slide" axis="0 0 1"
+                 range="0 0.03" stiffness="500" damping="0.2"
+                 springref="0" armature="0"/>
+          <geom class="leg" fromto="0 0 0   0 0 -0.05" mass="0.020"
+                rgba="0.55 0.55 0.65 1"/>
+          <geom class="foot" name="left_foot" pos="0 0 -0.05" mass="0.005"/>
+        </body>
+      </body>
+
+      <!-- ── Right leg (mirror about XZ plane) ────────────────────────── -->
+      <body name="right_upper_leg" pos="0 -0.025 -0.02">
+        <joint name="right_hip_pitch" type="hinge" axis="0 1 0" range="-1.57 1.57"/>
+        <geom class="leg" fromto="0 0 0   0 0 -0.05" mass="0.025"/>
+
+        <body name="right_lower_leg" pos="0 0 -0.05">
+          <joint name="right_spring" type="slide" axis="0 0 1"
+                 range="0 0.03" stiffness="500" damping="0.2"
+                 springref="0" armature="0"/>
+          <geom class="leg" fromto="0 0 0   0 0 -0.05" mass="0.020"
+                rgba="0.55 0.55 0.65 1"/>
+          <geom class="foot" name="right_foot" pos="0 0 -0.05" mass="0.005"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position class="hip_act" name="left_hip_pitch_act"  joint="left_hip_pitch"/>
+    <position class="hip_act" name="right_hip_pitch_act" joint="right_hip_pitch"/>
+  </actuator>
+
+  <sensor>
+    <framepos    name="torso_pos"  objtype="body" objname="torso"/>
+    <framequat   name="torso_quat" objtype="body" objname="torso"/>
+    <framelinvel name="torso_lvel" objtype="body" objname="torso"/>
+    <frameangvel name="torso_avel" objtype="body" objname="torso"/>
+    <jointpos name="left_spring_compression"  joint="left_spring"/>
+    <jointpos name="right_spring_compression" joint="right_spring"/>
+  </sensor>
+</mujoco>
