@@ -6,12 +6,18 @@ arbitrary (vx, vy, ωz) commands.  Works for any task that uses mjlab's
 stock `UniformVelocityCommand` — pass the task id with --task.
 
 Examples:
-    # New sprung velocity task (built on stock velocity env template):
+    # Local checkpoint:
     uv run python scripts/play_hop_forward_interactive.py \\
         --task Mjlab-Velocity-Flat-MicroDuck-Sprung \\
         --checkpoint_file logs/rsl_rl/microduck_velocity_sprung/<ts>/model_9999.pt
 
-    # Original sprung hop-forward task (custom rewards, kept for history):
+    # Checkpoint downloaded from a wandb run (matches the stock `play`
+    # CLI's --wandb-run-path).  Requires real wandb, not trackio:
+    MJLAB_MICRODUCK_LOGGER=wandb uv run python scripts/play_hop_forward_interactive.py \\
+        --task Mjlab-Velocity-Flat-MicroDuck-Sprung \\
+        --wandb-run-path entity/mjlab_microduck/<run_id>
+
+    # Previous (legacy) hop-forward task — works the same way:
     uv run python scripts/play_hop_forward_interactive.py \\
         --task Mjlab-HopForward-MicroDuck-Sprung \\
         --checkpoint_file logs/rsl_rl/microduck_hop_forward_sprung/<ts>/model_XXXX.pt
@@ -49,6 +55,7 @@ import mjlab_microduck.tasks  # noqa: F401  (task registration)
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
+from mjlab.utils.os import get_wandb_checkpoint_path
 from mjlab.viewer import NativeMujocoViewer
 
 
@@ -56,7 +63,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", default="Mjlab-Velocity-Flat-MicroDuck-Sprung", type=str,
                     help="Registered task id (must use UniformVelocityCommand)")
-    ap.add_argument("--checkpoint_file", required=True, type=str)
+    # Either a local checkpoint file OR a wandb run path — but not both.
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--checkpoint_file", type=str,
+                     help="Local path to a saved model_XXXX.pt checkpoint")
+    src.add_argument("--wandb-run-path", type=str,
+                     help="<entity>/<project>/<run_id> — downloads the latest "
+                          "model_XXXX.pt from this wandb run and uses it. "
+                          "Requires MJLAB_MICRODUCK_LOGGER=wandb so the real "
+                          "wandb client is active (trackio can't fetch from wandb).")
     ap.add_argument("--device", default=("cuda:0" if torch.cuda.is_available() else "cpu"))
     ap.add_argument("--vx-max", type=float, default=1.0,
                     help="cap |vx|. NOTE: training range was -0.15..+0.25 — "
@@ -74,11 +89,31 @@ def main():
     env = ManagerBasedRlEnv(cfg=env_cfg, device=args.device)
     wrapped_env = RslRlVecEnvWrapper(env, clip_actions=load_rl_cfg(args.task).clip_actions)
 
-    # Load policy
+    # Resolve checkpoint — local file or download from wandb
     agent_cfg = load_rl_cfg(args.task)
+    if args.checkpoint_file is not None:
+        checkpoint_path = Path(args.checkpoint_file).resolve()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        print(f"Loading local checkpoint: {checkpoint_path}")
+    else:
+        # Verify we're not aliased to trackio — wandb.Api() in trackio doesn't work
+        import wandb
+        if not hasattr(wandb, "Api") or wandb.__name__ == "trackio":
+            raise RuntimeError(
+                "--wandb-run-path requires real wandb.  Prefix the command with "
+                "MJLAB_MICRODUCK_LOGGER=wandb so the trackio→wandb alias is skipped."
+            )
+        log_root_path = (Path("logs") / "rsl_rl" / agent_cfg.experiment_name).resolve()
+        log_root_path.mkdir(parents=True, exist_ok=True)
+        print(f"Resolving checkpoint from wandb run {args.wandb_run_path} ...")
+        checkpoint_path, was_cached = get_wandb_checkpoint_path(
+            log_root_path, Path(args.wandb_run_path)
+        )
+        print(f"Loaded {'cached' if was_cached else 'downloaded'}: {checkpoint_path.name}")
+
     runner = OnPolicyRunner(wrapped_env, asdict(agent_cfg), device=args.device)
-    print(f"Loading checkpoint: {args.checkpoint_file}")
-    runner.load(str(Path(args.checkpoint_file).resolve()), map_location=args.device)
+    runner.load(str(checkpoint_path), map_location=args.device)
     policy = runner.get_inference_policy(device=args.device)
 
     # --- Disable auto-reset on termination ------------------------------------

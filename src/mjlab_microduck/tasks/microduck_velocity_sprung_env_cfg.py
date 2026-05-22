@@ -31,7 +31,7 @@ from copy import deepcopy
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.envs import mdp as base_mdp
-from mjlab.managers.manager_term_config import RewardTermCfg
+from mjlab.managers.manager_term_config import CurriculumTermCfg, RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.rl import (
     RslRlOnPolicyRunnerCfg,
@@ -42,6 +42,7 @@ from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 
 from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_SPRUNG_ROBOT_CFG
+from mjlab_microduck.tasks import mdp as microduck_mdp
 
 
 def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -141,7 +142,10 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     # Rigid microduck uses 0.10-0.25 s; we tighten the upper bound a bit
     # because our springs naturally bounce at ~6 Hz and we don't want to
     # encourage extremely slow swing phases.
-    cfg.rewards["air_time"].weight = 5.0
+    # Weight bumped from 5 → 7 to push the policy toward proactive
+    # stepping rather than the "lean and stumble + catch with foot"
+    # reactive-recovery local optimum the previous run found.
+    cfg.rewards["air_time"].weight = 7.0
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
     cfg.rewards["air_time"].params["threshold_min"] = 0.10   # 100 ms minimum swing
     cfg.rewards["air_time"].params["threshold_max"] = 0.20   # 200 ms maximum swing
@@ -186,12 +190,12 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     # to fall back on.  Has to do something with every step it sees.
     command.rel_standing_envs = 0.0
     command.rel_heading_envs = 0.0
-    # Slightly narrower than before — start in an easier regime where
-    # tracking while balanced is achievable.  We can expand the range
-    # later via curriculum once the policy converges.
-    command.ranges.lin_vel_x = (-0.10, 0.20)
-    command.ranges.lin_vel_y = (-0.10, 0.10)
-    command.ranges.ang_vel_z = (-0.4,  0.4)
+    # Placeholder values — overwritten by the velocity-curriculum below
+    # starting at step 0.  Symmetric since the curriculum function uses
+    # symmetric ranges (lin_vel_x = ±r).
+    command.ranges.lin_vel_x = (-0.05, 0.05)
+    command.ranges.lin_vel_y = (-0.05, 0.05)
+    command.ranges.ang_vel_z = (-0.1,  0.1)
 
     # ── Base reset — sprung HOME is ~131 mm; small drop bootstrap on top ──
     cfg.events["reset_base"].params["pose_range"]["z"] = (0.131, 0.155)
@@ -200,6 +204,26 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     for term in ("terrain_levels", "command_vel"):
         if term in cfg.curriculum:
             del cfg.curriculum[term]
+
+    # ── Velocity command curriculum ──
+    # Start with very narrow ranges and grow to the target over the first
+    # ~4000 iterations (out of 30k).  The previous training (no curriculum,
+    # full range from iter 0) converged to "lean and stumble" because the
+    # policy never had a phase to learn slow controlled motion first.
+    # Starting at ±0.05 m/s gives the policy time to find proper gait
+    # patterns before being asked to track higher speeds.
+    cfg.curriculum["velocity_command_ranges"] = CurriculumTermCfg(
+        func=microduck_mdp.velocity_command_ranges_curriculum,
+        params={
+            "command_name": "twist",
+            "velocity_stages": [
+                {"step": 0,         "lin_vel_range": 0.05, "ang_vel_range": 0.10},
+                {"step": 1000 * 24, "lin_vel_range": 0.10, "ang_vel_range": 0.20},
+                {"step": 2500 * 24, "lin_vel_range": 0.15, "ang_vel_range": 0.30},
+                {"step": 4000 * 24, "lin_vel_range": 0.20, "ang_vel_range": 0.40},
+            ],
+        },
+    )
 
     return cfg
 
@@ -234,5 +258,9 @@ MicroduckVelocitySprungRlCfg = RslRlOnPolicyRunnerCfg(
     run_name="velocity_sprung",
     save_interval=200,
     num_steps_per_env=24,
-    max_iterations=10000,
+    # Bumped from 10k → 30k — the previous run was undertrained for the
+    # complexity of "track velocity while walking on sprung legs".  The
+    # rigid microduck uses 50k iters for the same task with the same
+    # reward stack, so 30k is still on the conservative side.
+    max_iterations=30000,
 )
