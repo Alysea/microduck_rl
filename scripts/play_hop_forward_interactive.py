@@ -27,6 +27,9 @@ Controls (focus the viewer window first):
     ← / →       ang_vel_z  (turn left / right)
     Q / E       lin_vel_y  (strafe left / right)
     Space       zero all commands
+    R           reset the robot (use when it falls and can't recover)
+    X           toggle the env's random pushes (the periodic velocity
+                perturbations the training events apply)
     P           print current command
     + / -       widen / shrink the per-keypress step size
 
@@ -68,10 +71,14 @@ def main():
     src.add_argument("--checkpoint_file", type=str,
                      help="Local path to a saved model_XXXX.pt checkpoint")
     src.add_argument("--wandb-run-path", type=str,
-                     help="<entity>/<project>/<run_id> — downloads the latest "
-                          "model_XXXX.pt from this wandb run and uses it. "
-                          "Requires MJLAB_MICRODUCK_LOGGER=wandb so the real "
-                          "wandb client is active (trackio can't fetch from wandb).")
+                     help="<entity>/<project>/<run_id> — downloads model_XXXX.pt "
+                          "from this wandb run.  By default picks the latest "
+                          "checkpoint; pair with --checkpoint N for a specific "
+                          "iteration.  Requires MJLAB_MICRODUCK_LOGGER=wandb.")
+    ap.add_argument("--checkpoint", type=int, default=None,
+                    help="With --wandb-run-path: download model_<N>.pt instead "
+                         "of the latest.  Useful for rolling back to a checkpoint "
+                         "from before a training collapse.")
     ap.add_argument("--device", default=("cuda:0" if torch.cuda.is_available() else "cpu"))
     ap.add_argument("--vx-max", type=float, default=1.0,
                     help="cap |vx|. NOTE: training range was -0.15..+0.25 — "
@@ -106,11 +113,34 @@ def main():
             )
         log_root_path = (Path("logs") / "rsl_rl" / agent_cfg.experiment_name).resolve()
         log_root_path.mkdir(parents=True, exist_ok=True)
-        print(f"Resolving checkpoint from wandb run {args.wandb_run_path} ...")
-        checkpoint_path, was_cached = get_wandb_checkpoint_path(
-            log_root_path, Path(args.wandb_run_path)
-        )
-        print(f"Loaded {'cached' if was_cached else 'downloaded'}: {checkpoint_path.name}")
+
+        if args.checkpoint is not None:
+            # Pick a specific iteration — mirrors mjlab/scripts/play.py logic.
+            checkpoint_filename = f"model_{args.checkpoint}.pt"
+            api = wandb.Api()
+            wandb_run = api.run(str(args.wandb_run_path))
+            run_id = args.wandb_run_path.split("/")[-1]
+            download_dir = log_root_path / "wandb_checkpoints" / run_id
+            checkpoint_path = download_dir / checkpoint_filename
+            if checkpoint_path.exists():
+                print(f"Using cached {checkpoint_filename} (run: {run_id})")
+            else:
+                available = [f.name for f in wandb_run.files() if "model" in f.name]
+                if checkpoint_filename not in available:
+                    raise FileNotFoundError(
+                        f"Checkpoint '{checkpoint_filename}' not found in wandb run.  "
+                        f"Available: {sorted(available)}"
+                    )
+                wandb_run.file(checkpoint_filename).download(
+                    str(download_dir), replace=True,
+                )
+                print(f"Downloaded {checkpoint_filename} (run: {run_id})")
+        else:
+            print(f"Resolving latest checkpoint from wandb run {args.wandb_run_path} ...")
+            checkpoint_path, was_cached = get_wandb_checkpoint_path(
+                log_root_path, Path(args.wandb_run_path)
+            )
+            print(f"Loaded {'cached' if was_cached else 'downloaded'}: {checkpoint_path.name}")
 
     runner = OnPolicyRunner(wrapped_env, asdict(agent_cfg), device=args.device)
     runner.load(str(checkpoint_path), map_location=args.device)
@@ -161,8 +191,32 @@ def main():
     # GLFW keycodes — match what mjlab's _safe_key_callback forwards.
     KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT = 265, 264, 263, 262
     KEY_SPACE, KEY_P, KEY_Q, KEY_E = 32, 80, 81, 69
+    KEY_R, KEY_X = 82, 88
     KEY_PLUS_1, KEY_PLUS_2 = 61, 93     # '=' and ']'
     KEY_MINUS_1, KEY_MINUS_2 = 45, 47   # '-' and '/'
+
+    # Reset flag — set by R key, consumed in the policy wrapper before the
+    # next env.step (we can't call env.reset() directly from the keyboard
+    # callback because we're not in the viewer's main loop).
+    reset_pending = [False]
+
+    # Wrap the env's `push_robot` event so we can toggle it from a keypress.
+    # The stock velocity-env template adds a periodic-interval push event
+    # that applies random velocity disturbances every 1-3 s for robustness
+    # training.  Useful when training; sometimes distracting when watching
+    # the gait.  Default ON (matches training behaviour).
+    pushes_enabled = [True]
+    try:
+        _push_cfg = env.event_manager.get_term_cfg("push_robot")
+        _push_orig_func = _push_cfg.func
+        def _gated_push(*a, **k):
+            if pushes_enabled[0]:
+                _push_orig_func(*a, **k)
+        _push_cfg.func = _gated_push
+        _has_push_event = True
+    except (KeyError, ValueError):
+        _has_push_event = False
+        print("  (No 'push_robot' event in this task — X key will be a no-op.)")
 
     def key_callback(keycode: int):
         if keycode == KEY_UP:
@@ -179,6 +233,18 @@ def main():
             cmd[1] = clamp(cmd[1].item() - step["vy"], bounds["vy"])
         elif keycode == KEY_SPACE:
             cmd[:] = 0.0
+        elif keycode == KEY_R:
+            reset_pending[0] = True
+            cmd[:] = 0.0                                    # zero command on reset
+            print("\n  RESET requested — env will reset on next step")
+            return
+        elif keycode == KEY_X:
+            if _has_push_event:
+                pushes_enabled[0] = not pushes_enabled[0]
+                print(f"\n  random pushes: {'ON' if pushes_enabled[0] else 'OFF'}")
+            else:
+                print("\n  No 'push_robot' event in this task — X is a no-op")
+            return
         elif keycode == KEY_P:
             print_cmd(); return
         elif keycode in (KEY_PLUS_1, KEY_PLUS_2):
@@ -202,7 +268,19 @@ def main():
     last_print = [time.time()]
     asset = env.scene["robot"]
 
+    n_actions = env.action_manager.action_term_dim[0]
+    zero_action = torch.zeros((env.num_envs, n_actions), device=args.device)
+
     def policy_with_cmd_override(obs):
+        # Handle pending reset (R key) — call env.reset() and return a zero
+        # action so the next env.step doesn't immediately destabilise the
+        # freshly-reset state with whatever the policy would have output.
+        if reset_pending[0]:
+            env.reset()
+            write_cmd_to_term()
+            reset_pending[0] = False
+            return zero_action
+
         write_cmd_to_term()
         now = time.time()
         if now - last_print[0] > 1.0:

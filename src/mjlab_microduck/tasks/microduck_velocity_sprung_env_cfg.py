@@ -147,8 +147,12 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     # reactive-recovery local optimum the previous run found.
     cfg.rewards["air_time"].weight = 7.0
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
-    cfg.rewards["air_time"].params["threshold_min"] = 0.10   # 100 ms minimum swing
-    cfg.rewards["air_time"].params["threshold_max"] = 0.20   # 200 ms maximum swing
+    # Widened downward to admit shorter swing phases.  Walking cadence
+    # produces ~100-200 ms swings (microduck's setting); running cadence
+    # produces ~50-100 ms swings.  Original 0.10-0.20 made running gaits
+    # ineligible for the reward.  0.05-0.20 covers both walking and running.
+    cfg.rewards["air_time"].params["threshold_min"] = 0.05
+    cfg.rewards["air_time"].params["threshold_max"] = 0.20
 
     # Velocity tracking — BUMPED weights to make tracking the dominant
     # reward signal.  Previous training at weight=3.0 lost out to the
@@ -217,10 +221,19 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
         params={
             "command_name": "twist",
             "velocity_stages": [
+                # Phase A: from-scratch easy ramp (4k iters).  Used by the
+                # initial training run.  On a resume from iter 12k these
+                # all already fired, so no effect.
                 {"step": 0,         "lin_vel_range": 0.05, "ang_vel_range": 0.10},
                 {"step": 1000 * 24, "lin_vel_range": 0.10, "ang_vel_range": 0.20},
                 {"step": 2500 * 24, "lin_vel_range": 0.15, "ang_vel_range": 0.30},
                 {"step": 4000 * 24, "lin_vel_range": 0.20, "ang_vel_range": 0.40},
+                # Phase B: extension toward running speeds.  Activated
+                # gradually after the walking policy is solid.  At lin_vel=
+                # 0.5 the natural gait should require flight phases.
+                {"step": 12000 * 24, "lin_vel_range": 0.25, "ang_vel_range": 0.45},
+                {"step": 17000 * 24, "lin_vel_range": 0.35, "ang_vel_range": 0.60},
+                {"step": 25000 * 24, "lin_vel_range": 0.50, "ang_vel_range": 0.80},
             ],
         },
     )
