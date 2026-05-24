@@ -31,7 +31,9 @@ from copy import deepcopy
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.envs import mdp as base_mdp
-from mjlab.managers.manager_term_config import CurriculumTermCfg, RewardTermCfg
+from mjlab.managers.manager_term_config import (
+    CurriculumTermCfg, RewardTermCfg, TerminationTermCfg,
+)
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.rl import (
     RslRlOnPolicyRunnerCfg,
@@ -211,6 +213,20 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     for term in ("terrain_levels", "command_vel"):
         if term in cfg.curriculum:
             del cfg.curriculum[term]
+
+    # ── NaN-state safety termination ──
+    # The rigid microduck env has this; ours did not.  Sprung-leg
+    # dynamics can produce NaN MuJoCo states under extreme contact
+    # impulses (foot landing hard, springs at limit, etc.), which then
+    # propagate into the policy obs → into the action → into NaN losses.
+    # Terminating immediately on NaN resets the env *before* the
+    # corruption reaches the rollout buffer.  This is almost certainly
+    # missing-safeguard cause of the resume-from-checkpoint NaN losses
+    # we've been chasing.
+    cfg.terminations["nan_state"] = TerminationTermCfg(
+        func=microduck_mdp.robot_state_is_nan,
+        time_out=False,
+    )
 
     # ── Velocity command curriculum ──
     # Start with very narrow ranges and grow to the target over the first
