@@ -13,6 +13,9 @@ dependencies = [
     "onnxruntime>=1.24.4",
     "rustypot>=1.4.2",
     "trackio",
+    # Pinned to avoid the v0.24.0 silent-upload bug that drops metric data.
+    # See: wandb UI warning "may cause run data to silently fail to upload".
+    "wandb>=0.25.0",
 ]
 
 [project.entry-points."mjlab.tasks"]

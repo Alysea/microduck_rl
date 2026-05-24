@@ -147,11 +147,14 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     # reactive-recovery local optimum the previous run found.
     cfg.rewards["air_time"].weight = 7.0
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
-    # Widened downward to admit shorter swing phases.  Walking cadence
-    # produces ~100-200 ms swings (microduck's setting); running cadence
-    # produces ~50-100 ms swings.  Original 0.10-0.20 made running gaits
-    # ineligible for the reward.  0.05-0.20 covers both walking and running.
-    cfg.rewards["air_time"].params["threshold_min"] = 0.05
+    # Reverted to 0.10-0.20 (same as the iter-12000 training).  Lowering
+    # threshold_min to 0.05 was a reward-landscape change that almost
+    # certainly caused the resume-from-good-checkpoint collapse:
+    # suddenly-eligible short swings became more valuable than the
+    # critic predicted → advantage blow-up → catastrophic PPO update.
+    # Will re-introduce later once the policy has stabilised on the
+    # extended curriculum, via a SECOND resume with a controlled change.
+    cfg.rewards["air_time"].params["threshold_min"] = 0.10
     cfg.rewards["air_time"].params["threshold_max"] = 0.20
 
     # Velocity tracking — BUMPED weights to make tracking the dominant
