@@ -223,20 +223,18 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
         func=microduck_mdp.velocity_command_ranges_curriculum,
         params={
             "command_name": "twist",
+            # Phase A only — same curriculum the iter-12000 policy was
+            # trained on.  Phase B (extending to running speeds) is
+            # temporarily DISABLED because the iter-12000 → iter-12001
+            # jump from lin_vel_range=0.20 → 0.25 on resume appears to
+            # cause catastrophic advantage explosion (NaN losses
+            # immediately after resume).  Add Phase B back via a
+            # *second* resume once a stable walking policy is in hand.
             "velocity_stages": [
-                # Phase A: from-scratch easy ramp (4k iters).  Used by the
-                # initial training run.  On a resume from iter 12k these
-                # all already fired, so no effect.
                 {"step": 0,         "lin_vel_range": 0.05, "ang_vel_range": 0.10},
                 {"step": 1000 * 24, "lin_vel_range": 0.10, "ang_vel_range": 0.20},
                 {"step": 2500 * 24, "lin_vel_range": 0.15, "ang_vel_range": 0.30},
                 {"step": 4000 * 24, "lin_vel_range": 0.20, "ang_vel_range": 0.40},
-                # Phase B: extension toward running speeds.  Activated
-                # gradually after the walking policy is solid.  At lin_vel=
-                # 0.5 the natural gait should require flight phases.
-                {"step": 12000 * 24, "lin_vel_range": 0.25, "ang_vel_range": 0.45},
-                {"step": 17000 * 24, "lin_vel_range": 0.35, "ang_vel_range": 0.60},
-                {"step": 25000 * 24, "lin_vel_range": 0.50, "ang_vel_range": 0.80},
             ],
         },
     )
