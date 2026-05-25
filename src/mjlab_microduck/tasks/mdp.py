@@ -2362,3 +2362,43 @@ def body_pose_cmd_range_curriculum(
     cfg.ranges.ang_vel_z = (-current_angle, current_angle)
 
     return torch.tensor(current_z)
+
+
+def flight_phase_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str | None = None,
+    command_threshold: float = 0.1,
+) -> torch.Tensor:
+    """Reward simultaneous flight: both feet off the ground at once.
+
+    Walking has alternating single-leg stance — exactly one foot in the
+    air at any time.  Running has a brief flight phase where BOTH feet
+    are airborne.  Returns 1 per step while in flight, 0 otherwise.
+
+    Command-gated so the policy isn't rewarded for hopping in place when
+    standing still — flight phase only counts when actively moving.
+
+    Args:
+        sensor_name: ContactSensorCfg name with track_air_time=True.
+        command_name: If set, scales reward by (||cmd|| > command_threshold).
+        command_threshold: Minimum command magnitude to enable reward.
+
+    Returns:
+        Reward tensor (num_envs,) — 1 when both feet in air, 0 otherwise.
+    """
+    sensor = env.scene[sensor_name]
+    air_time = sensor.data.current_air_time   # (num_envs, n_feet)
+    assert air_time is not None
+    in_air = air_time > 0.0
+    in_flight = torch.all(in_air, dim=-1).float()
+    env.extras["log"]["Metrics/flight_phase_frac"] = in_flight.mean()
+    if command_name is not None:
+        command = env.command_manager.get_command(command_name)
+        if command is not None:
+            linear_norm = torch.norm(command[:, :2], dim=1)
+            angular_norm = torch.abs(command[:, 2])
+            total_command = linear_norm + angular_norm
+            scale = (total_command > command_threshold).float()
+            in_flight = in_flight * scale
+    return in_flight

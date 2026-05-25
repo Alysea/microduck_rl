@@ -28,8 +28,12 @@ Controls (focus the viewer window first):
     Q / E       lin_vel_y  (strafe left / right)
     Space       zero all commands
     R           reset the robot (use when it falls and can't recover)
-    X           toggle the env's random pushes (the periodic velocity
-                perturbations the training events apply)
+    K           toggle the env's random pushes (the periodic velocity
+                perturbations the training events apply).  NOTE: don't
+                use X for this — mujoco's native viewer binds X to
+                `mjVIS_TEXTURE` (toggles ground texture).
+    V           toggle camera follow (track the robot's trunk vs
+                free-look mode)
     P           print current command
     + / -       widen / shrink the per-keypress step size
 
@@ -51,6 +55,7 @@ import argparse
 from dataclasses import asdict
 from pathlib import Path
 
+import mujoco
 import torch
 from rsl_rl.runners import OnPolicyRunner
 
@@ -191,7 +196,13 @@ def main():
     # GLFW keycodes — match what mjlab's _safe_key_callback forwards.
     KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT = 265, 264, 263, 262
     KEY_SPACE, KEY_P, KEY_Q, KEY_E = 32, 80, 81, 69
-    KEY_R, KEY_X = 82, 88
+    KEY_R = 82
+    # NOTE: avoid letter keys mujoco's native viewer binds to mjVIS_*
+    # rendering flag toggles.  The reserved letters (mjVIS abbreviations)
+    # are: A B C D E H I J L M N O P R S T U W X.  Safe letters: G K Q V
+    # Y Z.  We use K for kicks (push toggle) and V for view (camera
+    # follow).  Don't reuse X — it toggles mjVIS_TEXTURE.
+    KEY_K, KEY_V = 75, 86
     KEY_PLUS_1, KEY_PLUS_2 = 61, 93     # '=' and ']'
     KEY_MINUS_1, KEY_MINUS_2 = 45, 47   # '-' and '/'
 
@@ -216,7 +227,15 @@ def main():
         _has_push_event = True
     except (KeyError, ValueError):
         _has_push_event = False
-        print("  (No 'push_robot' event in this task — X key will be a no-op.)")
+        print("  (No 'push_robot' event in this task — K key will be a no-op.)")
+
+    # Camera-follow state.  The NativeMujocoViewer is created below; we
+    # capture it via a list so the key_callback (defined first) can reach
+    # through to the underlying mujoco passive viewer's `cam` once the
+    # viewer is constructed.  The robot's root body id is resolved up-front.
+    viewer_ref = [None]
+    camera_follow = [False]
+    robot_root_body_id = env.scene["robot"].indexing.root_body_id
 
     def key_callback(keycode: int):
         if keycode == KEY_UP:
@@ -238,12 +257,31 @@ def main():
             cmd[:] = 0.0                                    # zero command on reset
             print("\n  RESET requested — env will reset on next step")
             return
-        elif keycode == KEY_X:
+        elif keycode == KEY_K:
             if _has_push_event:
                 pushes_enabled[0] = not pushes_enabled[0]
                 print(f"\n  random pushes: {'ON' if pushes_enabled[0] else 'OFF'}")
             else:
-                print("\n  No 'push_robot' event in this task — X is a no-op")
+                print("\n  No 'push_robot' event in this task — K is a no-op")
+            return
+        elif keycode == KEY_V:
+            # Toggle camera tracking on/off.  When ON, mujoco follows the
+            # robot's trunk; when OFF, free-look camera (default).
+            if viewer_ref[0] is None or viewer_ref[0].viewer is None:
+                print("\n  Viewer not ready yet — try again in a moment")
+                return
+            mjcam = viewer_ref[0].viewer.cam
+            camera_follow[0] = not camera_follow[0]
+            if camera_follow[0]:
+                mjcam.type = mujoco.mjtCamera.mjCAMERA_TRACKING.value
+                mjcam.trackbodyid = robot_root_body_id
+                mjcam.fixedcamid = -1
+                print("\n  camera follow: ON (tracking robot)")
+            else:
+                mjcam.type = mujoco.mjtCamera.mjCAMERA_FREE.value
+                mjcam.trackbodyid = -1
+                mjcam.fixedcamid = -1
+                print("\n  camera follow: OFF (free-look)")
             return
         elif keycode == KEY_P:
             print_cmd(); return
@@ -256,7 +294,7 @@ def main():
         write_cmd_to_term()
         print_cmd()
 
-    print("\nControls: ↑/↓ vx, ←/→ ωz, Q/E vy, Space=zero, P=print, +/- adjust step")
+    print("\nControls: ↑/↓ vx, ←/→ ωz, Q/E vy, Space=zero, R=reset, K=pushes, V=cam-follow, P=print, +/- adjust step")
     print(f"vx limit ±{args.vx_max}, vy limit ±{args.vy_max}, ωz limit ±{args.wz_max}\n")
 
     # Wrap policy so we re-apply our command override before every step in
@@ -301,6 +339,7 @@ def main():
         key_callback=key_callback,
         enable_perturbations=True,
     )
+    viewer_ref[0] = viewer    # let the V-key handler reach through to viewer.cam
     viewer.run()
 
 

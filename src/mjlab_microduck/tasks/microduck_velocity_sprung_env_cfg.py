@@ -149,15 +149,35 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     # reactive-recovery local optimum the previous run found.
     cfg.rewards["air_time"].weight = 7.0
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
-    # Reverted to 0.10-0.20 (same as the iter-12000 training).  Lowering
-    # threshold_min to 0.05 was a reward-landscape change that almost
-    # certainly caused the resume-from-good-checkpoint collapse:
-    # suddenly-eligible short swings became more valuable than the
-    # critic predicted → advantage blow-up → catastrophic PPO update.
-    # Will re-introduce later once the policy has stabilised on the
-    # extended curriculum, via a SECOND resume with a controlled change.
-    cfg.rewards["air_time"].params["threshold_min"] = 0.10
-    cfg.rewards["air_time"].params["threshold_max"] = 0.20
+    # Loosened from 0.10-0.20 to 0.12-0.30 — the tight 0.20 upper bound
+    # caps swing time at walking-cadence values, which is why iter-17000
+    # "walks faster" instead of running.  At 0.30 the policy can be
+    # rewarded for longer swing phases (a running-gait characteristic)
+    # without losing the lower-bound enforcement against tiny twitchy
+    # steps.
+    cfg.rewards["air_time"].params["threshold_min"] = 0.12
+    cfg.rewards["air_time"].params["threshold_max"] = 0.30
+
+    # ── NEW: flight-phase bonus ── ENCOURAGES actual running.
+    # Returns 1 per step when BOTH feet are simultaneously in the air,
+    # 0 otherwise.  Command-gated so it only activates when moving (we
+    # don't want the policy to hop in place when commanded to stand).
+    # Modest weight: this is a permission signal, not the primary
+    # objective — the air_time reward (weight 7.0) still dominates and
+    # enforces alternating gait most of the time.  At low command
+    # magnitude → walks (alternating, brief or no flight).  At high
+    # command magnitude → policy *can* trade some of the alternating
+    # reward for the flight-phase bonus and start producing a brief
+    # both-feet-airborne phase.
+    cfg.rewards["flight_phase"] = RewardTermCfg(
+        func=microduck_mdp.flight_phase_reward,
+        weight=1.0,
+        params={
+            "sensor_name": "feet_ground_contact",
+            "command_name": "twist",
+            "command_threshold": 0.1,
+        },
+    )
 
     # Velocity tracking — BUMPED weights to make tracking the dominant
     # reward signal.  Previous training at weight=3.0 lost out to the
@@ -246,14 +266,24 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
             # training the policy passes through these stages naturally;
             # the gradual expansion doesn't trigger the converged-policy
             # advantage explosion that resume-from-checkpoint did.
+            # Phase A — narrow ramp from very-slow to walking speed.
+            # Phase B — push toward running, with FINER stages than the
+            # previous attempt.  The iter-17000 jump from 0.25 → 0.35
+            # (+40%) collapsed training around iter 18000 — too big a
+            # distribution shift for the converged policy to handle in
+            # one step.  Stages here cap any single jump at ≤ +20% and
+            # space them ≥ 5000 iters apart, giving the critic time to
+            # re-fit value estimates before the next expansion.
             "velocity_stages": [
                 {"step": 0,         "lin_vel_range": 0.05, "ang_vel_range": 0.10},
                 {"step": 1000 * 24, "lin_vel_range": 0.10, "ang_vel_range": 0.20},
                 {"step": 2500 * 24, "lin_vel_range": 0.15, "ang_vel_range": 0.30},
                 {"step": 4000 * 24, "lin_vel_range": 0.20, "ang_vel_range": 0.40},
                 {"step": 12000 * 24, "lin_vel_range": 0.25, "ang_vel_range": 0.45},
-                {"step": 17000 * 24, "lin_vel_range": 0.35, "ang_vel_range": 0.60},
-                {"step": 25000 * 24, "lin_vel_range": 0.50, "ang_vel_range": 0.80},
+                {"step": 17000 * 24, "lin_vel_range": 0.30, "ang_vel_range": 0.50},
+                {"step": 22000 * 24, "lin_vel_range": 0.35, "ang_vel_range": 0.60},
+                {"step": 27000 * 24, "lin_vel_range": 0.42, "ang_vel_range": 0.70},
+                {"step": 32000 * 24, "lin_vel_range": 0.50, "ang_vel_range": 0.80},
             ],
         },
     )
@@ -291,9 +321,8 @@ MicroduckVelocitySprungRlCfg = RslRlOnPolicyRunnerCfg(
     run_name="velocity_sprung",
     save_interval=200,
     num_steps_per_env=24,
-    # Bumped from 10k → 30k — the previous run was undertrained for the
-    # complexity of "track velocity while walking on sprung legs".  The
-    # rigid microduck uses 50k iters for the same task with the same
-    # reward stack, so 30k is still on the conservative side.
-    max_iterations=30000,
+    # Bumped to 40k to accommodate the finer Phase B curriculum (final
+    # stage at iter 32000 needs ~8000 iters to consolidate the
+    # higher-speed gait).  Rigid microduck uses 50k for the same task.
+    max_iterations=40000,
 )
