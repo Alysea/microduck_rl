@@ -256,9 +256,19 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     # Starting at ±0.05 m/s gives the policy time to find proper gait
     # patterns before being asked to track higher speeds.
     cfg.curriculum["velocity_command_ranges"] = CurriculumTermCfg(
-        func=microduck_mdp.velocity_command_ranges_curriculum,
+        # SMOOTH version — linearly interpolates between adjacent stages
+        # over `ramp_steps` instead of step-function jumps.  Step-function
+        # transitions repeatedly caused NaN-loss collapse (~iter 12000)
+        # because a converged policy can't absorb instantaneous
+        # distribution shifts; value estimates go stale, TD errors spike,
+        # advantages explode, gradients explode, weights → NaN.
+        # Spreading the same total shift over 2000 iters means each
+        # gradient step sees ~0.05% command-range expansion — well within
+        # the value function's tolerance.
+        func=microduck_mdp.velocity_command_ranges_curriculum_smooth,
         params={
             "command_name": "twist",
+            "ramp_steps": 2000 * 24,
             # Phase A — narrow ramp from very-slow to walking speed.
             # Used by from-scratch training to find proper gait patterns
             # before being asked to track higher speeds.
@@ -314,7 +324,12 @@ MicroduckVelocitySprungRlCfg = RslRlOnPolicyRunnerCfg(
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
-        max_grad_norm=1.0,
+        # Tightened from 1.0 to 0.5 as a safety net against the
+        # advantage-explosion mechanism that has caused NaN losses at
+        # curriculum transitions.  The smooth curriculum should already
+        # eliminate the explosions, but a tighter grad-norm clip means
+        # even an unexpected distribution shift can't blow up the update.
+        max_grad_norm=0.5,
     ),
     wandb_project="mjlab_microduck",
     experiment_name="microduck_velocity_sprung",

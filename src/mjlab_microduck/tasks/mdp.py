@@ -2364,6 +2364,103 @@ def body_pose_cmd_range_curriculum(
     return torch.tensor(current_z)
 
 
+def velocity_command_ranges_curriculum_smooth(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    velocity_stages: list[dict],
+    ramp_steps: int = 2000 * 24,
+    update_lin_vel_y: bool = True,
+    update_ang_vel_z: bool = True,
+    forward_only: bool = False,
+) -> torch.Tensor:
+    """Smoothly-interpolated velocity-command curriculum.
+
+    Unlike the step-function `velocity_command_ranges_curriculum`, this
+    version linearly interpolates the command ranges between adjacent
+    stages over a `ramp_steps` window leading up to each stage target.
+    A converged PPO policy can absorb the same total command-range
+    expansion over 2000 iterations of tiny per-step shifts, but cannot
+    absorb the entire shift in one step (value-function staleness →
+    advantage explosion → NaN loss).
+
+    For each pair of adjacent stages prev → next:
+      - Plateau at prev.value until step (next.step - ramp_steps).
+      - Linearly interpolate from prev.value to next.value, reaching
+        next.value at exactly next.step.
+      - Plateau at next.value until the next ramp begins.
+
+    If two stages are spaced closer than ramp_steps, the ramp uses the
+    entire inter-stage gap (no plateau between them).
+
+    Args:
+        velocity_stages: Same format as the step-function curriculum.
+        ramp_steps: Length of the linear interpolation window in env
+            step-counter units (i.e. iterations × num_steps_per_env=24).
+            Default 2000 * 24 = 48000 steps.
+
+    Logs the current ranges to `Curriculum/lin_vel_range` and
+    `Curriculum/ang_vel_range` so you can verify the ramp shape in wandb.
+    """
+    del env_ids
+
+    from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+    from typing import cast
+
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None, f"Command term '{command_name}' not found"
+    cfg = cast(UniformVelocityCommandCfg, command_term.cfg)
+
+    step = env.common_step_counter
+    n = len(velocity_stages)
+
+    if step >= velocity_stages[-1]["step"]:
+        current_lin_vel = velocity_stages[-1]["lin_vel_range"]
+        current_ang_vel = velocity_stages[-1]["ang_vel_range"]
+    elif step <= velocity_stages[0]["step"]:
+        current_lin_vel = velocity_stages[0]["lin_vel_range"]
+        current_ang_vel = velocity_stages[0]["ang_vel_range"]
+    else:
+        # Find the bracket [prev, nxt] such that prev.step <= step < nxt.step
+        prev = velocity_stages[0]
+        nxt = velocity_stages[1]
+        for i in range(1, n):
+            if step < velocity_stages[i]["step"]:
+                prev = velocity_stages[i - 1]
+                nxt = velocity_stages[i]
+                break
+        # Ramp window ends at nxt.step, starts ramp_steps earlier
+        # (or at prev.step if the gap is smaller than ramp_steps).
+        ramp_start = max(prev["step"], nxt["step"] - ramp_steps)
+        if step <= ramp_start:
+            current_lin_vel = prev["lin_vel_range"]
+            current_ang_vel = prev["ang_vel_range"]
+        else:
+            alpha = (step - ramp_start) / max(nxt["step"] - ramp_start, 1)
+            current_lin_vel = (
+                prev["lin_vel_range"]
+                + alpha * (nxt["lin_vel_range"] - prev["lin_vel_range"])
+            )
+            current_ang_vel = (
+                prev["ang_vel_range"]
+                + alpha * (nxt["ang_vel_range"] - prev["ang_vel_range"])
+            )
+
+    if forward_only:
+        cfg.ranges.lin_vel_x = (0.0, current_lin_vel)
+    else:
+        cfg.ranges.lin_vel_x = (-current_lin_vel, current_lin_vel)
+    if update_lin_vel_y:
+        cfg.ranges.lin_vel_y = (-current_lin_vel, current_lin_vel)
+    if update_ang_vel_z:
+        cfg.ranges.ang_vel_z = (-current_ang_vel, current_ang_vel)
+
+    env.extras["log"]["Curriculum/lin_vel_range"] = current_lin_vel
+    env.extras["log"]["Curriculum/ang_vel_range"] = current_ang_vel
+
+    return torch.tensor([current_lin_vel])
+
+
 def flight_phase_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
