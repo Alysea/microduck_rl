@@ -2455,8 +2455,11 @@ def velocity_command_ranges_curriculum_smooth(
     if update_ang_vel_z:
         cfg.ranges.ang_vel_z = (-current_ang_vel, current_ang_vel)
 
-    env.extras["log"]["Curriculum/lin_vel_range"] = current_lin_vel
-    env.extras["log"]["Curriculum/ang_vel_range"] = current_ang_vel
+    # `env.extras["log"]` may not exist yet on the initial reset
+    # (curriculum runs before any step has populated it).
+    log_dict = env.extras.setdefault("log", {})
+    log_dict["Curriculum/lin_vel_range"] = current_lin_vel
+    log_dict["Curriculum/ang_vel_range"] = current_ang_vel
 
     return torch.tensor([current_lin_vel])
 
