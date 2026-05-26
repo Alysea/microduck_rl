@@ -234,6 +234,20 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
         if term in cfg.curriculum:
             del cfg.curriculum[term]
 
+    # ── DIAGNOSTIC: remove base_lin_vel from policy obs ──
+    # The stock make_velocity_env_cfg() puts base_lin_vel in BOTH
+    # policy and critic observations.  The rigid microduck env removes
+    # it from policy (privileged info — can't be measured on hardware).
+    # On a sprung-leg robot, base_lin_vel spikes during foot impacts
+    # as springs compress/release; the policy memorizes those spike
+    # patterns and at iter ~12000 starts extrapolating wildly when an
+    # unusual lin_vel value comes through → outlier action →
+    # action_rate_l2 explosion → progressive policy divergence over
+    # ~170 iterations → NaN losses.  This is the single-variable test
+    # to confirm or rule out that hypothesis.
+    if "base_lin_vel" in cfg.observations["policy"].terms:
+        del cfg.observations["policy"].terms["base_lin_vel"]
+
     # ── NaN-state safety termination ──
     # The rigid microduck env has this; ours did not.  Sprung-leg
     # dynamics can produce NaN MuJoCo states under extreme contact
