@@ -92,6 +92,11 @@ def main():
                     help="cap |vy|. Training range was ±0.15 — beyond is OOD")
     ap.add_argument("--wz-max", type=float, default=2.0,
                     help="cap |ωz|. Training range was ±0.5 — beyond is OOD")
+    ap.add_argument("--clip-actions", type=float, default=None,
+                    help="Override clip_actions in the env wrapper.  None ⇒ "
+                         "use the task's RL cfg default.  Use this to A/B test "
+                         "different bounds on the same checkpoint (e.g. compare "
+                         "behavior at --clip-actions 30 vs --clip-actions 3).")
     args = ap.parse_args()
 
     # Build the env (play mode = num_envs=1, no command resampling needed
@@ -99,7 +104,11 @@ def main():
     env_cfg = load_env_cfg(args.task, play=True)
     env_cfg.scene.num_envs = 1
     env = ManagerBasedRlEnv(cfg=env_cfg, device=args.device)
-    wrapped_env = RslRlVecEnvWrapper(env, clip_actions=load_rl_cfg(args.task).clip_actions)
+    _cfg_clip = load_rl_cfg(args.task).clip_actions
+    effective_clip = args.clip_actions if args.clip_actions is not None else _cfg_clip
+    wrapped_env = RslRlVecEnvWrapper(env, clip_actions=effective_clip)
+    print(f"clip_actions = {effective_clip}"
+          f"{' (CLI override)' if args.clip_actions is not None else ' (from task cfg)'}")
 
     # Resolve checkpoint — local file or download from wandb
     agent_cfg = load_rl_cfg(args.task)
@@ -309,6 +318,13 @@ def main():
     n_actions = env.action_manager.action_term_dim[0]
     zero_action = torch.zeros((env.num_envs, n_actions), device=args.device)
 
+    # Foot contact sensor — if present, we'll read air times and accumulate
+    # a "flight phase" fraction (both feet airborne) between prints.  Tasks
+    # without the sensor (rare) just skip these fields.
+    foot_sensor = env.scene.sensors.get("feet_ground_contact")
+    flight_steps = [0]    # steps with both feet in air since last print
+    total_steps  = [0]    # total steps since last print
+
     def policy_with_cmd_override(obs):
         # Handle pending reset (R key) — call env.reset() and return a zero
         # action so the next env.step doesn't immediately destabilise the
@@ -317,18 +333,40 @@ def main():
             env.reset()
             write_cmd_to_term()
             reset_pending[0] = False
+            flight_steps[0] = 0
+            total_steps[0] = 0
             return zero_action
 
         write_cmd_to_term()
+
+        # Accumulate flight-phase fraction every step (not just at print).
+        if foot_sensor is not None:
+            with torch.no_grad():
+                air = foot_sensor.data.current_air_time[0]   # (n_feet,)
+                if bool(torch.all(air > 0.0)):
+                    flight_steps[0] += 1
+                total_steps[0] += 1
+
         now = time.time()
         if now - last_print[0] > 1.0:
             with torch.no_grad():
                 vxy = asset.data.root_link_lin_vel_b[0, :2]
                 wz  = asset.data.root_link_ang_vel_b[0, 2]
                 z   = asset.data.root_link_pos_w[0, 2]
+                if foot_sensor is not None:
+                    air = foot_sensor.data.current_air_time[0]
+                    air_l = air[0].item() * 1000.0
+                    air_r = air[1].item() * 1000.0
+                    frac = flight_steps[0] / max(total_steps[0], 1)
+                    foot_str = (f"  |  air L={air_l:>4.0f}ms R={air_r:>4.0f}ms"
+                                f"  |  flight={frac*100:5.1f}%")
+                    flight_steps[0] = 0
+                    total_steps[0] = 0
+                else:
+                    foot_str = ""
             print(f"\r  cmd: vx={cmd[0].item():+.2f} vy={cmd[1].item():+.2f} ωz={cmd[2].item():+.2f}  "
                   f"|  actual: vx={vxy[0].item():+.2f} vy={vxy[1].item():+.2f} ωz={wz.item():+.2f}  "
-                  f"|  trunk_z={z.item()*1000:.0f}mm",
+                  f"|  trunk_z={z.item()*1000:.0f}mm{foot_str}",
                   flush=True)
             last_print[0] = now
         return base_policy(obs)

@@ -317,6 +317,25 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
 
 # === PPO config ===
 MicroduckVelocitySprungRlCfg = RslRlOnPolicyRunnerCfg(
+    # Bound policy outputs to ±π in the env wrapper.  This breaks the
+    # action_rate_l2 death-spiral mechanism that killed every long
+    # training run: a converged policy occasionally produces extreme
+    # outlier actions, action_rate_l2 reward goes finite-but-huge,
+    # value loss explodes, weights → NaN.
+    #
+    # Physical meaning: action is added to HOME pose joint position
+    # (radians).  Joint ranges in the XML max out at head_yaw=±2.618 rad
+    # (the widest); all leg joints are within ±1.92.  clip=π gives a
+    # small (~20%) headroom over the widest joint and means "any single
+    # action represents at most a 180° rotation from HOME" — physically
+    # meaningful and beyond which output is wasted (the BAM actuator
+    # saturates anyway).
+    #
+    # Bounds action_rate_l2 contribution: max |Δa| = 2π → per-joint
+    # (Δa)² ≤ 39.5 → sum-14-joints ≤ 553 → weighted -0.4 ≤ -221/step
+    # → per 500-step episode ≤ -110,500.  Well within what the value
+    # function can fit (vs the unbounded -10^25 that triggered NaN).
+    clip_actions=math.pi,
     policy=RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_obs_normalization=False,
