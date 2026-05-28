@@ -2469,12 +2469,22 @@ def flight_phase_reward(
     sensor_name: str = "feet_ground_contact",
     command_name: str | None = None,
     command_threshold: float = 0.1,
+    max_air_time: float = 0.5,
 ) -> torch.Tensor:
     """Reward simultaneous flight: both feet off the ground at once.
 
     Walking has alternating single-leg stance — exactly one foot in the
     air at any time.  Running has a brief flight phase where BOTH feet
     are airborne.  Returns 1 per step while in flight, 0 otherwise.
+
+    `max_air_time` upper-bounds the swing duration that counts as
+    "flight".  Real flight phases are short (50-200 ms); without an
+    upper bound the policy can reward-hack by holding one foot
+    perpetually in the air ("knee bent" suspended-foot stance) and
+    rocking the other foot — both feet then technically register as
+    airborne while the held-up foot's air_time grows unbounded.
+    Capping at 0.5 s rejects this trick: the held foot's air_time
+    quickly exceeds 0.5 s and stops counting.
 
     Command-gated so the policy isn't rewarded for hopping in place when
     standing still — flight phase only counts when actively moving.
@@ -2483,16 +2493,21 @@ def flight_phase_reward(
         sensor_name: ContactSensorCfg name with track_air_time=True.
         command_name: If set, scales reward by (||cmd|| > command_threshold).
         command_threshold: Minimum command magnitude to enable reward.
+        max_air_time: Per-foot maximum air_time (seconds) for "running
+            flight" to count.  Feet that have been airborne longer than
+            this are treated as held-up / hovered and don't contribute.
 
     Returns:
-        Reward tensor (num_envs,) — 1 when both feet in air, 0 otherwise.
+        Reward tensor (num_envs,) — 1 when both feet in *running* air,
+        0 otherwise.
     """
     sensor = env.scene[sensor_name]
     air_time = sensor.data.current_air_time   # (num_envs, n_feet)
     assert air_time is not None
-    in_air = air_time > 0.0
-    in_flight = torch.all(in_air, dim=-1).float()
-    env.extras["log"]["Metrics/flight_phase_frac"] = in_flight.mean()
+    in_running_air = (air_time > 0.0) & (air_time < max_air_time)
+    in_flight = torch.all(in_running_air, dim=-1).float()
+    log_dict = env.extras.setdefault("log", {})
+    log_dict["Metrics/flight_phase_frac"] = in_flight.mean()
     if command_name is not None:
         command = env.command_manager.get_command(command_name)
         if command is not None:
