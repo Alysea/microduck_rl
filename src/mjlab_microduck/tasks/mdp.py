@@ -2464,6 +2464,78 @@ def velocity_command_ranges_curriculum_smooth(
     return torch.tensor([current_lin_vel])
 
 
+def joint_pos_default_l2(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """L2 penalty on joint position deviation from default pose.
+
+    Companion to the existing exp-based `pose` reward.  The exp form
+    `exp(-(error/std)²)` has near-zero gradient when error >> std, so
+    once the policy parks a joint far from default it gets stuck —
+    there's no force pulling it back.  This L2 form provides a constant
+    gradient at any error level: `d/dq sum((q − q_default)²) = 2(q − q_default)`,
+    which always points toward default.
+
+    Designed to be used WITH the exp `pose` reward, not as a replacement:
+    - L2 pulls the policy out of asymmetric/crocked stances.
+    - exp gives a strong reward bump near default for fine-grained
+      pose-matching at small errors.
+    Together they cover the full error range with non-zero gradient.
+
+    Args:
+        asset_cfg: Joints to apply to.  Typically the 14 actuated joints
+            (exclude springs).
+
+    Returns:
+        Penalty tensor (num_envs,) — sum of squared deviations.  Multiply
+        by a negative weight in the env cfg.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    default = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    return torch.sum(torch.square(pos - default), dim=-1)
+
+
+def foot_overhang_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    max_air_time: float = 0.5,
+) -> torch.Tensor:
+    """Penalize any foot held in the air longer than `max_air_time`.
+
+    Real flight phases are short (50-200 ms); a foot that has been
+    airborne for >0.5 s is being *held up*, not running.  Without this
+    penalty, the policy can reward-hack by parking one foot in a
+    "crocked" knee-bent pose and rocking on the other — the held foot
+    saves action_rate_l2 cost (no joint changes) while only weakly
+    losing pose reward.  This penalty makes the held-up strategy
+    strictly worse than alternating.
+
+    Per-step penalty per foot grows linearly past the threshold:
+        penalty = max(0, air_time - max_air_time)
+    summed across feet, then weighted at the env-cfg level.
+
+    Args:
+        sensor_name: ContactSensorCfg name with track_air_time=True.
+        max_air_time: Threshold (s).  Feet airborne longer than this
+            contribute linearly to the penalty.  0.5 s is a comfortable
+            upper bound for genuine running flight phases.
+
+    Returns:
+        Penalty tensor (num_envs,) — sum of excess air times across feet,
+        in seconds.  Multiply by a negative weight in the env cfg.
+    """
+    sensor = env.scene[sensor_name]
+    air_time = sensor.data.current_air_time   # (num_envs, n_feet)
+    assert air_time is not None
+    excess = torch.clamp(air_time - max_air_time, min=0.0)
+    penalty = torch.sum(excess, dim=-1)
+    log_dict = env.extras.setdefault("log", {})
+    log_dict["Metrics/foot_overhang_mean"] = penalty.mean()
+    return penalty
+
+
 def flight_phase_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",

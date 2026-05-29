@@ -208,6 +208,26 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
         },
     )
 
+    # ── NEW: L2 pose penalty alongside the exp `pose` reward ──
+    # The previous training (run vu72naz7) had Episode_Reward/pose ≈ 0.002
+    # throughout — the policy parked in an asymmetric "crocked foot"
+    # posture that the exp-based pose reward couldn't pull out of, because
+    # exp(-(error/std)²) has near-zero gradient at error >> std.  The L2
+    # form has constant gradient (∝ error) and reliably pulls toward
+    # default.  Weight chosen so that at the bad-posture region observed
+    # (sum(error²) ~ 14 across 14 joints) the per-step penalty is ~-0.7
+    # (visible to PPO without dominating tracking/air_time), and decays
+    # smoothly to ~-0.22 once joints are within their std of default.
+    cfg.rewards["joint_pos_default_l2"] = RewardTermCfg(
+        func=microduck_mdp.joint_pos_default_l2,
+        weight=-0.05,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=(r"^(?!.*spring).*",),
+            ),
+        },
+    )
+
     # ── Commands ──
     # Use deepcopy so we don't share mutable state with other envs that
     # might construct from the same make_velocity_env_cfg() — defensive
