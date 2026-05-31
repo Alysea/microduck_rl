@@ -100,10 +100,29 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     # The critic obs has a `foot_height` term that needs its site refs
     cfg.observations["critic"].terms["foot_height"].params["asset_cfg"].site_names = site_names
 
-    # Action — full hip range, standard JointPositionAction (no neck offset)
+    # Action — per-joint scale dict, normalized to [-1, +1] policy outputs.
+    # Each joint maps its (clipped) [-1, +1] action to a useful displacement
+    # from HOME, in radians.  Scales are chosen to give reasonable motion
+    # range without overshooting joint limits in the "tight" direction
+    # (joints with asymmetric HOME relative to physical range allow some
+    # overshoot in the wider direction; the actuator/joint-limit physics
+    # clip this naturally and the policy learns it).
+    #
+    # Combined with clip_actions=1.0 in the RL config, this gives the
+    # policy a physically-meaningful, structurally-bounded action space.
+    # No more "policy emits |a|=25" outliers — the action space won't
+    # allow it by construction.
     joint_pos_action = cfg.actions["joint_pos"]
     assert isinstance(joint_pos_action, JointPositionActionCfg)
-    joint_pos_action.scale = 1.0
+    joint_pos_action.scale = {
+        r".*hip_yaw.*":   0.5,    # joint range ±0.524, HOME=0
+        r".*hip_roll.*":  0.5,    # joint range ±0.698, HOME=0
+        r".*hip_pitch.*": 0.7,    # asymmetric: HOME=±0.3 in 1.57-wide range
+        r".*knee.*":      0.8,    # asymmetric: HOME=∓0.6 in 1.92-wide range
+        r".*ankle.*":     0.6,    # has ~1.27-1.87 in each direction
+        r".*neck.*":      0.6,    # neck_pitch
+        r".*head.*":      0.6,    # head_pitch / head_yaw / head_roll
+    }
 
     # ── Rewards ──
     # Pose reward — tight stds at standing, looser at walking.
@@ -176,6 +195,13 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
             "sensor_name": "feet_ground_contact",
             "command_name": "twist",
             "command_threshold": 0.1,
+            # Pass a very large max_air_time → effectively no cap.  The
+            # "held-foot" reward-hack the cap was designed to prevent
+            # didn't actually occur in practice; the cap may have
+            # contributed to the bouncing local optimum we saw with
+            # clip_actions=π.  Reverting to uncapped to match the
+            # original good-running run.
+            "max_air_time": 1.0e9,
         },
     )
 
@@ -193,6 +219,8 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
 
     # Action rate — moderate.  Start at -0.4 like the rigid microduck's
     # baseline (it later curricula up to -1.0; we skip curriculum for now).
+    # Stock unclamped function: with clip_actions=1.0 and per-joint scale
+    # bounded, the input to action_rate_l2 is naturally bounded.
     cfg.rewards["action_rate_l2"].weight = -0.4
 
     # ── NEW: head stability penalty (sprung-specific) ──
@@ -204,26 +232,6 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot", joint_names=(r".*neck.*", r".*head.*"),
-            ),
-        },
-    )
-
-    # ── NEW: L2 pose penalty alongside the exp `pose` reward ──
-    # The previous training (run vu72naz7) had Episode_Reward/pose ≈ 0.002
-    # throughout — the policy parked in an asymmetric "crocked foot"
-    # posture that the exp-based pose reward couldn't pull out of, because
-    # exp(-(error/std)²) has near-zero gradient at error >> std.  The L2
-    # form has constant gradient (∝ error) and reliably pulls toward
-    # default.  Weight chosen so that at the bad-posture region observed
-    # (sum(error²) ~ 14 across 14 joints) the per-step penalty is ~-0.7
-    # (visible to PPO without dominating tracking/air_time), and decays
-    # smoothly to ~-0.22 once joints are within their std of default.
-    cfg.rewards["joint_pos_default_l2"] = RewardTermCfg(
-        func=microduck_mdp.joint_pos_default_l2,
-        weight=-0.05,
-        params={
-            "asset_cfg": SceneEntityCfg(
-                "robot", joint_names=(r"^(?!.*spring).*",),
             ),
         },
     )
@@ -337,25 +345,25 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
 
 # === PPO config ===
 MicroduckVelocitySprungRlCfg = RslRlOnPolicyRunnerCfg(
-    # Bound policy outputs to ±π in the env wrapper.  This breaks the
-    # action_rate_l2 death-spiral mechanism that killed every long
-    # training run: a converged policy occasionally produces extreme
-    # outlier actions, action_rate_l2 reward goes finite-but-huge,
-    # value loss explodes, weights → NaN.
+    # clip_actions=1.0: paired with the per-joint scale dict on
+    # JointPositionAction, this gives the policy a normalized [-1, +1]
+    # action space per joint.  Physical motion is determined by the
+    # env's per-joint scale, not by the policy's output magnitude.
     #
-    # Physical meaning: action is added to HOME pose joint position
-    # (radians).  Joint ranges in the XML max out at head_yaw=±2.618 rad
-    # (the widest); all leg joints are within ±1.92.  clip=π gives a
-    # small (~20%) headroom over the widest joint and means "any single
-    # action represents at most a 180° rotation from HOME" — physically
-    # meaningful and beyond which output is wasted (the BAM actuator
-    # saturates anyway).
+    # Why this works for NaN safety:
+    #   max |Δa| per joint = 2 (action goes -1 to +1 in one step)
+    #   max (Δa)² × scale² per joint ≤ 4 × 0.8² = 2.56 (knee, worst)
+    #   sum over 14 joints ≤ ~30 (in practice much smaller)
+    #   weighted action_rate_l2 ≤ -12 / step ≤ -6000 / episode
+    #   corresponding max value loss ≤ ~10^7 (recoverable; fatal was 10^21+)
     #
-    # Bounds action_rate_l2 contribution: max |Δa| = 2π → per-joint
-    # (Δa)² ≤ 39.5 → sum-14-joints ≤ 553 → weighted -0.4 ≤ -221/step
-    # → per 500-step episode ≤ -110,500.  Well within what the value
-    # function can fit (vs the unbounded -10^25 that triggered NaN).
-    clip_actions=math.pi,
+    # Why this works for gait quality:
+    #   The previous clip=π changed the *training* landscape: the policy
+    #   was free to sample |a|>π and got truncated, but learned in a
+    #   space where actions had unbounded magnitude.  Here, the entire
+    #   action space is normalized [-1, +1]; the policy never sees
+    #   "wasted" magnitude and learns to use the bounded space natively.
+    clip_actions=1.0,
     policy=RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_obs_normalization=False,

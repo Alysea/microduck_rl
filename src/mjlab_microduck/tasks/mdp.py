@@ -2464,6 +2464,43 @@ def velocity_command_ranges_curriculum_smooth(
     return torch.tensor([current_lin_vel])
 
 
+def action_rate_l2_clamped(
+    env: ManagerBasedRlEnv,
+    max_per_step: float = 50.0,
+) -> torch.Tensor:
+    """Per-step action_rate_l2 penalty, clamped at a maximum magnitude.
+
+    Drop-in replacement for `mjlab.envs.mdp.rewards.action_rate_l2` that
+    bounds the per-step value so a rare outlier policy output can't
+    propagate a -10^25 reward through GAE returns and corrupt the value
+    function (the death-spiral mechanism that triggered NaN losses in
+    earlier sprung-leg runs).
+
+    Normal operation: ||Δa||² is ~0.005-0.02 per step (mean |Δa| ≈ 0.02
+    across 14 joints).  The default clamp at 50 is 1000× normal — it
+    never fires in clean training, but caps the worst case at -50/step
+    weighted (= -20/step at weight=-0.4, or -10000 per 500-step episode)
+    instead of arbitrary -10^25.  The value loss this can produce is
+    bounded to ~10^8, well within recoverable territory (the previous
+    fatal spike was 10^22).
+
+    Unlike `clip_actions` (which truncates policy outputs in the env
+    wrapper and re-shapes the optimization landscape), this clamp only
+    bounds the REWARD signal — the policy still produces and learns
+    from its raw actions, only the catastrophic-magnitude reward case
+    is capped.
+
+    Args:
+        max_per_step: Per-step ceiling on `sum(Δa²)` before weighting.
+
+    Returns:
+        Tensor (num_envs,) — `min(sum(Δa²), max_per_step)`.
+    """
+    delta = env.action_manager.action - env.action_manager.prev_action
+    raw = torch.sum(torch.square(delta), dim=1)
+    return torch.clamp(raw, max=max_per_step)
+
+
 def joint_pos_default_l2(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
