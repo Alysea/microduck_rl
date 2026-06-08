@@ -100,29 +100,16 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
     # The critic obs has a `foot_height` term that needs its site refs
     cfg.observations["critic"].terms["foot_height"].params["asset_cfg"].site_names = site_names
 
-    # Action — per-joint scale dict, normalized to [-1, +1] policy outputs.
-    # Each joint maps its (clipped) [-1, +1] action to a useful displacement
-    # from HOME, in radians.  Scales are chosen to give reasonable motion
-    # range without overshooting joint limits in the "tight" direction
-    # (joints with asymmetric HOME relative to physical range allow some
-    # overshoot in the wider direction; the actuator/joint-limit physics
-    # clip this naturally and the policy learns it).
-    #
-    # Combined with clip_actions=1.0 in the RL config, this gives the
-    # policy a physically-meaningful, structurally-bounded action space.
-    # No more "policy emits |a|=25" outliers — the action space won't
-    # allow it by construction.
+    # Action — uniform scale=1.0, matches the original "good running" run.
+    # The per-joint dict + clip_actions=1.0 experiment (run fktnuht3) produced
+    # the clip-bias pathology described in
+    # docs/action_obs_normalization_report.md: noise_std grew unbounded
+    # (1.0 → 229) because clipping disables the gradient on σ.  Reverted
+    # to the framework default until tanh squashing is implemented as the
+    # proper architectural fix.
     joint_pos_action = cfg.actions["joint_pos"]
     assert isinstance(joint_pos_action, JointPositionActionCfg)
-    joint_pos_action.scale = {
-        r".*hip_yaw.*":   0.5,    # joint range ±0.524, HOME=0
-        r".*hip_roll.*":  0.5,    # joint range ±0.698, HOME=0
-        r".*hip_pitch.*": 0.7,    # asymmetric: HOME=±0.3 in 1.57-wide range
-        r".*knee.*":      0.8,    # asymmetric: HOME=∓0.6 in 1.92-wide range
-        r".*ankle.*":     0.6,    # has ~1.27-1.87 in each direction
-        r".*neck.*":      0.6,    # neck_pitch
-        r".*head.*":      0.6,    # head_pitch / head_yaw / head_roll
-    }
+    joint_pos_action.scale = 1.0
 
     # ── Rewards ──
     # Pose reward — tight stds at standing, looser at walking.
@@ -219,9 +206,15 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
 
     # Action rate — moderate.  Start at -0.4 like the rigid microduck's
     # baseline (it later curricula up to -1.0; we skip curriculum for now).
-    # Stock unclamped function: with clip_actions=1.0 and per-joint scale
-    # bounded, the input to action_rate_l2 is naturally bounded.
+    # Use the per-step CLAMPED variant as the NaN safeguard: with no
+    # clip_actions, a policy outlier could drive action_rate_l2 to -10^25
+    # and corrupt the value function (the original death spiral).  The
+    # clamp at 50/step is 5000× normal operation so never fires in clean
+    # training, but bounds the catastrophic case to recoverable value
+    # losses.  See docs/action_obs_normalization_report.md.
+    cfg.rewards["action_rate_l2"].func = microduck_mdp.action_rate_l2_clamped
     cfg.rewards["action_rate_l2"].weight = -0.4
+    cfg.rewards["action_rate_l2"].params["max_per_step"] = 50.0
 
     # ── NEW: head stability penalty (sprung-specific) ──
     # Keep the head and neck still so the body-mounted IMU sees clean data,
@@ -345,25 +338,18 @@ def make_microduck_velocity_sprung_env_cfg(play: bool = False) -> ManagerBasedRl
 
 # === PPO config ===
 MicroduckVelocitySprungRlCfg = RslRlOnPolicyRunnerCfg(
-    # clip_actions=1.0: paired with the per-joint scale dict on
-    # JointPositionAction, this gives the policy a normalized [-1, +1]
-    # action space per joint.  Physical motion is determined by the
-    # env's per-joint scale, not by the policy's output magnitude.
-    #
-    # Why this works for NaN safety:
-    #   max |Δa| per joint = 2 (action goes -1 to +1 in one step)
-    #   max (Δa)² × scale² per joint ≤ 4 × 0.8² = 2.56 (knee, worst)
-    #   sum over 14 joints ≤ ~30 (in practice much smaller)
-    #   weighted action_rate_l2 ≤ -12 / step ≤ -6000 / episode
-    #   corresponding max value loss ≤ ~10^7 (recoverable; fatal was 10^21+)
-    #
-    # Why this works for gait quality:
-    #   The previous clip=π changed the *training* landscape: the policy
-    #   was free to sample |a|>π and got truncated, but learned in a
-    #   space where actions had unbounded magnitude.  Here, the entire
-    #   action space is normalized [-1, +1]; the policy never sees
-    #   "wasted" magnitude and learns to use the bounded space natively.
-    clip_actions=1.0,
+    # clip_actions=None: same as the original "good running" config.
+    # The clip_actions=1.0 experiment (run fktnuht3) exhibited the
+    # known clip-bias pathology: PPO computes log_prob for the
+    # unclipped sampled action but the env saw the clipped value.
+    # With clip + entropy bonus, σ drifts upward unbounded (saw
+    # noise_std=229 at iter 40k vs init 1.0) and the policy degrades
+    # to random-after-clip output.  Death-spiral protection is back
+    # at the reward function level via action_rate_l2_clamped.
+    # See docs/action_obs_normalization_report.md for the literature
+    # background and recommended next steps (tanh-squashed Gaussian
+    # with Jacobian correction).
+    clip_actions=None,
     policy=RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_obs_normalization=False,
