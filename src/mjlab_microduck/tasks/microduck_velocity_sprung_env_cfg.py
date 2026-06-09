@@ -351,6 +351,13 @@ MicroduckVelocitySprungRlCfg = RslRlOnPolicyRunnerCfg(
     # with Jacobian correction).
     clip_actions=None,
     policy=RslRlPpoActorCriticCfg(
+        # Tanh-squashed Gaussian actor with Jacobian-corrected log-prob.
+        # See docs/phase_b_touchpoint_map.md for the override surface
+        # and src/mjlab_microduck/policy/squashed_actor_critic.py for
+        # the implementation + design rationale.  This eliminates the
+        # clip-bias pathology by bounding actions at the network level
+        # rather than via env-wrapper clipping.
+        class_name="mjlab_microduck.policy.squashed_actor_critic:SquashedActorCritic",
         init_noise_std=1.0,
         actor_obs_normalization=False,
         critic_obs_normalization=False,
@@ -360,6 +367,11 @@ MicroduckVelocitySprungRlCfg = RslRlOnPolicyRunnerCfg(
         activation="elu",
     ),
     algorithm=RslRlPpoAlgorithmCfg(
+        # SquashedPPO: subclass that uses SquashedRolloutStorage (with
+        # raw_actions buffer) so the squashed actor's log_prob can be
+        # re-evaluated at the exact sampled u — see
+        # mjlab_microduck/policy/squashed_ppo.py.
+        class_name="mjlab_microduck.policy:SquashedPPO",
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
