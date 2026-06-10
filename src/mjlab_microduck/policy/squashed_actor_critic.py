@@ -33,16 +33,25 @@ Two design decisions baked in:
       hard ratio clipping in the loss (changes rsl_rl PPO, not
       lightweight) or Option 2 (store u directly, also heavier).
 
-(2) **Two SAC-convention approximations are kept**:
-    - ``entropy`` returns the underlying Normal's entropy, not the
-      true squashed entropy (which has no closed form).  Off by
-      ``E[Σᵢ log(1-aᵢ²+ε)]`` (negative, so squashed entropy is
-      smaller).  Entropy bonus is multiplied by entropy_coef=0.01, so
-      the bias on the gradient is small.  Monte-Carlo correction is
-      possible but adds compute.  Standard practice (SB3, SAC).
-    - The PPO adaptive-LR KL is computed on the underlying Normal
+(2) **Corrected entropy (Step B7) + one remaining approximation**:
+    - ``entropy`` now returns the TRUE squashed-distribution entropy
+      via a Monte-Carlo estimate:
+          h(a) = h_Normal(u) + E_u[ Σᵢ log(1 − tanh²(uᵢ)) ]
+      The original version returned just ``h_Normal(u)``, which grows
+      as ``0.5·log(2πe σ²)`` WITHOUT BOUND.  In a 62k-iter run
+      (ajzu256z) that uncorrected bonus drove σ from 1 → 303: with a
+      fixed entropy_coef and the unbounded Normal entropy, PPO kept
+      getting rewarded for inflating σ while the surrogate barely
+      pushed back (saturated tanh actions don't change with σ).  The
+      true squashed entropy is bounded (bounded action support), so
+      the correction term cancels the σ-growth incentive once samples
+      saturate.  This is the matching half of the Jacobian correction.
+      A hard ``MAX_STD`` clamp on the distribution is also applied as a
+      backstop.
+    - The PPO adaptive-LR KL is still computed on the underlying Normal
       (closed form), not on the squashed distribution.  Same SAC
-      convention.
+      convention — this one is kept because it only drives the LR
+      schedule, where the bias is benign.
 
 Anything else (critic, obs normalization, ``_update_distribution``,
 KL adaptation, value loss, advantage normalization) is inherited
@@ -51,9 +60,12 @@ unchanged from ``ActorCritic``.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
+from torch.distributions import Normal
 from tensordict import TensorDict
 
 from rsl_rl.modules.actor_critic import ActorCritic
@@ -123,6 +135,19 @@ class SquashedActorCritic(ActorCritic):
     ATANH_CLAMP_EPS: float = 0.1
     EPS: float = 1e-6
 
+    # Entropy correction (Step B7).
+    # Number of Monte-Carlo samples for the squashed-entropy correction
+    # term.  Reparameterized (rsample), so the gradient w.r.t. σ/μ flows
+    # and the entropy bonus correctly trades off.  Cheap (just samples
+    # the existing Normal — no network forward); 16 keeps variance low.
+    ENTROPY_MC_SAMPLES: int = 16
+    # Hard backstop on the Normal std used by the distribution.  The
+    # corrected entropy is the real fix for σ-runaway; this clamp only
+    # catches a residual bug.  MAX_STD=4 is well above a healthy
+    # squashed σ (~0.3–1.5) so it shouldn't bind in normal training.
+    MIN_STD: float = 1e-3
+    MAX_STD: float = 4.0
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Pop our own kwarg before forwarding to ActorCritic, so the
         # base-class `kwargs` filter doesn't print a warning about it.
@@ -148,6 +173,54 @@ class SquashedActorCritic(ActorCritic):
                 last_linear.bias.zero_()
 
     # ── Overrides ─────────────────────────────────────────────────────
+
+    def _update_distribution(self, obs: torch.Tensor) -> None:
+        """Build the Normal, then clamp σ as a hard backstop.
+
+        The corrected ``entropy`` (below) is the real fix for σ-runaway.
+        This clamp is belt-and-suspenders: it bounds the σ actually used
+        for sampling / log_prob / entropy / KL to [MIN_STD, MAX_STD].
+        Because ``clamp`` has zero gradient outside the range, once the
+        learned σ parameter hits MAX_STD it stops being pushed higher —
+        the clamp is self-enforcing.
+        """
+        super()._update_distribution(obs)
+        std = self.distribution.stddev.clamp(self.MIN_STD, self.MAX_STD)
+        self.distribution = Normal(self.distribution.mean, std)
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        """True entropy of the tanh-squashed distribution (MC estimate).
+
+        Change-of-variables for differential entropy under ``a = tanh(u)``:
+
+            h(a) = h(u) + E_u[ Σᵢ log|d aᵢ / d uᵢ| ]
+                 = h(u) + E_u[ Σᵢ log(1 − tanh²(uᵢ)) ]
+
+        where ``h(u)`` is the (closed-form) Normal entropy.  The
+        correction term is estimated by Monte Carlo over
+        ``ENTROPY_MC_SAMPLES`` reparameterized samples.
+
+        Why this matters: ``h(u) = Σ 0.5·log(2πe σ²)`` grows without
+        bound in σ, but the squashed entropy is bounded (the action
+        support is bounded).  Using only ``h(u)`` as the PPO entropy
+        bonus made σ run away to 303 over 62k iters (run ajzu256z).
+        The correction term goes increasingly negative as samples
+        saturate, cancelling the unbounded growth.
+
+        Numerically stable form of ``log(1 − tanh²(u))``:
+            log(1 − tanh²(u)) = 2·(log 2 − u − softplus(−2u))
+        (avoids ``log(0)`` when ``|u|`` is large / tanh saturates).
+        """
+        normal_entropy = self.distribution.entropy().sum(dim=-1)  # (batch,)
+        # Reparameterized samples: (K, batch, n_actions).  rsample keeps
+        # the estimate differentiable so the bonus's gradient reaches σ.
+        u = self.distribution.rsample((self.ENTROPY_MC_SAMPLES,))
+        log_jac = 2.0 * (
+            math.log(2.0) - u - F.softplus(-2.0 * u)
+        )  # = log(1 − tanh²(u)), (K, batch, n_actions)
+        correction = log_jac.sum(dim=-1).mean(dim=0)  # (batch,)
+        return normal_entropy + correction
 
     def act(self, obs: TensorDict, **kwargs: Any) -> torch.Tensor:
         """Sample from the underlying Normal and squash with tanh.
@@ -260,10 +333,16 @@ class SquashedActorCritic(ActorCritic):
         ).sum(dim=-1)
         return log_prob_normal - jacobian_log_det
 
-    # NOTE: not overridden, inherited from ActorCritic:
-    #   - _update_distribution  (creates self.distribution = Normal(μ, σ))
-    #   - action_mean / action_std  (queried for KL computation in PPO)
-    #   - entropy  (used for entropy bonus — SAC-convention approximation)
+    # NOTE: overridden above:
+    #   - __init__               (small-init on final actor layer)
+    #   - _update_distribution   (σ clamp backstop)
+    #   - entropy                (corrected squashed entropy, Step B7)
+    #   - act / act_inference    (tanh squashing + raw-u cache)
+    #   - get_actions_log_prob / get_actions_log_prob_with_raw_u
+    #
+    # Inherited unchanged from ActorCritic:
+    #   - action_mean / action_std  (queried for KL — uses clamped σ now,
+    #     since _update_distribution rebuilds self.distribution)
     #   - evaluate  (critic, no actor-side change needed)
     #   - get_actor_obs, get_critic_obs, update_normalization
     #   - reset, forward, load_state_dict

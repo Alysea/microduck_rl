@@ -267,18 +267,28 @@ def run_all():
         )
 
     # ───── (6) Entropy is finite and reasonable ─────
-    @test("entropy is finite and matches Normal entropy (SAC convention)")
+    @test("corrected entropy = Normal entropy minus positive saturation term")
     def _():
+        # Step B7: entropy is now the TRUE squashed entropy =
+        #   h_Normal(u) + E[Σ log(1 − tanh²(u))]
+        # The correction term is negative (log of something < 1), so the
+        # corrected entropy must be strictly LESS than the raw Normal
+        # entropy.  Verify both that relationship and finiteness.
         policy = make_dummy_policy(num_actions=4, init_noise_std=1.0)
         mean = torch.zeros(10, 4)
         make_distribution(policy, mean, std_val=1.0)
-        ent = policy.entropy   # property — reads self.distribution.entropy
-        # Analytical entropy of Normal(0, 1) per dim = 0.5 * log(2πe·1²)
-        per_dim = 0.5 * math.log(2 * math.pi * math.e)
-        expected = 4 * per_dim
-        assert torch.isfinite(ent).all()
-        assert abs(ent[0].item() - expected) < 1e-4, (
-            f"entropy = {ent[0].item():.4f}, expected ≈ {expected:.4f}"
+        ent = policy.entropy   # corrected (MC)
+        normal_per_dim = 0.5 * math.log(2 * math.pi * math.e)
+        normal_total = 4 * normal_per_dim   # ≈ 5.676
+        assert torch.isfinite(ent).all(), "non-finite corrected entropy"
+        assert ent[0].item() < normal_total, (
+            f"corrected entropy {ent[0].item():.3f} should be < raw Normal "
+            f"entropy {normal_total:.3f} (correction term is negative)"
+        )
+        # Sanity: not absurdly far below either (correction for N(0,1) is
+        # ≈ -0.84/dim → total ≈ 5.68 - 3.37 ≈ 2.3).  Allow MC variance.
+        assert 1.5 < ent[0].item() < 4.0, (
+            f"corrected entropy {ent[0].item():.3f} outside expected ~2.3 range"
         )
 
     # ───── (7) Round-trip precision: atanh(tanh(u)) ≈ u to within 1e-4 ─────
@@ -385,6 +395,56 @@ def run_all():
             print(f"\n      (warn) Option-1 ratio ({max_ratio_v1:.2e}) is "
                   f"smaller than Option-2 ({max_ratio:.2e}); means this "
                   f"seed didn't sample saturated u — test still passes")
+
+    # ───── (10) Corrected entropy is BOUNDED as σ grows (Step B7 fix) ─────
+    @test("corrected entropy stays bounded as σ → large (σ-runaway fix)")
+    def _():
+        # The σ-runaway bug: uncorrected Normal entropy = 0.5 log(2πe σ²)
+        # grows without bound, so the PPO entropy bonus rewards inflating
+        # σ forever (drove σ → 303 in run ajzu256z).  The corrected
+        # squashed entropy is bounded because the action support is
+        # bounded.  Verify: as σ increases over orders of magnitude, the
+        # corrected entropy does NOT keep climbing (it should level off
+        # and then DECREASE — saturated distribution concentrates mass
+        # at ±1).
+        policy = make_dummy_policy(num_actions=4)
+        mean = torch.zeros(8, 4)
+        entropies = {}
+        for std_val in [0.5, 1.0, 2.0, 4.0, 8.0, 50.0]:
+            make_distribution(policy, mean, std_val=std_val)
+            ent = policy.entropy.mean().item()
+            entropies[std_val] = ent
+        # The UNcorrected Normal entropy at these σ would be (per 4 dims):
+        #   σ=0.5: 1.74,  σ=8: 12.8,  σ=50: 27.5  — monotonic, unbounded.
+        # The corrected entropy must NOT grow like that.  Concretely,
+        # entropy at σ=50 must be LESS than at σ=2 (saturation regime).
+        assert entropies[50.0] < entropies[2.0], (
+            f"corrected entropy did not turn over: "
+            f"σ=2 → {entropies[2.0]:.3f}, σ=50 → {entropies[50.0]:.3f} "
+            f"(should decrease — bug means σ-runaway persists)"
+        )
+        # And it must be finite throughout.
+        for s, e in entropies.items():
+            assert math.isfinite(e), f"non-finite entropy at σ={s}"
+
+    # ───── (11) σ clamp backstop limits the distribution std ─────
+    @test("MAX_STD clamp bounds the distribution std")
+    def _():
+        from tensordict import TensorDict
+
+        policy = make_dummy_policy(num_actions=4)
+        # Force the learnable std parameter way above MAX_STD
+        with torch.no_grad():
+            policy.std.fill_(100.0)
+        obs = TensorDict(
+            {"policy": torch.zeros(8, 8), "critic": torch.zeros(8, 8)},
+            batch_size=[8],
+        )
+        policy.act(obs)   # triggers _update_distribution → clamp
+        max_std = policy.distribution.stddev.max().item()
+        assert max_std <= policy.MAX_STD + 1e-5, (
+            f"distribution std {max_std} exceeds MAX_STD {policy.MAX_STD}"
+        )
 
     # ───── Summary ─────
     print()
