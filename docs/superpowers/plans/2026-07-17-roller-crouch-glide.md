@@ -13,7 +13,7 @@
 - **Aucune modification du runtime Rust.** Le geste réutilise le slot `--ground-pick` existant (bouton A, one-shot).
 - **Layout d'obs unifié 61D** obligatoire (`--new-cmd-obs`) : `[twist(3), head(4), body(6)]`, head/body zero-paddés. Toute nouvelle policy DOIT conserver ce layout.
 - **14 joints actifs** (roues passives exclues via `SceneEntityCfg("robot", joint_names=(r"^(?!passive_).*",))`), `action.scale = 1.0`, `kp_fw = 200`.
-- **Parité entraînement/déploiement (sim2real) :** au déploiement, forcer `--ground-pick-kp-ratio 1.0` (défaut 0.6), `--ground-pick-action-scale` = action_scale runtime, `--ground-pick-period 4.0`.
+- **Parité entraînement/déploiement (sim2real) :** au déploiement, forcer `--ground-pick-kp-ratio 1.0` (défaut 0.6), `--ground-pick-action-scale` = action_scale runtime, `--ground-pick-period 6.0`.
 - **Phase encoding (imposé par le runtime) :** `command = [cos(2π·φ), sin(2π·φ), 0]`, période 4 s. Palier de glisse = 1 s → `hold_lo=0.375`, `hold_hi=0.625`.
 - **Commits simples** (pas de `Co-Authored-By`).
 - Lancer les tests via `uv run --with pytest pytest` (pas de dépendance pytest ajoutée au projet).
@@ -875,7 +875,7 @@ microduck_runtime --variant pre-alpha --new-cmd-obs --roller \
   --new-dxl-imu --kp 200 --action-scale 0.8 \
   --max-linear-vel 0.6 --max-linear-vel-backward 0.5 --max-angular-vel 0.0 \
   --ground-pick ~/microduck/policies/roller_crouch.onnx \
-  --ground-pick-period 4.0 \
+  --ground-pick-period 6.0 \
   --ground-pick-kp-ratio 1.0 \
   --ground-pick-action-scale 0.8
 ```
@@ -883,7 +883,7 @@ microduck_runtime --variant pre-alpha --new-cmd-obs --roller \
 **Paramètres critiques (parité sim2real) :**
 - `--ground-pick-kp-ratio 1.0` — le défaut 0.6 baisserait kp à 120 alors qu'on entraîne à 200.
 - `--ground-pick-action-scale 0.8` — doit matcher l'`action_scale` d'entraînement.
-- `--ground-pick-period 4.0` — doit matcher la période entraînée.
+- `--ground-pick-period 6.0` — doit matcher la période entraînée.
 
 - [ ] **Step 3: Tester le geste**
 
