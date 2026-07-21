@@ -123,7 +123,7 @@ microduck_runtime --variant pre-alpha --new-cmd-obs --roller \
   --new-dxl-imu --kp 200 --action-scale 0.8 \
   --max-linear-vel 0.6 --max-linear-vel-backward 0.5 --max-angular-vel 0.0 \
   --ground-pick roller_crouch.onnx \
-  --ground-pick-period 6.0 \
+  --ground-pick-period 3.0 \
   --ground-pick-kp-ratio 1.0 \
   --ground-pick-action-scale 0.8
 ```
@@ -134,7 +134,7 @@ Bouton **A** → crouch-glide, puis retour auto à la policy roller.
 - `--ground-pick-kp-ratio 1.0` : le défaut est **0.6** (baisse kp à 120 pendant le trick).
   On entraîne à kp=200 → il faut forcer **1.0** pour que ça corresponde.
 - `--ground-pick-action-scale` doit matcher l'`action_scale` d'entraînement (0.8 ci-dessus).
-- `--ground-pick-period 6.0` doit matcher la période/longueur de mouvement entraînée
+- `--ground-pick-period 3.0` doit matcher la période/longueur de mouvement entraînée
   (défaut 4.0, on le garde).
 
 ## Risques et vérification
