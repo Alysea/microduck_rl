@@ -79,8 +79,20 @@ Placeholders plausibles au départ (ajustables), à remplacer par les lectures r
 ### Rewards hérités non listés
 La table ci-dessus n'est pas exhaustive : l'env hérite de velocity quelques
 régularisateurs génériques de faible poids non spécifiques au shoot —
-`angular_momentum` (-0.02), `soft_landing` (-1e-5), `dof_pos_limits` — conservés
-(stabilité, négligeables). À revoir seulement lors d'un passage de tuning.
+`angular_momentum` (-0.02), `dof_pos_limits` — conservés (stabilité, négligeables).
+⚠️ `soft_landing` (reward de marche) est **retiré** : il lit le capteur 2-pieds
+`feet_ground_contact` supprimé au profit du capteur pied gauche → KeyError au 1er step
+sinon, et il est inerte pour un shoot debout.
+
+### Gotcha renommage capteur (⚠️)
+Renommer le capteur pied (`feet_ground_contact` → `left_foot_ground_contact`) casse
+tout ce que l'héritage velocity/ground_pick référence par ce nom. À traiter :
+- **obs critic** `foot_air_time`/`foot_contact`/`foot_contact_forces` → repointés vers
+  le capteur pied gauche (le critic garde l'info d'appui ; sinon KeyError à la
+  construction de l'env).
+- **reward** `soft_landing` → retiré (voir ci-dessus ; sinon KeyError au 1er step).
+Toujours valider par une construction live + **au moins un `step()`** (le reward
+manager ne tourne qu'au step), pas seulement le build de cfg ni les tests unitaires.
 
 ### Objectif : suivi de la pose interpolée par la phase
 Nouvelle fonction **pure** dans `mdp.py` :
