@@ -64,6 +64,23 @@ Placeholders plausibles au départ (ajustables), à remplacer par les lectures r
   - Raison : chaque épisode démarre au STAND (état du robot = `default_joint_pos`)
     avec φ=0 = cible STAND → cohérence état/cible au reset (sinon la policy est
     sommée d'être instantanément en pose « frappe » depuis une station immobile).
+  - **Invariant de cohérence** : `STAND_POSE` DOIT égaler la pose articulaire de
+    reset du sim (`HOME_FRAME` / `default_joint_pos`, non nulle : hip_pitch ±0.4579,
+    ankle ±0.4530, hip_roll ±0.0873, neck/head_pitch 0.3491). Vérifié par
+    `test_stand_pose_matches_home_standing_pose`. Les placeholders initialement à
+    zéro cassaient cet invariant (corrigé après revue finale).
+
+### Reset (hauteur debout, pas d'élan)
+- `reset_base.pose_range.z = (0.12, 0.13)` — **hauteur debout absolue** (le `pos`
+  racine par défaut de `InitialStateCfg` est (0,0,0), donc z de reset = 0.12–0.13 m,
+  pas un offset additif ; valeur identique à l'env velocity qui marche). Pas de chute.
+- **Pas d'injection de vitesse d'entrée** (shoot debout, contrairement au crouch-glide).
+
+### Rewards hérités non listés
+La table ci-dessus n'est pas exhaustive : l'env hérite de velocity quelques
+régularisateurs génériques de faible poids non spécifiques au shoot —
+`angular_momentum` (-0.02), `soft_landing` (-1e-5), `dof_pos_limits` — conservés
+(stabilité, négligeables). À revoir seulement lors d'un passage de tuning.
 
 ### Objectif : suivi de la pose interpolée par la phase
 Nouvelle fonction **pure** dans `mdp.py` :
@@ -92,7 +109,7 @@ Rewards de suivi (toujours actifs, symétriques comme crouch) :
 | Reward | Poids | Rôle |
 |---|---|---|
 | `upright` | 2.0 | tronc vertical |
-| `support_foot_grounded` (pied gauche) | 3.0 | garder le pied d'appui planté |
+| `support_foot_grounded` (pied gauche) | 6.0 | garder le pied d'appui planté (capteur mono-pied → `found∈{0,1}` → reward∈{0,0.5} après `/2`, donc poids 6.0 ≈ contribution max 3.0) |
 | `feet_flat` (gauche) | -1.0 | lame gauche à plat |
 | `self_collisions` | -1.0 | |
 | `body_ang_vel` | -0.05 | |
