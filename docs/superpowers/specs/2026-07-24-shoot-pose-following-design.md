@@ -94,6 +94,24 @@ tout ce que l'héritage velocity/ground_pick référence par ce nom. À traiter 
 Toujours valider par une construction live + **au moins un `step()`** (le reward
 manager ne tourne qu'au step), pas seulement le build de cfg ni les tests unitaires.
 
+### ⚠️ Transfert de poids appris (révision post-1er entraînement)
+Constat : les poses BACK/FWD relevées **robot tenu à la main (appui bipède)** gardent le
+CoM **centré entre les deux pieds** (~4-5 cm à l'intérieur du pied gauche) à toutes les
+phases. Avec `upright` imposé, dès que le pied droit se lève le robot bascule → aucune
+policy ne peut tenir (géométrique, pas du tuning). Vérifié en sim (CoM vs sites pieds).
+
+Fix retenu (RL apprend l'équilibre) :
+- `mdp.com_over_support_foot` : reward gaussien (std 4 cm) tirant la projection du CoM
+  (`root_com_pos_w`) vers le pied d'appui, **gaté** par `mdp.kick_engagement` (0 au repos
+  STAND, 1 pendant la frappe). Poids 3.0.
+- **suivi de pose scindé** (param `joint_names` sur `kick_pose_track`/`_l1`) :
+  GESTE = jambe droite + cou/tête (std 0.35, serré) ; APPUI = jambe gauche (std 0.9,
+  poids 1.0, **lâche**) → la policy peut adducter/décaler le bassin pour transférer le
+  poids sans que le suivi fige le bassin centré.
+La table « Équilibre / appui » ci-dessus est donc étendue : `support_leg_pose` (1.0),
+`com_over_support` (3.0) s'ajoutent, et `kick_pose_track`/`kick_pose_l1` ne portent plus
+que sur les 9 joints du geste (droite+cou).
+
 ### Objectif : suivi de la pose interpolée par la phase
 Nouvelle fonction **pure** dans `mdp.py` :
 ```python
