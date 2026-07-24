@@ -446,14 +446,17 @@ WINDUP_END = 0.35    # STAND -> BACK
 KICK_END = 0.45      # BACK -> FORWARD (segment court = frappe sèche)
 RETURN_END = 0.75    # FORWARD -> STAND, puis repos jusqu'à 1.0
 
-# ── Poses (rad, 14 joints, mouth exclu) — PLACEHOLDERS, à lire sur le vrai robot ──
+# ── Poses (rad, 14 joints, mouth exclu) ──────────────────────────────────────
 # Convention: jambe droite frappe (hanche/genou droit actifs), gauche en appui.
+# STAND_POSE = pose HOME du sim (HOME_FRAME / default_joint_pos) pour que φ=0
+# coïncide avec la config de reset (invariant randomize_phase=False). BACK/FWD
+# sont des PLACEHOLDERS jambe droite, à affiner via read_pose.py.
 STAND_POSE = {
-    "left_hip_yaw": 0.0, "left_hip_roll": 0.0, "left_hip_pitch": 0.0,
-    "left_knee": 0.0, "left_ankle": 0.0,
-    "neck_pitch": 0.0, "head_pitch": 0.0, "head_yaw": 0.0, "head_roll": 0.0,
-    "right_hip_yaw": 0.0, "right_hip_roll": 0.0, "right_hip_pitch": 0.0,
-    "right_knee": 0.0, "right_ankle": 0.0,
+    "left_hip_yaw": 0.0, "left_hip_roll": -0.0873, "left_hip_pitch": -0.4579,
+    "left_knee": -0.0049, "left_ankle": 0.4530,
+    "neck_pitch": 0.3491, "head_pitch": 0.3491, "head_yaw": 0.0, "head_roll": 0.0,
+    "right_hip_yaw": 0.0, "right_hip_roll": 0.0873, "right_hip_pitch": 0.4579,
+    "right_knee": 0.0049, "right_ankle": -0.4530,
 }
 KICK_BACK_POSE = {  # armement: hanche droite en extension arrière + genou fléchi
     **STAND_POSE,
@@ -616,13 +619,16 @@ Et alléger le curriculum action_rate (garder la structure, viser -0.5) :
 
 - [ ] **Step 8: Reset — hauteur de station debout**
 
-Le fichier ground_pick met `cfg.events["reset_base"].params["pose_range"]["z"] = (0.12, 0.13)` (station accroupie basse). Pour le shoot, garder une station DEBOUT. Vérifier/mettre :
+Garder la **hauteur debout** `(0.12, 0.13)` — c'est la valeur de l'env velocity
+(marche) ET de ground_pick. ⚠️ Ce n'est PAS un offset additif « station accroupie » :
+le `pos` racine par défaut de `InitialStateCfg` est (0,0,0), donc la hauteur de reset
+est z ∈ [0.12, 0.13] m **absolue** = debout (aucune chute). Vérifier/mettre :
 
 ```python
     cfg.events["reset_base"].params["pose_range"]["z"] = (0.12, 0.13)
 ```
 
-(Conserver la valeur héritée de la station debout velocity ; ne PAS injecter de vitesse d'entrée — c'est un shoot debout, pas de glisse.)
+(Ne PAS injecter de vitesse d'entrée — c'est un shoot debout, pas de glisse.)
 
 - [ ] **Step 9: Renommer la RlCfg**
 
