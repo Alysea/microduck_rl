@@ -69,7 +69,9 @@ EPISODE_LENGTH_S = 6.0
 ```
 
 Les hauteurs de repos au sol sont **identiques** aux deux modèles (c'est la coque du tronc qui touche,
-pas les pieds) → les plages `prone_z` du `standup` se réutilisent telles quelles.
+pas les pieds). Cela ne veut pas dire que la plage `prone_z` du `standup` se réutilise telle quelle :
+voir la note sous « Reset » — `prone_z_min` diverge (0.076 ici, pas 0.05) car une seule plage sert
+deux poses (ventre, dos) dont les hauteurs de contact au reset ne sont pas les mêmes.
 
 La grandeur mesurée est bien celle que lisent les récompenses : `height_target_gaussian` et
 `height_l1_penalty` utilisent `root_link_pos_w[:, 2]`, qui vaut exactement `xpos[trunk_base].z`
@@ -213,7 +215,7 @@ cfg.events["set_ground_state"] = EventTermCfg(
         "face_up_prob":    0.00,   # dos — introduit tard (le plus dur)
         "sitting_prob":    0.00,   # pas de bucket assis → aucun override de joint à remapper
         "standing_prob":   0.50,
-        "prone_z_min":     0.05,   # validé : géométrie de repos identique aux deux modèles
+        "prone_z_min":     0.076,  # cf. note ci-dessous — pas un simple héritage du standup
         "prone_z_max":     0.09,
         "standing_z_min":  0.134,  # roller (contre 0.11–0.12 pour les pieds)
         "standing_z_max":  0.144,
@@ -224,6 +226,16 @@ cfg.events["set_ground_state"] = EventTermCfg(
 
 Note : dans `set_random_ground_state`, le bucket `standing` réutilise le quaternion du bucket
 `sitting` — donc `sitting_tilt_max` bruite aussi les départs debout, ce qui est voulu.
+
+**Sur `prone_z_min` = 0.076 (et pas 0.05, valeur reprise à tort du `standup`)** : les poses ventre et
+dos partagent une seule plage de z, mais leurs hauteurs de contact mesurées diffèrent — ventre
+0.0752, dos 0.0475 — donc une plage unique ne peut pas être idéale pour les deux. Le commentaire du
+`standup` justifie son plancher `0.05` par un repos mesuré à ~0.044 **après stabilisation sous
+gravité** ; or ce qui compte à l'instant du reset, c'est la hauteur de contact en pose HOME, pas la
+hauteur de repos une fois retombé. À 0.05, le ventre spawn avec la coque du tronc **enfoncée de
+25 mm dans le sol**, un pushout que la policy paie ensuite via `gentle_rise` /
+`joint_torque_rate_l2`. `prone_z_min = 0.076` élimine cette interpénétration, au prix d'un dos qui
+démarre 28–42 mm au-dessus de son repos — un artefact bien plus doux qu'un pushout de contact.
 
 **Aucune modification de `mdp.py`** : `reset_robot_joints` de la base utilise
 `joint_names=(".*",)` avec `velocity_range=(0.0, 0.0)` et `default_joint_vel` (HOME_FRAME

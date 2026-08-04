@@ -727,6 +727,7 @@ def test_ground_state_heights_are_roller_specific():
     # Repos au sol : géométrie identique aux deux modèles (c'est la coque du
     # tronc qui touche, pas les pieds) → plages du standup réutilisées.
     assert (params["prone_z_min"], params["prone_z_max"]) == (0.05, 0.09)
+    # [Corrigé à 0.076 après la revue finale — voir docs/superpowers/specs/2026-08-04-roller-standup-design.md]
     # Debout : hauteur ROLLER (+23 mm vs le modèle sans roues, qui est à 0.11–0.12).
     assert params["standing_z_min"] == 0.134
     assert params["standing_z_max"] == 0.144
@@ -809,6 +810,7 @@ Dans `microduck_roller_standup_env_cfg.py`, insérer ce bloc **après** les réc
             # Repos au sol : mesuré à 0.075 (ventre) / 0.048 (dos), identique aux
             # deux modèles — c'est la coque du tronc qui touche, pas les pieds.
             "prone_z_min":    0.05,
+            # [Corrigé à 0.076 après la revue finale — voir docs/superpowers/specs/2026-08-04-roller-standup-design.md]
             "prone_z_max":    0.09,
             # Debout sur roues : ROLLER_STAND_Z = 0.138 (contre 0.11–0.12 sans roues).
             "standing_z_min": 0.134,
