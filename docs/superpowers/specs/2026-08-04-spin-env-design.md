@@ -1,0 +1,261 @@
+# Spec — Env « Spin » (rotation rapide sur place, sur rollers)
+
+Date : 2026-08-04. Branche : `new_pre_alpha_rollers`.
+
+## But
+
+Une nouvelle tâche RL qui apprend au microduck sur rollers à faire un **spin** :
+~2 tours anti-horaire sur place à ~6 rad/s (360°/s), puis arrêt propre debout.
+Geste **cyclique piloté par une phase**, déployé dans un **slot bouton one-shot**
+du runtime, comme la tâche `roller_crouch` existante.
+
+## Décisions cadrées
+
+| Question | Décision |
+|---|---|
+| Support | Sur rollers (`MICRODUCK_WALK_ROLLERS_ROBOT_CFG`, 4 roues passives) |
+| Pilotage | Slot bouton one-shot, commande = phase `[cos(2πφ), sin(2πφ), 0]` |
+| Cible | ~6 rad/s, 2 tours, puis freinage jusqu'à l'arrêt |
+| État d'entrée | À l'arrêt **ou** en roulement lent (0 → 0.3 m/s) |
+| Sens | Gauche uniquement (lacet positif, anti-horaire) |
+| Approche | Objectif « résultat » (suivi de ω_z) + amorce antisymétrique décroissante |
+
+**Contrainte runtime** : le slot n'envoie que `[cos, sin, 0]` — aucun canal libre
+pour le sens de rotation. La policy tourne donc **toujours à gauche**. Une policy
+miroir pourrait plus tard aller dans un autre slot (bouton B, `--fold-policy`).
+
+## Mécanique physique visée
+
+Sur 4 roues passives, la rotation sur place « propre » se fait en **roulement
+différentiel** : le patin gauche part vers l'arrière, le droit vers l'avant (les
+roues **roulent**, elles ne patinent pas). C'est un *swizzle antisymétrique* : les
+jambes font l'inverse l'une de l'autre, au lieu du miroir du swizzle classique.
+
+Vérification des signes pour une rotation anti-horaire (repère : x avant, y gauche,
+z haut ; ω_z > 0) : un point à gauche (+y) a pour vitesse `ω ẑ × y ŷ = −ω y x̂`,
+donc **vers l'arrière**. Les 4 roues tournent positif en marche avant (vérifié par
+`test_wheel_direction.py`), donc pour un spin anti-horaire :
+`ω_roues_gauche < 0`, `ω_roues_droite > 0`, soit **`ω_D − ω_G > 0`**.
+
+## Approche retenue (C) et pourquoi
+
+Trois approches ont été considérées :
+
+- **A — objectif « résultat » pur** : on récompense la vitesse de lacet et on laisse
+  PPO trouver le geste. Risque documenté dans ce repo : optimum paresseux /
+  patinage-sautillement au lieu du roulement propre.
+- **B — objectif « directif » par poses** : deux poses de ciseau interpolées par la
+  phase, comme `roller_crouch`. Marche vite *si* les poses sont bonnes ; or pour le
+  crouch elles étaient **lues sur le vrai robot**, alors qu'ici le geste est inconnu.
+  Il faudrait le composer à la main : cher et risqué (des poses sans couple utile
+  ne produisent rien).
+- **C — A + amorce antisymétrique décroissante** ← **retenue**. Structure de A, plus
+  deux termes de *shaping* faibles qui injectent la seule connaissance physique
+  certaine (le roulement différentiel), et dont le poids décroît par curriculum pour
+  laisser la policy affiner son propre geste. La **fréquence de pompage reste libre**.
+
+## Architecture
+
+**Fichier** : `src/mjlab_microduck/tasks/microduck_spin_env_cfg.py`
+- factory `make_microduck_spin_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg`
+- config PPO `MicroduckSpinRlCfg`
+- task id `Mjlab-Spin-Flat-MicroDuck`, enregistré dans `tasks/__init__.py`
+
+Clone la structure de `microduck_roller_crouch_env_cfg.py` : robot rollers, obs 61D
+unifié, DR complète, `action.scale = 1.0`, terrain plat.
+
+**`ENABLE_SYMMETRY = False`** — obligatoire : l'augmentation de symétrie gauche/droite
+transformerait un spin à gauche en spin à droite et détruirait l'apprentissage.
+
+**Commande** : `GroundPickPhaseCommandCfg(period=4.0, randomize_phase=False)`.
+`period=4.0` est le défaut de `--ground-pick-period` → rien à passer au runtime.
+`randomize_phase=False` → chaque épisode démarre à φ=0 (debout), comme au déploiement.
+
+## Enveloppe de phase
+
+La phase pilote une **vitesse de lacet cible** ω\*(φ), en trapèze sur 4 segments
+(période 4 s, `SPIN_RATE_MAX = 6.0` rad/s) :
+
+```
+ACCEL_END = 0.125   [0,     0.125)  0.5 s  ω* : 0 → 6 rad/s   (lancement, rampe linéaire)
+HOLD_END  = 0.525   [0.125, 0.525)  1.6 s  ω* = 6 rad/s        (régime)
+BRAKE_END = 0.650   [0.525, 0.650)  0.5 s  ω* : 6 → 0          (freinage, rampe linéaire)
+            1.0     [0.650, 1.0)    1.4 s  ω* = 0              (repos debout)
+```
+
+Intégrale sur un cycle : `0.5·3 + 1.6·6 + 0.5·3 = 12.6 rad ≈ 2.0 tours`. ✅
+
+Épisode = 20 s = **5 cycles** : le robot répète lancement → régime → freinage → repos
+cinq fois par épisode. Plus de données par épisode, et le segment « repos » entraîne
+aussi la sortie propre du trick.
+
+**Fonction pure** `spin_rate_by_phase(phase, rate_max, accel_end, hold_end, brake_end)`
+dans `mdp.py`, à côté de `crouch_pose_blend`. Testable sans simulateur.
+
+**Porte de shaping** : `gate(φ) = spin_rate_by_phase(φ) / rate_max ∈ [0, 1]`. Vaut 0
+sur le segment repos → aucune amorce ne pousse au ciseau à ce moment-là, donc le robot
+revient en station neutre. C'est ce qui donne une sortie de trick propre vers la policy
+roller.
+
+## Rewards
+
+### Pièges vérifiés dans mjlab (à traiter explicitement)
+
+- `body_ang_vel` (`body_angular_velocity_penalty`) ne pénalise que **x/y**
+  (`ang_vel_xy`, commentaire « Don't penalize z-angular velocity ») → **gardée**
+  (poids −0.05) : elle réprime le ballant roulis/tangage sans gêner le spin.
+- `angular_momentum` (`angular_momentum_penalty`) pénalise la **norme 3D** du moment
+  angulaire → elle combattrait directement le spin. **Supprimée.**
+
+### Nouvelles rewards (à écrire dans `mdp.py`)
+
+| Reward | Poids | Définition |
+|---|---|---|
+| `spin_rate_track` | 6.0 | `exp(−((ω_z − ω*(φ))/std)²)`, `std = 1.5` rad/s. ω_z = lacet du tronc en repère corps (ce que voit l'IMU). Objectif principal. |
+| `spin_rate_l1` | 0.5 | `−|ω_z − ω*(φ)|` : bootstrap à gradient constant quand la gaussienne sature loin de la cible (même astuce que `crouch_glide_pose_l1`) |
+| `spin_stay_in_place` | −1.0 | `‖v_xy‖²` du tronc → « sur place », et tue l'élan d'entrée. Pas d'état de référence, donc robuste aux 5 cycles par épisode |
+| `spin_wheel_differential` | 1.0 | `gate(φ) · tanh(clamp(ω_D − ω_G, min=0) / omega_scale)` avec `ω_G = (LF+LR)/2`, `ω_D = (RF+RR)/2` : récompense les patins qui roulent en sens opposés cohérents avec l'anti-horaire → tourner **en roulement**, pas en patinage. Roues résolues par nom (`passive_LF_?wheel`, …). `omega_scale = 20.0` rad/s par défaut (voir ci-dessous) |
+| `leg_antisymmetry` | 1.0 → 0.25 | `gate(φ) · (−mean|q_G − q_D|)` sur `hip_pitch` et `knee`. ⚠️ convention miroir : une pose *symétrique* donne `q_G + q_D ≈ 0`, donc le **ciseau** c'est `q_G ≈ q_D`. Décroît par curriculum |
+| `spin_grounded` | 0.5 | `gate(φ) · 1[n_contact ≥ 2]` : les deux lames au sol, empêche « je saute et je vrille en l'air ». La `grounded_reward` du swizzle n'est pas réutilisable telle quelle (elle se pondère par `cmd_x`, qui vaut ici `cos(2πφ)`) |
+
+**Calibrage de `omega_scale`** (échelle de saturation du tanh) : au régime visé,
+chaque patin avance à `v = ω_z · demi_voie`, donc chaque roue tourne à
+`v / r` avec `r = 0.0175` m, et le différentiel vaut `2 · ω_z · demi_voie / r`.
+Les racines de jambe sont à `y = ±0.0175` m dans le modèle rollers, mais les patins
+sont plus écartés (offset de cheville) : la demi-voie réelle est à **mesurer sur les
+sites `left_foot` / `right_foot` dans le sim** au premier run. Avec une demi-voie
+estimée à ~0.03 m et `ω_z = 6` rad/s, le différentiel attendu est ~20 rad/s — d'où le
+défaut `omega_scale = 20.0`. Paramètre de la reward, à réajuster après mesure.
+
+### Rewards reprises de `roller_crouch` (stabilité / sim2real)
+
+| Reward | Poids |
+|---|---|
+| `upright` (tronc vertical) | 2.0 |
+| `feet_flat` (lames à plat) | −2.0 |
+| `self_collisions` | −1.0 |
+| `body_ang_vel` (xy seulement) | −0.05 |
+| `action_rate_l2` | −1.0 (curriculum −0.5 → −1.0) |
+| `neck_action_rate_l2` | −0.5 |
+| `joint_torques_l2` | −1e-3 |
+| `neck_joint_pos_l2` **hors `head_yaw`** | −0.2 |
+
+**La tête** : tangage/roulis de la nuque tenus près du neutre (sim2real), mais
+`head_yaw` **exclu** du terme → libre de servir de volant d'inertie pour lancer la
+rotation. Implémentation : `neck_joint_pos_l2` résout ses joints par regex
+`.*(neck|head).*` en dur ; il faut donc soit ajouter un paramètre de regex à cette
+fonction, soit écrire une variante `neck_joint_pos_l2_no_yaw`. Choix : **ajouter un
+paramètre `pattern`** à `neck_joint_pos_l2` (défaut inchangé) pour ne pas dupliquer.
+
+## Reset / état d'entrée
+
+```python
+cfg.events["reset_base"].params["pose_range"]["z"] = (0.1335, 0.1435)
+cfg.events["reset_base"].params["velocity_range"] = {"x": (0.0, 0.3)}
+```
+
+Injection via `reset_root_state_uniform`. **Jamais** `push_by_setting_velocity` en
+`mode="reset"` : c'est ce qui avait produit les NaN sur le crouch (`root_vel +=` sur
+une vitesse racine potentiellement divergente → le free-joint de la base explose).
+
+## Domain randomization
+
+Identique à `roller_crouch`, sans dévier (recette sim2real validée du repo) : COM
+tronc + tête, masse/inertie, friction articulaire BAM, armature, friction roues,
+pushes 0.2 m/s toutes les 3–6 s, désalignement IMU 6°, biais d'encodeurs ±0.015 rad.
+
+## Observations
+
+Layout **61D à l'identique** de roller / ground_pick / crouch — condition pour que
+l'ONNX charge dans le slot :
+`[gyro(3), projected_gravity(3), joint_pos(14), joint_vel(14), last_action(14), command(13)]`
+avec `command = [twist(3), head_pose(4), body_pose(6)]`, head/body zero-paddés.
+
+Donc : retrait de `base_lin_vel` de l'actor (gardé côté critic), retrait des
+`height_scan` et `foot_height`, `wheel_vel` côté critic, joints passifs exclus des
+termes `joint_pos`/`joint_vel`, délais et bruits identiques au crouch.
+
+Le gyro est dans l'obs → la policy **observe** son propre ω_z : la tâche est observable.
+
+## Terminations
+
+`time_out`, `fell_over`, `out_of_terrain_bounds` (héritées) + `nan_state`
+(`microduck_mdp.robot_state_is_nan`), comme le crouch.
+
+## Curriculum
+
+| Terme | Étapes |
+|---|---|
+| `action_rate_weight` | −0.5 (0) → −0.8 (250 it.) → −1.0 (500 it.) |
+| `leg_antisym_weight` | 1.0 (0) → 0.5 (1500 it.) → 0.25 (3000 it.) |
+| `com_range` | 0.003 → 0.005 (500 it.) → 0.01 (1000 it.) |
+| `head_com_range` | 0.003 → 0.005 (500 it.) → 0.01 (1000 it.) |
+
+(itérations × 24 pas/env, comme les autres envs)
+
+**Pas de curriculum sur la vitesse cible** : 6 rad/s d'emblée. Voir « Plan B ».
+
+## PPO
+
+`MicroduckSpinRlCfg` = copie de `MicroduckRollerCrouchRlCfg` : actor/critic
+(512, 256, 128) elu, obs normalization, PPO adaptatif lr 1e-3, `desired_kl=0.01`,
+`num_steps_per_env=24`, `symmetry_cfg=None`, `experiment_name="spin"`,
+`run_name="spin"`, `max_iterations=8000`.
+
+## Tests
+
+`tests/test_spin.py` — fonctions pures, sans simulateur :
+- `spin_rate_by_phase` : valeurs aux bornes des 4 segments (0, rate_max, rate_max, 0, 0)
+- monotonie croissante sur la rampe de lancement, décroissante sur le freinage
+- **intégrale sur un cycle ≈ 4π** (garantit « 2 tours ») — le test qui protège la
+  cible. Valeur exacte de l'enveloppe : 12.6 rad contre 4π = 12.566 → tolérance 1 %
+- `gate(φ) = 0` sur tout le segment repos, `∈ [0,1]` partout
+
+`tests/test_spin_cfg.py` — l'env se construit :
+- commande = `GroundPickPhaseCommand`, `period == 4.0`, `randomize_phase is False`
+- `"angular_momentum" not in cfg.rewards` (le piège de la section rewards)
+- `symmetry_cfg is None`
+- dimension de l'obs actor == 61
+
+Lancer : `uv run --with pytest pytest tests/ -q`
+
+## Entraînement / déploiement
+
+```bash
+uv run train Mjlab-Spin-Flat-MicroDuck --env.scene.num-envs 4096 --agent.max_iterations 8000
+# surveiller Episode_Reward/spin_rate_track (doit monter)
+uv run scripts/play_latest.py     # alias md-play
+uv run scripts/export_latest.py   # ONNX, normaliseur d'obs baké
+```
+
+```bash
+microduck_runtime --variant pre-alpha --new-cmd-obs --roller \
+  --model output.onnx --new-dxl-imu --kp 200 --action-scale 0.8 \
+  --ground-pick spin.onnx \
+  --ground-pick-period 4.0 \      # = SPIN_PERIOD
+  --ground-pick-kp-ratio 1.0 \    # défaut 0.6 -> forcer 1.0 (entraîné kp 200)
+  --ground-pick-action-scale 0.8  # matcher action_scale runtime
+```
+
+Bouton **A** → spin, puis retour auto à la policy roller.
+
+## Critère de succès
+
+En play : ~2 tours anti-horaire en ~2.6 s, dérive du tronc < ~10 cm, robot debout tout
+du long, station neutre stable pendant le segment repos avant le cycle suivant.
+
+## Plan B si l'entraînement plafonne
+
+Dans l'ordre :
+1. **Curriculum de vitesse** : `SPIN_RATE_MAX` 3 → 6 rad/s (nécessite de rendre
+   `rate_max` pilotable par un `CurriculumTermCfg` sur les params de reward).
+2. Monter `spin_wheel_differential` et retarder la décroissance de `leg_antisymmetry`.
+3. Élargir `std` de `spin_rate_track` (1.5 → 2.5) pour un gradient utile plus loin.
+4. En dernier recours, basculer sur l'approche B (poses de ciseau composées à la main
+   dans un pose editor) pour amorcer le geste, puis relâcher.
+
+## Hors périmètre
+
+- Spin à droite (policy miroir dans un autre slot) — plus tard.
+- Variante à pied (sans rollers).
+- Spin commandé en vitesse continue (nécessiterait un canal de commande runtime).
