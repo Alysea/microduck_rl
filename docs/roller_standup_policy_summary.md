@@ -28,7 +28,7 @@ Les hauteurs de repos au sol sont identiques aux deux modèles : c'est la coque 
 
 ## Reset — départ au sol
 
-`set_random_ground_state` : ventre (`prone_z` 0.05–0.09) / dos / **déjà debout** (`standing_z` 0.134–0.144), ± 10° de bruit en pitch/roll. Pas de bucket « assis ». Le bucket « debout » est nécessaire : sans lui la policy monte mais ne tient pas.
+`set_random_ground_state` : ventre (`prone_z` 0.076–0.09, plancher relevé car le ventre ne décolle du sol qu'à 0.0752) / dos / **déjà debout** (`standing_z` 0.134–0.144), ± 10° de bruit en pitch/roll. Pas de bucket « assis ». Le bucket « debout » est nécessaire : sans lui la policy monte mais ne tient pas.
 
 **Curriculum `ground_state_mix`** (easy → hard, le dos en dernier) :
 
