@@ -124,8 +124,12 @@ chaque patin avance à `v = ω_z · demi_voie`, donc chaque roue tourne à
 Les racines de jambe sont à `y = ±0.0175` m dans le modèle rollers, mais les patins
 sont plus écartés (offset de cheville) : la demi-voie réelle est à **mesurer sur les
 sites `left_foot` / `right_foot` dans le sim** au premier run. Avec une demi-voie
-estimée à ~0.03 m et `ω_z = 6` rad/s, le différentiel attendu est ~20 rad/s — d'où le
-défaut `omega_scale = 20.0`. Paramètre de la reward, à réajuster après mesure.
+estimée à ~0.03 m et `ω_z = 6` rad/s, le différentiel attendu était ~20 rad/s — d'où
+le défaut initial `omega_scale = 20.0`. **Mesure faite (Task 3) : demi-voie réelle
+= 0.0499 m, différentiel attendu = 34.2 rad/s, soit 71 % au-dessus de l'estimation
+— au-delà du seuil de 30 % fixé par le plan.** `SPIN_WHEEL_OMEGA_SCALE` a donc été
+corrigé à **34.0**. Voir la section « Résultats de la vérification initiale »
+ci-dessous pour le détail.
 
 ### Rewards reprises de `roller_crouch` (stabilité / sim2real)
 
@@ -259,3 +263,73 @@ Dans l'ordre :
 - Spin à droite (policy miroir dans un autre slot) — plus tard.
 - Variante à pied (sans rollers).
 - Spin commandé en vitesse continue (nécessiterait un canal de commande runtime).
+
+## Résultats de la vérification initiale
+
+### Demi-voie mesurée et `omega_scale`
+
+La demi-voie a été mesurée sur les sites `left_foot` / `right_foot` du modèle
+rollers : **0.0499 m**, contre l'estimation de 0.03 m du spec. Différentiel de
+roues attendu au régime (6 rad/s) : `2 · 6.0 · 0.0499 / 0.0175` = **34.2 rad/s**,
+soit 71 % au-dessus du défaut 20.0 — au-delà du seuil de 30 % fixé par le plan.
+`SPIN_WHEEL_OMEGA_SCALE` a donc été changé de 20.0 à **34.0**. Les tests continuent
+de passer `omega_scale=20.0` explicitement, pour rester indépendants de la
+constante.
+
+### Smoke run (Step 2 : 5 itérations, 64 envs, garde NaN)
+
+Terminé sans exception. `Episode_Termination/nan_state` est resté à 0.0000 sur
+toute la durée, et `/tmp/mjlab/nan_dumps/` n'a jamais été créé. Les six rewards
+spin apparaissent bien dans les clés `Episode_Reward/` loggées : `spin_rate_track`,
+`spin_rate_l1`, `spin_stay_in_place`, `spin_wheel_differential`, `spin_grounded`,
+`leg_antisymmetry`.
+
+Parité d'observation (Step 1) : la liste des termes de l'obs actor de l'env spin
+est **identique** à celle de `roller_crouch` — 8 termes, même ordre :
+`base_ang_vel, projected_gravity, joint_pos, joint_vel, actions, command,
+head_command, body_command`. C'est la condition pour que l'ONNX exporté charge
+dans le slot du runtime.
+
+**Note d'usage à retenir** : la commande d'exemple du plan avec `--enable-nan-guard`
+en flag nu est rejetée par le CLI de ce repo — il faut passer
+`--enable-nan-guard True`.
+
+### Run de calibrage 500 itérations (Step 3)
+
+4096 envs, 500 itérations, ~2,32 s/itération, code de sortie 0, logger wandb (donc
+`scripts/play_latest.py` / `md-play` retrouve le run).
+
+`Episode_Reward/spin_rate_track` est monté de façon monotone :
+0.0291 (it. 1) → 0.0534 (50) → 0.1464 (100) → 0.2609 (200) → 0.2946 (300) →
+0.3111 (400) → **0.3168 (500)**. Le critère de succès de cette étape (la courbe
+doit monter) est rempli.
+
+### Diagnostic dérivé — estimations, pas des mesures directes
+
+Les valeurs ci-dessous viennent du rapport entre termes de reward dans le dernier
+bloc de log, ce qui annule le facteur de normalisation inconnu appliqué par le
+logger. À prendre comme des estimations, reproductibles à partir de la même
+méthode :
+
+- Rapport `spin_rate_l1 / spin_rate_track` (−0.0097 / 0.3168, poids 0.5 et 6.0,
+  `std = 1.5`), en résolvant `e = 0.3674 · exp(−(e/1.5)²)` : erreur moyenne
+  absolue de suivi de vitesse de lacet ≈ **0.35 rad/s**, contre une cible qui
+  culmine à 6 rad/s. Pour comparaison, une policy qui ne fait rien du tout
+  donnerait un rapport environ 20× pire — ceci reflète donc un vrai suivi, pas
+  seulement la reward « farmée » pendant le segment de repos.
+- `spin_stay_in_place` ≈ −0.0069 implique `‖v_xy‖ ≈ 0.35 m/s` : le robot est
+  **encore en translation**, pas encore en train de tourner sur place.
+- `spin_wheel_differential` n'atteint qu'environ **15 %** de son maximum
+  atteignable (porte moyenne sur un cycle = 0.525), et `spin_grounded` ≈ **24 %**.
+  La rotation n'est donc **pas** encore produite par le roulement différentiel
+  visé — la policy trouve une autre voie (pivot ou patinage, avec les lames
+  souvent pas toutes les deux au sol).
+
+Ceci reste la principale question ouverte pour la prochaine étape d'entraînement,
+à relier au « Plan B » du spec : les poids de shaping (`spin_wheel_differential`
+1.0, `spin_grounded` 0.5, `spin_stay_in_place` −1.0) sont petits face à
+`spin_rate_track` à 6.0, et 500 itérations ne représentent que 1/16 des 8000
+prévues — ce point pourrait donc aussi simplement se résorber plus tard dans
+l'entraînement.
+
+L'étape 4 (regarder le geste) reste à faire, réservée à l'humain.
