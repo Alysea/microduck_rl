@@ -399,4 +399,19 @@ curriculum** sur la vitesse cible : c'est un premier essai pour voir ce que le
 robot parvient à faire à vitesse moitié, avant d'envisager une remontée graduelle
 si besoin.
 
+**Atténuation du coût de dérive pendant le lancement.** Renforcer
+`spin_stay_in_place` à −3.0 a rendu plus aigu un défaut relevé par la revue : ce
+terme était le seul du spin à ne pas être modulé par la phase, donc il facturait à
+plein tarif la translation transitoire pendant la rampe de lancement — précisément
+le moment où le robot doit pousser au sol pour s'injecter du moment angulaire, et
+où l'élan d'entrée (jusqu'à 0.3 m/s) doit être **converti** en rotation. Le coût
+est désormais multiplié par `SPIN_LAUNCH_DRIFT_SCALE = 0.2` sur `[0, ACCEL_END)`
+et vaut plein tarif ensuite. Il n'est volontairement **pas** éteint pendant le
+repos, contrairement aux amorces : c'est là que l'immobilité est le vrai critère.
+
 L'étape 4 (regarder le geste) reste à faire, réservée à l'humain.
+
+⚠️ Ces quatre tests (trois nouveaux sur l'atténuation, un modifié) n'ont **pas**
+été exécutés — la machine était réservée à autre chose au moment du commit. À
+lancer avant tout run long : `uv run --with pytest pytest tests/test_spin.py
+tests/test_spin_cfg.py -q`.
