@@ -2,10 +2,19 @@
 
 Date : 2026-08-04. Branche : `new_pre_alpha_rollers`.
 
+> **Amendement (après le premier run)** : le premier run de calibrage (500 it.)
+> a montré que le robot tombe systématiquement vers 1,16 s, bien avant le
+> freinage. En réponse, la cible a été réduite de moitié — `SPIN_RATE_MAX`
+> 6.0 → **3.0 rad/s**, soit **1 tour par cycle au lieu de 2** — et
+> `spin_stay_in_place` renforcé à **−3.0**, **sans curriculum** de vitesse.
+> Voir « Résultats de la vérification initiale » pour les preuves et la
+> configuration actuellement en vigueur.
+
 ## But
 
 Une nouvelle tâche RL qui apprend au microduck sur rollers à faire un **spin** :
-~2 tours anti-horaire sur place à ~6 rad/s (360°/s), puis arrêt propre debout.
+~2 tours anti-horaire sur place à ~6 rad/s (360°/s) *(cible initiale ; ramenée
+à 3 rad/s, voir l'amendement)*, puis arrêt propre debout.
 Geste **cyclique piloté par une phase**, déployé dans un **slot bouton one-shot**
 du runtime, comme la tâche `roller_crouch` existante.
 
@@ -15,7 +24,7 @@ du runtime, comme la tâche `roller_crouch` existante.
 |---|---|
 | Support | Sur rollers (`MICRODUCK_WALK_ROLLERS_ROBOT_CFG`, 4 roues passives) |
 | Pilotage | Slot bouton one-shot, commande = phase `[cos(2πφ), sin(2πφ), 0]` |
-| Cible | ~6 rad/s, 2 tours, puis freinage jusqu'à l'arrêt |
+| Cible | ~6 rad/s, 2 tours, puis freinage jusqu'à l'arrêt (cible initiale ; ramenée à 3 rad/s, voir l'amendement) |
 | État d'entrée | À l'arrêt **ou** en roulement lent (0 → 0.3 m/s) |
 | Sens | Gauche uniquement (lacet positif, anti-horaire) |
 | Approche | Objectif « résultat » (suivi de ω_z) + amorce antisymétrique décroissante |
@@ -74,7 +83,8 @@ transformerait un spin à gauche en spin à droite et détruirait l'apprentissag
 ## Enveloppe de phase
 
 La phase pilote une **vitesse de lacet cible** ω\*(φ), en trapèze sur 4 segments
-(période 4 s, `SPIN_RATE_MAX = 6.0` rad/s) :
+(période 4 s, `SPIN_RATE_MAX = 6.0` rad/s — cible initiale ; ramenée à 3 rad/s,
+voir l'amendement ; les segments et la période n'ont pas changé) :
 
 ```
 ACCEL_END = 0.125   [0,     0.125)  0.5 s  ω* : 0 → 6 rad/s   (lancement, rampe linéaire)
@@ -83,11 +93,21 @@ BRAKE_END = 0.650   [0.525, 0.650)  0.5 s  ω* : 6 → 0          (freinage, ram
             1.0     [0.650, 1.0)    1.4 s  ω* = 0              (repos debout)
 ```
 
+*(Les valeurs ω\* = 6 rad/s ci-dessus correspondent à `SPIN_RATE_MAX` = 6.0, la
+cible initiale ; voir l'amendement pour la valeur en vigueur.)*
+
 Intégrale sur un cycle : `0.5·3 + 1.6·6 + 0.5·3 = 12.6 rad ≈ 2.0 tours`. ✅
+*(à `SPIN_RATE_MAX = 6.0`, cible initiale.)* Forme générale : l'intégrale vaut
+`2.1 × SPIN_RATE_MAX` quel que soit `rate_max` (0.25 + 1.6 + 0.25 = 2.1). Avec la
+cible en vigueur (3.0 rad/s) : `2.1 × 3.0 = 6.3 rad ≈ 1 tour` par cycle — voir
+l'amendement.
 
 Épisode = 20 s = **5 cycles** : le robot répète lancement → régime → freinage → repos
 cinq fois par épisode. Plus de données par épisode, et le segment « repos » entraîne
-aussi la sortie propre du trick.
+aussi la sortie propre du trick. **Note (post-run)** : ceci reste vrai
+géométriquement (20 s / 4 s), mais aucun épisode du run de calibrage n'a survécu
+au-delà de ~1,16 s, soit une fraction du premier cycle seulement — voir
+« Résultats de la vérification initiale ».
 
 **Fonction pure** `spin_rate_by_phase(phase, rate_max, accel_end, hold_end, brake_end)`
 dans `mdp.py`, à côté de `crouch_pose_blend`. Testable sans simulateur.
@@ -113,7 +133,7 @@ roller.
 |---|---|---|
 | `spin_rate_track` | 6.0 | `exp(−((ω_z − ω*(φ))/std)²)`, `std = 1.5` rad/s. ω_z = lacet du tronc en repère corps (ce que voit l'IMU). Objectif principal. |
 | `spin_rate_l1` | 0.5 | `−|ω_z − ω*(φ)|` : bootstrap à gradient constant quand la gaussienne sature loin de la cible (même astuce que `crouch_glide_pose_l1`) |
-| `spin_stay_in_place` | −1.0 | `‖v_xy‖²` du tronc → « sur place », et tue l'élan d'entrée. Pas d'état de référence, donc robuste aux 5 cycles par épisode |
+| `spin_stay_in_place` | −3.0 (initialement −1.0, voir l'amendement) | `‖v_xy‖²` du tronc → « sur place », et tue l'élan d'entrée. Pas d'état de référence, donc robuste aux 5 cycles par épisode |
 | `spin_wheel_differential` | 1.0 | `gate(φ) · tanh(clamp(ω_D − ω_G, min=0) / omega_scale)` avec `ω_G = (LF+LR)/2`, `ω_D = (RF+RR)/2` : récompense les patins qui roulent en sens opposés cohérents avec l'anti-horaire → tourner **en roulement**, pas en patinage. Roues résolues par nom (`passive_LF_?wheel`, …). `omega_scale = 17.0` rad/s en vigueur (voir le paragraphe de calibrage ci-dessous) |
 | `leg_antisymmetry` | 1.0 → 0.25 | `gate(φ) · (−mean|q_G − q_D|)` sur `hip_pitch` et `knee`. ⚠️ convention miroir : une pose *symétrique* donne `q_G + q_D ≈ 0`, donc le **ciseau** c'est `q_G ≈ q_D`. Décroît par curriculum |
 | `spin_grounded` | 0.5 | `gate(φ) · 1[n_contact ≥ 2]` : les deux lames au sol, empêche « je saute et je vrille en l'air ». La `grounded_reward` du swizzle n'est pas réutilisable telle quelle (elle se pondère par `cmd_x`, qui vaut ici `cos(2πφ)`) |
@@ -128,8 +148,10 @@ estimée à ~0.03 m et `ω_z = 6` rad/s, le différentiel attendu était ~20 rad
 le défaut initial `omega_scale = 20.0`. **Mesure faite (Task 3) : demi-voie réelle
 = 0.0499 m, différentiel attendu = 34.2 rad/s, soit 71 % au-dessus de l'estimation
 — au-delà du seuil de 30 % fixé par le plan.** `SPIN_WHEEL_OMEGA_SCALE` a donc été
-corrigé à **34.0**. Voir la section « Résultats de la vérification initiale »
-ci-dessous pour le détail.
+corrigé à **34.0** (valeur intermédiaire, en vigueur tant que la cible était à
+6 rad/s ; recalibrée depuis à **17.0**, voir le paragraphe « Mise à jour »
+juste en dessous). Voir la section « Résultats de la vérification initiale »
+ci-dessous pour le détail de la mesure de demi-voie.
 
 **Mise à jour (fix wave post-review)** : `SPIN_RATE_MAX` a été réduit de 6.0 à
 **3.0 rad/s** (décision humaine, sans curriculum — voir plus bas). Conséquence
@@ -206,7 +228,8 @@ Le gyro est dans l'obs → la policy **observe** son propre ω_z : la tâche est
 
 (itérations × 24 pas/env, comme les autres envs)
 
-**Pas de curriculum sur la vitesse cible** : 6 rad/s d'emblée. Voir « Plan B ».
+**Pas de curriculum sur la vitesse cible** : 6 rad/s d'emblée *(cible initiale ;
+ramenée à 3 rad/s, toujours sans curriculum, voir l'amendement)*. Voir « Plan B ».
 
 ## PPO
 
@@ -220,8 +243,14 @@ Le gyro est dans l'obs → la policy **observe** son propre ω_z : la tâche est
 `tests/test_spin.py` — fonctions pures, sans simulateur :
 - `spin_rate_by_phase` : valeurs aux bornes des 4 segments (0, rate_max, rate_max, 0, 0)
 - monotonie croissante sur la rampe de lancement, décroissante sur le freinage
-- **intégrale sur un cycle ≈ 4π** (garantit « 2 tours ») — le test qui protège la
-  cible. Valeur exacte de l'enveloppe : 12.6 rad contre 4π = 12.566 → tolérance 1 %
+- **intégrale sur un cycle ≈ 4π** à `rate_max = 6.0` (garantit la **forme** du
+  trapèze, `2.1 × rate_max` rad par cycle) — ne protège plus la cible en vigueur
+  depuis l'amendement, cf. bullet suivant. Valeur exacte de l'enveloppe : 12.6 rad
+  contre 4π = 12.566 → tolérance 1 %
+- **la cible réellement expédiée** (`mdp.SPIN_RATE_MAX`) intègre bien à
+  `2.1 × SPIN_RATE_MAX` rad par cycle, quel que soit `rate_max` — ajouté en
+  7d916aa, c'est ce test qui échoue si la cible change sans qu'on ait réfléchi au
+  nombre de tours. Avec la valeur en vigueur (3.0 rad/s) : 6.3 rad ≈ 1 tour
 - `gate(φ) = 0` sur tout le segment repos, `∈ [0,1]` partout
 
 `tests/test_spin_cfg.py` — l'env se construit :
@@ -229,6 +258,9 @@ Le gyro est dans l'obs → la policy **observe** son propre ω_z : la tâche est
 - `"angular_momentum" not in cfg.rewards` (le piège de la section rewards)
 - `symmetry_cfg is None`
 - dimension de l'obs actor == 61
+- **parité exacte de l'ordre des termes d'observation** (actor + critic) avec
+  `roller_crouch`, groupe par groupe — ajouté en 7d916aa, condition stricte pour
+  que l'ONNX exporté charge dans le slot du runtime
 
 Lancer : `uv run --with pytest pytest tests/ -q`
 
@@ -256,12 +288,20 @@ Bouton **A** → spin, puis retour auto à la policy roller.
 
 En play : ~2 tours anti-horaire en ~2.6 s, dérive du tronc < ~10 cm, robot debout tout
 du long, station neutre stable pendant le segment repos avant le cycle suivant.
+*(Critère formulé pour la cible initiale de 6 rad/s / 2 tours ; à 3 rad/s, voir
+l'amendement, ce serait ~1 tour sur la durée du régime — critère non révisé, le
+robot ne tenant pas encore jusque-là.)*
 
 ## Plan B si l'entraînement plafonne
 
 Dans l'ordre :
 1. **Curriculum de vitesse** : `SPIN_RATE_MAX` 3 → 6 rad/s (nécessite de rendre
    `rate_max` pilotable par un `CurriculumTermCfg` sur les params de reward).
+   **Partiellement suivi** : suite au run de calibrage, la cible a bien été
+   abaissée à 3 rad/s (voir l'amendement), mais **sans curriculum** — 3 rad/s
+   est pour l'instant une cible fixe, pas un point de départ ramping vers 6.
+   L'humain a choisi de voir d'abord ce que le robot parvient à faire à cette
+   vitesse avant d'envisager une remontée graduelle.
 2. Monter `spin_wheel_differential` et retarder la décroissance de `leg_antisymmetry`.
 3. Élargir `std` de `spin_rate_track` (1.5 → 2.5) pour un gradient utile plus loin.
 4. En dernier recours, basculer sur l'approche B (poses de ciseau composées à la main
