@@ -114,7 +114,7 @@ roller.
 | `spin_rate_track` | 6.0 | `exp(−((ω_z − ω*(φ))/std)²)`, `std = 1.5` rad/s. ω_z = lacet du tronc en repère corps (ce que voit l'IMU). Objectif principal. |
 | `spin_rate_l1` | 0.5 | `−|ω_z − ω*(φ)|` : bootstrap à gradient constant quand la gaussienne sature loin de la cible (même astuce que `crouch_glide_pose_l1`) |
 | `spin_stay_in_place` | −1.0 | `‖v_xy‖²` du tronc → « sur place », et tue l'élan d'entrée. Pas d'état de référence, donc robuste aux 5 cycles par épisode |
-| `spin_wheel_differential` | 1.0 | `gate(φ) · tanh(clamp(ω_D − ω_G, min=0) / omega_scale)` avec `ω_G = (LF+LR)/2`, `ω_D = (RF+RR)/2` : récompense les patins qui roulent en sens opposés cohérents avec l'anti-horaire → tourner **en roulement**, pas en patinage. Roues résolues par nom (`passive_LF_?wheel`, …). `omega_scale = 20.0` rad/s par défaut (voir ci-dessous) |
+| `spin_wheel_differential` | 1.0 | `gate(φ) · tanh(clamp(ω_D − ω_G, min=0) / omega_scale)` avec `ω_G = (LF+LR)/2`, `ω_D = (RF+RR)/2` : récompense les patins qui roulent en sens opposés cohérents avec l'anti-horaire → tourner **en roulement**, pas en patinage. Roues résolues par nom (`passive_LF_?wheel`, …). `omega_scale = 17.0` rad/s en vigueur (voir le paragraphe de calibrage ci-dessous) |
 | `leg_antisymmetry` | 1.0 → 0.25 | `gate(φ) · (−mean|q_G − q_D|)` sur `hip_pitch` et `knee`. ⚠️ convention miroir : une pose *symétrique* donne `q_G + q_D ≈ 0`, donc le **ciseau** c'est `q_G ≈ q_D`. Décroît par curriculum |
 | `spin_grounded` | 0.5 | `gate(φ) · 1[n_contact ≥ 2]` : les deux lames au sol, empêche « je saute et je vrille en l'air ». La `grounded_reward` du swizzle n'est pas réutilisable telle quelle (elle se pondère par `cmd_x`, qui vaut ici `cos(2πφ)`) |
 
@@ -130,6 +130,15 @@ le défaut initial `omega_scale = 20.0`. **Mesure faite (Task 3) : demi-voie ré
 — au-delà du seuil de 30 % fixé par le plan.** `SPIN_WHEEL_OMEGA_SCALE` a donc été
 corrigé à **34.0**. Voir la section « Résultats de la vérification initiale »
 ci-dessous pour le détail.
+
+**Mise à jour (fix wave post-review)** : `SPIN_RATE_MAX` a été réduit de 6.0 à
+**3.0 rad/s** (décision humaine, sans curriculum — voir plus bas). Conséquence
+mécanique directe sur `omega_scale`, pas un choix indépendant : le différentiel
+attendu au régime redevient `2 · 3.0 · 0.0499 / 0.0175` = **17.1 rad/s**. Laisser
+`omega_scale = 34.0` plafonnerait le terme à `tanh(17.1/34) = 0.47` de son propre
+maximum, ce qui affaiblirait exactement le shaping que l'on cherche à renforcer.
+`SPIN_WHEEL_OMEGA_SCALE` est donc recorrigé à **17.0**, avec la même demi-voie
+mesurée (0.0499 m) conservée comme référence.
 
 ### Rewards reprises de `roller_crouch` (stabilité / sim2real)
 
@@ -299,10 +308,21 @@ en flag nu est rejetée par le CLI de ce repo — il faut passer
 4096 envs, 500 itérations, ~2,32 s/itération, code de sortie 0, logger wandb (donc
 `scripts/play_latest.py` / `md-play` retrouve le run).
 
-`Episode_Reward/spin_rate_track` est monté de façon monotone :
-0.0291 (it. 1) → 0.0534 (50) → 0.1464 (100) → 0.2609 (200) → 0.2946 (300) →
-0.3111 (400) → **0.3168 (500)**. Le critère de succès de cette étape (la courbe
-doit monter) est rempli.
+**Ce qui a réellement été établi** : `Mean episode length` = **57.83 pas** sur un
+épisode de 1000 pas (20 s à 50 Hz), soit **~1,16 s**. `Episode_Termination/fell_over`
+≈ **70**, `time_out = 0.0000`, `nan_state = 0`. Le robot **tombe à chaque épisode**,
+à une phase φ ≈ 0,29 — en plein milieu du segment de régime. Il n'atteint jamais le
+freinage (φ ≥ 0,525) ni le repos (φ ≥ 0,650) : **71 % du cycle n'est jamais
+entraîné**.
+
+La longueur d'épisode est passée de 23,98 à 57,83 pas sur la durée du run : la
+montée de `Episode_Reward/spin_rate_track` (0,0291 → 0,3168) reflète donc
+principalement une **survie qui s'allonge**, pas un suivi qui s'améliore. Le
+critère de succès de cette étape tel qu'énoncé dans le plan (« la courbe doit
+monter ») **n'est pas un signal valide** pour ce terme : un robot totalement
+immobile score déjà `6.0 × 0.405 = 2.43` dessus — le segment de repos paie plein
+tarif pour rester debout sans bouger, donc toute policy qui survit plus longtemps
+capte mécaniquement plus de ce segment-là, indépendamment de la qualité du suivi.
 
 ### Diagnostic dérivé — estimations, pas des mesures directes
 
@@ -311,25 +331,32 @@ bloc de log, ce qui annule le facteur de normalisation inconnu appliqué par le
 logger. À prendre comme des estimations, reproductibles à partir de la même
 méthode :
 
-- Rapport `spin_rate_l1 / spin_rate_track` (−0.0097 / 0.3168, poids 0.5 et 6.0,
-  `std = 1.5`), en résolvant `e = 0.3674 · exp(−(e/1.5)²)` : erreur moyenne
-  absolue de suivi de vitesse de lacet ≈ **0.35 rad/s**, contre une cible qui
-  culmine à 6 rad/s. Pour comparaison, une policy qui ne fait rien du tout
-  donnerait un rapport environ 20× pire — ceci reflète donc un vrai suivi, pas
-  seulement la reward « farmée » pendant le segment de repos.
-- `spin_stay_in_place` ≈ −0.0069 implique `‖v_xy‖ ≈ 0.35 m/s` : le robot est
-  **encore en translation**, pas encore en train de tourner sur place.
-- `spin_wheel_differential` n'atteint qu'environ **15 %** de son maximum
-  atteignable (porte moyenne sur un cycle = 0.525), et `spin_grounded` ≈ **24 %**.
-  La rotation n'est donc **pas** encore produite par le roulement différentiel
-  visé — la policy trouve une autre voie (pivot ou patinage, avec les lames
-  souvent pas toutes les deux au sol).
+**Ce qui tient** : pendant les ~1,2 s où il reste debout, le robot suit la cible
+d'assez près. Rapport `spin_rate_l1 / spin_rate_track` (−0,0097 / 0,3168, poids 0,5
+et 6,0, `std = 1.5`), en résolvant `e = 0.3674 · exp(−(e/1.5)²)` : erreur moyenne
+absolue de suivi de vitesse de lacet ≈ **0,35 rad/s**, confirmée par deux voies
+indépendantes — ce ratio `spin_rate_l1 / spin_rate_track`, et un calcul inverse à
+partir de la normalisation du reward manager. Il **peut lancer** le spin ; il **ne
+peut pas rester debout** en le faisant.
 
-Ceci reste la principale question ouverte pour la prochaine étape d'entraînement,
-à relier au « Plan B » du spec : les poids de shaping (`spin_wheel_differential`
-1.0, `spin_grounded` 0.5, `spin_stay_in_place` −1.0) sont petits face à
-`spin_rate_track` à 6.0, et 500 itérations ne représentent que 1/16 des 8000
-prévues — ce point pourrait donc aussi simplement se résorber plus tard dans
-l'entraînement.
+**Ce qui ne tient pas** : le bloc de shaping (`spin_wheel_differential` 1,0,
+`spin_grounded` 0,5, `spin_stay_in_place` −1,0) totalise ~1,0 de poids contre 6,0
+pour l'objectif principal — environ **13 %** de ce qu'une policy en patinage
+renoncerait à gagner en ignorant ce bloc. Et `spin_wheel_differential` est
+**invariant au centre instantané de rotation** : un spin centré à 6 rad/s et un
+pivot sur le patin gauche à 6 rad/s produisent tous les deux un différentiel de
+34,2 — ce terme n'encode donc **pas** le roulement centré, seul
+`spin_stay_in_place` le fait. `spin_stay_in_place` ≈ −0,0069 implique
+`‖v_xy‖ ≈ 0,35 m/s` : le robot est encore en translation, cohérent avec un pivot
+excentré (patin comme pivot) plutôt qu'une rotation autour du centre du corps.
+
+### Changement de configuration décidé suite à ce diagnostic
+
+Cible réduite de moitié — `SPIN_RATE_MAX` 6.0 → **3.0 rad/s** — et
+`spin_stay_in_place` renforcé −1.0 → **−3.0** (voir le tableau des rewards et
+`SPIN_WHEEL_OMEGA_SCALE` recalibré à 17.0 plus haut). **Délibérément sans
+curriculum** sur la vitesse cible : c'est un premier essai pour voir ce que le
+robot parvient à faire à vitesse moitié, avant d'envisager une remontée graduelle
+si besoin.
 
 L'étape 4 (regarder le geste) reste à faire, réservée à l'humain.
