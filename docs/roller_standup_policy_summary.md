@@ -89,6 +89,27 @@ uv run scripts/export_latest.py      # alias md-export
 uv run --with pytest pytest tests/test_roller_standup_cfg.py -q
 ```
 
+### ⚠️ Voir les départs sur le dos au play
+
+Un play ne montre **jamais** de départ sur le dos par défaut : l'env de play est
+reconstruit à neuf, donc `common_step_counter` repart à 0 et le curriculum applique son
+palier 0, où `face_up_prob = 0`. On ne voit que 50 % ventre / 50 % debout, quelle que soit
+la maturité du checkpoint chargé. Or le dos est le cas le plus dur, celui qu'on veut
+justement inspecter.
+
+`STANDUP_PLAY_FACE_UP` force le mélange (même motif que `SLOPE_PLAY_DIFFICULTY` dans
+`roller_slope`), **uniquement sur le chemin `play=True`** — l'entraînement et son
+curriculum easy → hard sont intouchés :
+
+```bash
+STANDUP_PLAY_FACE_UP=1.0 md-play    # 100 % de départs sur le dos
+STANDUP_PLAY_FACE_UP=0.4 md-play    # le mélange du dernier palier du curriculum
+STANDUP_PLAY_FACE_UP=none md-play   # défaut (palier 0, pas de dos)
+```
+
+Le reste (`1 - face_up`) est réparti ventre:debout dans le rapport 2:1 du dernier palier,
+si bien que `0.4` reproduit exactement le mélange de fin d'entraînement (0.40 / 0.20 / 0.40).
+
 ## Hors périmètre
 
 Intégrer le relevé dans la policy de roulage (recette `velstand`) ; buckets de départ sur le côté ; variante rough ; pénalités d'impact tronc/tête.
