@@ -142,25 +142,51 @@ saturées à 95–99 %, contre **≈ −1.2** pour tous les amortisseurs réunis
 `joint_torque_rate_l2` à **−0.0002/pas** et `joint_torques_l2` à **−0.0001/pas**, soit rien.
 Rapport ~35:1 : aucune raison d'être doux.
 
-**Les trois corrections :**
+**État actuel des corrections :**
 
-| | avant | après | pourquoi |
+| | avant | maintenant | pourquoi |
 |---|---|---|---|
-| `gentle_rise` | −0.02 (récompense) | **+0.02** (pénalité) | signe corrigé ; magnitude gardée PETITE exprès — `|a_z|` est forcément élevé pendant un retournement, un gros poids serait un bloqueur de mouvement |
-| `joint_torque_rate_l2` | −2e-3 | **−2.0** | le levier SÛR : pénalise la variation de couple, pas le mouvement |
-| `head_impact_penalty` | absent | **−1.0**, seuil 2.0 | taper la tête était gratuit ; pénalité ciblée (capteur sous-arbre `neck`, valeurs de `velstand`) |
+| `gentle_rise` | −0.02 (récompense) | **+0.02** (pénalité) | signe corrigé ; magnitude gardée PETITE exprès — `\|a_z\|` est forcément élevé pendant un retournement, un gros poids serait un bloqueur de mouvement |
+| `joint_torque_rate_l2` | −2e-3 | **−0.2** | le levier SÛR : pénalise la variation de couple, pas le mouvement |
+| `head_impact_penalty` | absent | **toujours absent** | essayé à −1.0, a gelé la policy — voir ci-dessous |
+
+### ⚠️ La pénalité d'impact tête a gelé la policy — ne pas la remettre telle quelle
+
+Tentative avec les valeurs de `velstand` (`body_impact_cost`, sous-arbre `neck`, −1.0,
+seuil 2.0) : **la policy a convergé vers rester couchée, inerte.** Mesuré (run `d8rnko6p`) :
+
+| terme | avant (violent) | avec head_impact (gelé) |
+|---|---|---|
+| `standing_composite` | +14.32 | **+3.26** |
+| `upright_sharp` | +5.76 | +1.06 |
+| `head_impact_penalty` | — | **−1.01** ← plus gros terme négatif |
+| `joint_torque_rate_l2` | −0.0002 | −0.255 (donc **pas** le coupable) |
+
+L'erreur de raisonnement : croire qu'une pénalité « ciblée » ne bride pas le mouvement.
+**Faux ici — pour se relever du dos, ce robot pivote sur sa tête et ses épaules.** La tête
+est le point d'appui du retournement, pas un dégât collatéral ; la pénaliser bloque le seul
+mécanisme disponible, et le dos était déjà le cas qui échouait.
+
+**L'optimum paresseux qui rend ce gel possible** : `pose_stand_legs` restait à **+7.72 sur 8**
+alors que le robot était allongé — les jambes sont à HOME en position couchée, donc cette
+récompense est encaissée quasi gratuitement. C'est `height_stand_l1` (poids +30) qui doit
+rendre « rester au sol » net négatif ; il ne faut pas l'affaiblir.
+
+**Hypothèse en cours de test** : taper la tête était un *symptôme* de la violence (le bug de
+signe payait la brutalité, et une montée brutale finit sur la tête), pas un défaut séparé.
+Si le slam revient maintenant que le signe est corrigé, la reprise doit être une pénalité
+**gatée en hauteur** (comme `upright_sharp` l'est), qui épargne la phase de retournement au sol.
+
+**Leçon de méthode** : les trois corrections ont été appliquées d'un coup, donc le gel n'a pas
+pu être attribué avec certitude — seul le suspect le plus probable a pu être désigné. Une
+correction à la fois, à l'avenir.
 
 **Recalibrage si c'est encore violent** : `|Δτ|²` vaut ~0.1 à convergence, donc la
 contribution de `joint_torque_rate_l2` ≈ `0.1 × |poids|`. Monter **ce** terme, **pas**
 `body_ang_vel` (−0.05) ni `action_rate_l2` (rampe → −1.0) : ceux-là sont des bloqueurs de
 mouvement et le `standup` documente qu'à −0.15 et −1.2 respectivement, ils **gelaient** le
-relevé depuis le dos. Si au contraire le dos cesse de fonctionner en simu, **baisser**
+relevé depuis le dos. Si au contraire le dos cesse de fonctionner, **baisser**
 `joint_torque_rate_l2` en premier.
-
-Vérifié en exécution réelle (pas seulement en config) : `gentle_rise` passe à −0.0022/−0.0101,
-`head_impact_penalty` à −0.0467/−0.3287 (donc le capteur `neck` **résout bien** sur le modèle
-rollers — sinon `body_impact_cost` aurait renvoyé zéro en silence), `joint_torque_rate_l2` à
-−0.17/−0.65.
 
 ## Hors périmètre
 
