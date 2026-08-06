@@ -110,6 +110,58 @@ STANDUP_PLAY_FACE_UP=none md-play   # défaut (palier 0, pas de dos)
 Le reste (`1 - face_up`) est réparti ventre:debout dans le rapport 2:1 du dernier palier,
 si bien que `0.4` reproduit exactement le mélange de fin d'entraînement (0.40 / 0.20 / 0.40).
 
+## 🔧 Correction anti-violence (après premier test robot)
+
+**Symptômes** sur un checkpoint 4000+ : mouvements très brusques, la tête tape le sol,
+échec du relevé depuis le dos sur le robot. **Présents en simu aussi** → ce n'était donc
+ni du sim2real, ni un checkpoint trop jeune, mais la conception des récompenses.
+
+**Root cause : `gentle_rise` récompensait la violence.** `trunk_vertical_accel_penalty`
+renvoie déjà `-|a_z|` (`mdp.py:2171`) ; multiplié par le poids **−0.02** hérité du
+`standup`, ça faisait un double négatif, donc `+0.02·|a_z|` — **plus le tronc accélérait
+brutalement, plus la policy était payée**. Confirmé par le log : `Episode_Reward/gentle_rise
+= +0.0118` sur le run `vweolw91`, seul terme de pénalité loggé positif.
+
+`mdp.py` mélange deux conventions de signe, et c'est le piège :
+
+| terme | la fonction renvoie | poids correct |
+|---|---|---|
+| `height_stand_l1`, `pose_stand_l1`, `gentle_rise` | `-abs(...)`, déjà négatif | **positif** |
+| `joint_torques_l2`, `joint_torque_rate_l2`, `action_rate_l2`, `body_impact_cost` | magnitude positive | **négatif** |
+
+Verrouillé par `test_already_negative_penalties_use_positive_weights`.
+
+⚠️ **Le `standup` du marcheur a exactement le même bug** (même fonction, même poids −0.02).
+Ça explique la série de tentatives d'amortissement infructueuses documentées dans ses
+commentaires (« *violent / shaky / overshoot-tip-repeat on the real robot* ») : elles
+combattaient un terme qui poussait activement dans l'autre sens. **Non corrigé ici** — c'est
+un autre env, à trancher séparément.
+
+**Problème structurel associé.** À convergence les récompenses de tâche totalisaient **≈ +41.6**
+saturées à 95–99 %, contre **≈ −1.2** pour tous les amortisseurs réunis — dont
+`joint_torque_rate_l2` à **−0.0002/pas** et `joint_torques_l2` à **−0.0001/pas**, soit rien.
+Rapport ~35:1 : aucune raison d'être doux.
+
+**Les trois corrections :**
+
+| | avant | après | pourquoi |
+|---|---|---|---|
+| `gentle_rise` | −0.02 (récompense) | **+0.02** (pénalité) | signe corrigé ; magnitude gardée PETITE exprès — `|a_z|` est forcément élevé pendant un retournement, un gros poids serait un bloqueur de mouvement |
+| `joint_torque_rate_l2` | −2e-3 | **−2.0** | le levier SÛR : pénalise la variation de couple, pas le mouvement |
+| `head_impact_penalty` | absent | **−1.0**, seuil 2.0 | taper la tête était gratuit ; pénalité ciblée (capteur sous-arbre `neck`, valeurs de `velstand`) |
+
+**Recalibrage si c'est encore violent** : `|Δτ|²` vaut ~0.1 à convergence, donc la
+contribution de `joint_torque_rate_l2` ≈ `0.1 × |poids|`. Monter **ce** terme, **pas**
+`body_ang_vel` (−0.05) ni `action_rate_l2` (rampe → −1.0) : ceux-là sont des bloqueurs de
+mouvement et le `standup` documente qu'à −0.15 et −1.2 respectivement, ils **gelaient** le
+relevé depuis le dos. Si au contraire le dos cesse de fonctionner en simu, **baisser**
+`joint_torque_rate_l2` en premier.
+
+Vérifié en exécution réelle (pas seulement en config) : `gentle_rise` passe à −0.0022/−0.0101,
+`head_impact_penalty` à −0.0467/−0.3287 (donc le capteur `neck` **résout bien** sur le modèle
+rollers — sinon `body_impact_cost` aurait renvoyé zéro en silence), `joint_torque_rate_l2` à
+−0.17/−0.65.
+
 ## Hors périmètre
 
 Intégrer le relevé dans la policy de roulage (recette `velstand`) ; buckets de départ sur le côté ; variante rough ; pénalités d'impact tronc/tête.
