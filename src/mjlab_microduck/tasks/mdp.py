@@ -6102,3 +6102,53 @@ def alternating_flight(
         log["Metrics/flight_fraction"] = flight.mean()
 
     return reward
+
+
+def feet_air_time_capped(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    threshold_min: float = 0.05,
+    threshold_max: float = 0.15,
+    command_name: str | None = None,
+    command_threshold: float = 0.01,
+) -> torch.Tensor:
+    """mjlab's ``feet_air_time`` with the per-foot indicator sum capped at 1.0.
+
+    Stock ``feet_air_time`` (mjlab/tasks/velocity/mdp/rewards.py:209) does
+    ``torch.sum(in_range.float(), dim=1)``, so both feet airborne scores 2.0
+    against 1.0 for alternating — at weight 5.0 that is a standing incentive
+    toward symmetric bouncing, and it grows with commanded speed. Capping at
+    1.0 removes the double payment without forbidding flight; genuine flight is
+    rewarded separately by `alternating_flight`.
+
+    Parameter-compatible with the stock term so a config can swap ``.func``
+    and keep the existing params dict.
+
+    Returns:
+        Reward tensor (num_envs,) in [0, 1].
+    """
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    if sensor_name not in env.scene.sensors:
+        return zeros
+
+    air = env.scene.sensors[sensor_name].data.current_air_time
+    if air is None or air.dim() < 2:
+        return zeros
+    air = torch.nan_to_num(air, nan=0.0, posinf=0.0, neginf=0.0)
+
+    in_range = (air > threshold_min) & (air < threshold_max)
+    reward = torch.clamp(in_range.float().sum(dim=1), max=1.0)
+
+    if command_name is not None:
+        command = env.command_manager.get_command(command_name)
+        speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+        reward = reward * (speed > command_threshold).float()
+
+    log = env.extras.get("log") if hasattr(env, "extras") else None
+    if log is not None:
+        # Preserve the dashboard metric the stock term emitted.
+        in_air = air > 0
+        n_in_air = in_air.float().sum().clamp(min=1.0)
+        log["Metrics/air_time_mean"] = (air * in_air.float()).sum() / n_in_air
+
+    return reward

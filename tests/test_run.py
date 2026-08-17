@@ -5,7 +5,7 @@ Uses duck-typed fakes rather than a real mjlab env, matching tests/test_wheel_gl
 
 import torch
 
-from mjlab_microduck.tasks.mdp import alternating_flight
+from mjlab_microduck.tasks.mdp import alternating_flight, feet_air_time_capped
 
 
 class _Data:
@@ -108,3 +108,46 @@ def test_asymmetry_metric_averages_over_flight_envs_only():
     alternating_flight(env, sensor_name=_SENSOR, command_name=_CMD)
     assert float(env.extras["log"]["Metrics/flight_asymmetry"]) < 1e-4
     assert abs(float(env.extras["log"]["Metrics/flight_fraction"]) - 0.5) < 1e-6
+
+
+def test_capped_both_feet_in_window_scores_one_not_two():
+    # THE bug being fixed: stock mjlab feet_air_time returns 2.0 here.
+    env = _Env([[0.10, 0.10]])
+    out = feet_air_time_capped(env, sensor_name=_SENSOR, command_name=_CMD)
+    assert abs(float(out[0]) - 1.0) < 1e-6
+
+
+def test_capped_single_foot_in_window_scores_one():
+    env = _Env([[0.10, 0.0]])
+    out = feet_air_time_capped(env, sensor_name=_SENSOR, command_name=_CMD)
+    assert abs(float(out[0]) - 1.0) < 1e-6
+
+
+def test_capped_below_window_scores_zero():
+    env = _Env([[0.01, 0.01]])
+    out = feet_air_time_capped(env, sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out[0]) == 0.0
+
+
+def test_capped_above_window_scores_zero():
+    env = _Env([[0.40, 0.40]])
+    out = feet_air_time_capped(env, sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out[0]) == 0.0
+
+
+def test_capped_inert_at_zero_command():
+    env = _Env([[0.10, 0.10]], cmd=[[0.0, 0.0, 0.0]])
+    out = feet_air_time_capped(env, sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out[0]) == 0.0
+
+
+def test_capped_nan_safe():
+    env = _Env([[float("nan"), 0.10]])
+    out = feet_air_time_capped(env, sensor_name=_SENSOR, command_name=_CMD)
+    assert torch.isfinite(out).all()
+
+
+def test_capped_missing_sensor_returns_zeros():
+    env = _Env([[0.10, 0.10]], sensor_name="some_other_sensor")
+    out = feet_air_time_capped(env, sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out[0]) == 0.0
