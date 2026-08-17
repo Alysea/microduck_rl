@@ -6152,3 +6152,40 @@ def feet_air_time_capped(
         log["Metrics/air_time_mean"] = (air * in_air.float()).sum() / n_in_air
 
     return reward
+
+
+def action_magnitude_monitor(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Log action magnitude. Contributes exactly zero reward.
+
+    Watches for the failure that killed the previous sprung campaign: a
+    converged policy emitting |a| ~ 1e8-1e10, which drove action_rate_l2 to
+    ~-1e25 and corrupted the value function. If these traces climb off their
+    baseline, the fix is to swap in a tanh-squashed distribution via
+    ``RslRlModelCfg.distribution_cfg["class_name"]``.
+
+    Returns zeros, so the reward total is unaffected at any weight. **Register
+    it with a non-zero weight anyway**: ``RewardManager.compute``
+    (mjlab/managers/reward_manager.py:122) short-circuits before calling the
+    term function when ``weight == 0.0``, which would silently disable this.
+
+    Returns:
+        A zeros tensor (num_envs,).
+    """
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    if not hasattr(env, "action_manager"):
+        return zeros
+
+    actions = env.action_manager.action
+    if actions is None or actions.numel() == 0:
+        return zeros
+
+    abs_actions = torch.nan_to_num(
+        actions.abs().float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+
+    log = env.extras.get("log") if hasattr(env, "extras") else None
+    if log is not None:
+        log["Metrics/action_abs_max"] = abs_actions.max()
+        log["Metrics/action_abs_p99"] = torch.quantile(abs_actions.flatten(), 0.99)
+
+    return zeros

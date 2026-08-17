@@ -5,7 +5,7 @@ Uses duck-typed fakes rather than a real mjlab env, matching tests/test_wheel_gl
 
 import torch
 
-from mjlab_microduck.tasks.mdp import alternating_flight, feet_air_time_capped
+from mjlab_microduck.tasks.mdp import alternating_flight, feet_air_time_capped, action_magnitude_monitor
 
 
 class _Data:
@@ -150,4 +150,52 @@ def test_capped_nan_safe():
 def test_capped_missing_sensor_returns_zeros():
     env = _Env([[0.10, 0.10]], sensor_name="some_other_sensor")
     out = feet_air_time_capped(env, sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out[0]) == 0.0
+
+
+class _ActionManager:
+    def __init__(self, actions):
+        self.action = torch.tensor(actions, dtype=torch.float32)
+
+
+class _ActionEnv:
+    def __init__(self, actions, with_manager=True):
+        self.num_envs = len(actions)
+        self.device = "cpu"
+        self.extras = {"log": {}}
+        if with_manager:
+            self.action_manager = _ActionManager(actions)
+
+
+def test_monitor_contributes_exactly_zero_reward():
+    env = _ActionEnv([[0.5, -3.0, 1e9]])
+    out = action_magnitude_monitor(env)
+    assert out.shape == (1,)
+    assert float(out[0]) == 0.0
+
+
+def test_monitor_reports_max_magnitude():
+    env = _ActionEnv([[0.5, -3.0, 2.0]])
+    action_magnitude_monitor(env)
+    assert abs(float(env.extras["log"]["Metrics/action_abs_max"]) - 3.0) < 1e-6
+
+
+def test_monitor_logs_both_keys():
+    env = _ActionEnv([[0.5, -3.0, 2.0]])
+    action_magnitude_monitor(env)
+    assert "Metrics/action_abs_max" in env.extras["log"]
+    assert "Metrics/action_abs_p99" in env.extras["log"]
+
+
+def test_monitor_survives_blowup_values():
+    # The failure mode being watched for: |a| ~ 1e10.
+    env = _ActionEnv([[1e10, -1e10]])
+    out = action_magnitude_monitor(env)
+    assert float(out[0]) == 0.0
+    assert torch.isfinite(env.extras["log"]["Metrics/action_abs_max"])
+
+
+def test_monitor_without_action_manager_returns_zeros():
+    env = _ActionEnv([[0.5, 0.5]], with_manager=False)
+    out = action_magnitude_monitor(env)
     assert float(out[0]) == 0.0
