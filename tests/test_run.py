@@ -5,7 +5,12 @@ Uses duck-typed fakes rather than a real mjlab env, matching tests/test_wheel_gl
 
 import torch
 
-from mjlab_microduck.tasks.mdp import alternating_flight, feet_air_time_capped, action_magnitude_monitor
+from mjlab_microduck.tasks.mdp import (
+    action_magnitude_monitor,
+    alternating_flight,
+    feet_air_time_capped,
+    forward_speed_monitor,
+)
 
 
 class _Data:
@@ -208,3 +213,79 @@ def test_monitor_survives_non_finite_actions():
     assert float(out[0]) == 0.0
     assert torch.isfinite(env.extras["log"]["Metrics/action_abs_max"])
     assert torch.isfinite(env.extras["log"]["Metrics/action_abs_p99"])
+
+
+# --------------------------------------------------------------------------
+# forward_speed_monitor — the plateau metric the sprung phase is compared to.
+# --------------------------------------------------------------------------
+
+
+class _AssetData:
+    def __init__(self, fwd_vels):
+        # (num_envs, 3) body-frame linear velocity; column 0 is forward.
+        self.root_link_lin_vel_b = torch.tensor(
+            [[v, 0.0, 0.0] for v in fwd_vels], dtype=torch.float32
+        )
+
+
+class _Asset:
+    def __init__(self, fwd_vels):
+        self.data = _AssetData(fwd_vels)
+
+
+class _AssetScene:
+    def __init__(self, asset):
+        self._asset = asset
+
+    def __getitem__(self, _name):
+        return self._asset
+
+
+class _SpeedEnv:
+    """fwd_vels: list of base-frame forward velocities, one per env."""
+
+    def __init__(self, fwd_vels):
+        self.num_envs = len(fwd_vels)
+        self.device = "cpu"
+        self.extras = {"log": {}}
+        self.scene = _AssetScene(_Asset(fwd_vels))
+
+
+def test_forward_speed_monitor_contributes_exactly_zero_reward():
+    env = _SpeedEnv([0.4, 1.1, -0.2])
+    out = forward_speed_monitor(env)
+    assert out.shape == (3,)
+    assert torch.all(out == 0.0)
+
+
+def test_forward_speed_monitor_logs_both_keys():
+    env = _SpeedEnv([0.4, 1.1])
+    forward_speed_monitor(env)
+    assert "Metrics/forward_speed_mean" in env.extras["log"]
+    assert "Metrics/forward_speed_max" in env.extras["log"]
+
+
+def test_forward_speed_monitor_reports_mean_and_max():
+    env = _SpeedEnv([0.4, 1.0, 0.7])
+    forward_speed_monitor(env)
+    log = env.extras["log"]
+    assert abs(float(log["Metrics/forward_speed_mean"]) - 0.7) < 1e-6
+    assert abs(float(log["Metrics/forward_speed_max"]) - 1.0) < 1e-6
+
+
+def test_forward_speed_monitor_is_nan_safe():
+    env = _SpeedEnv([float("nan"), 0.8])
+    out = forward_speed_monitor(env)
+    log = env.extras["log"]
+    assert torch.all(out == 0.0)
+    assert torch.isfinite(log["Metrics/forward_speed_mean"])
+    assert torch.isfinite(log["Metrics/forward_speed_max"])
+
+
+def test_forward_speed_monitor_survives_non_finite_velocities():
+    env = _SpeedEnv([float("inf"), float("-inf"), 0.5])
+    out = forward_speed_monitor(env)
+    log = env.extras["log"]
+    assert torch.all(out == 0.0)
+    assert torch.isfinite(log["Metrics/forward_speed_mean"])
+    assert torch.isfinite(log["Metrics/forward_speed_max"])

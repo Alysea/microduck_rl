@@ -277,12 +277,39 @@ the baseline to look good would destroy its value as a control.
 
 Stated rather than papered over:
 
-- **`running_threshold = 0.6` is a guess.** Above the current walking band,
-  below the new curriculum's top. Revisit once the plateau is measured.
+- **`running_threshold` is a guess.** Set to `1.2` (was `0.6`). mjlab's
+  `variable_posture` gates on the MIXED total `|lin| + |ang|`, and
+  `ang_vel_range` is held at 1.0 through every stage, so any threshold at or
+  below 1.0 was reachable by yaw alone — spin-in-place at zero linear velocity
+  was being granted the loose hip_pitch/knee running tolerance. `1.2` sits above
+  the max `|ang|`, so yaw can no longer trigger it by itself; on forward speed
+  alone only the last two curriculum stages (1.2, 1.5) reach it. Revisit once
+  the plateau is measured.
 - **`alternating_flight` could be gamed by a limp** — one leg taking long
   flights, the other short hops, which also scores high asymmetry. If that
   appears, the fix is a symmetry term on stride length rather than air time.
   Not pre-built; YAGNI until observed.
+- **Bouncing is discouraged but not excluded.** Capping `air_time` makes it
+  gait-*neutral* rather than anti-bouncing: symmetric bouncing still collects the
+  full `air_time` weight of 5.0 and forfeits only `alternating_flight`'s ≤3.0, so
+  it retains roughly 62% of the flight-related reward and remains a plausible
+  local optimum. Two further terms mildly favour it — `body_ang_vel` (−0.05) and
+  `angular_momentum` (−0.02) penalise the trunk rotation intrinsic to an
+  alternating gait while symmetric bouncing generates almost none. Magnitudes are
+  small (~−0.004/step against `alternating_flight`'s ~+0.06/step) so they should
+  not flip the balance. Deliberately not retuned before the first run; revisit
+  with data.
+- **Three untouched shaping terms are a Phase 3 confound.**
+  `com_height_target` (+1.2, band 0.11–0.14 m, i.e. only ~3 cm of CoM travel),
+  `foot_clearance` (−2.0, target 0.02 m) and `foot_swing_height` (−0.25,
+  quadratic around 0.02 m) are all tuned for a 2 cm-lift walking gait and oppose
+  the ballistic CoM arc and higher swing that flight requires. The plateau may be
+  set by these rather than by rigid-leg dynamics. That is survivable for the
+  baseline, but springs change exactly CoM oscillation and foot height, so these
+  penalties are **not neutral between the rigid and sprung conditions** —
+  "springs helped" could be "springs relieved a shaping penalty". Phase 3 must
+  hold all three fixed and report their episode sums alongside the plateau.
+  Widening them for both conditions is an open decision for Steve.
 
 ## Out of scope
 

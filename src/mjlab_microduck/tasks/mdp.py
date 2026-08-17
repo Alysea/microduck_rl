@@ -6189,3 +6189,42 @@ def action_magnitude_monitor(env: ManagerBasedRlEnv) -> torch.Tensor:
         log["Metrics/action_abs_p99"] = torch.quantile(abs_actions.flatten(), 0.99)
 
     return zeros
+
+
+def forward_speed_monitor(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Log ACHIEVED forward speed. Contributes exactly zero reward.
+
+    The Run task's success criterion is a measured forward-speed plateau, and
+    that number is what the later sprung condition is compared against. The
+    pre-existing ``error_vel_xy`` reward is isotropic in xy, so it cannot isolate
+    forward tracking; nothing else logged the achieved speed at all.
+
+    Reports base-frame x velocity (``root_link_lin_vel_b[:, 0]``, the same
+    attribute `braking_reward` and `coasting_reward` read), so it is a true body
+    forward speed rather than a world-frame magnitude.
+
+    Returns zeros, so the reward total is unaffected at any weight. **Register
+    it with a non-zero weight anyway**: ``RewardManager.compute``
+    (mjlab/managers/reward_manager.py:122) short-circuits before calling the
+    term function when ``weight == 0.0``, which would silently disable this.
+
+    Returns:
+        A zeros tensor (num_envs,).
+    """
+    zeros = torch.zeros(env.num_envs, device=env.device)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    fwd_vel = asset.data.root_link_lin_vel_b[:, 0]
+    if fwd_vel is None or fwd_vel.numel() == 0:
+        return zeros
+    fwd_vel = torch.nan_to_num(fwd_vel.float(), nan=0.0, posinf=0.0, neginf=0.0)
+
+    log = env.extras.get("log") if hasattr(env, "extras") else None
+    if log is not None:
+        log["Metrics/forward_speed_mean"] = fwd_vel.mean()
+        log["Metrics/forward_speed_max"] = fwd_vel.max()
+
+    return zeros
