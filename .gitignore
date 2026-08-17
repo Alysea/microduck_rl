@@ -38,3 +38,6 @@ backup_onnx/
 logdir/.claude/
 logdir/
 logdir/.claude/worktrees/
+
+# superpowers SDD scratch
+.superpowers/
