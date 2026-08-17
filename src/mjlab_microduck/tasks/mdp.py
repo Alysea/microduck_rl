@@ -6042,3 +6042,63 @@ def joint_vel_rel_backlash(
     default_joint_vel = asset.data.default_joint_vel
     assert default_joint_vel is not None
     return vel - default_joint_vel[:, main_ids]
+
+
+def alternating_flight(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str,
+    command_threshold: float = 0.01,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Reward flight phases whose feet ALTERNATE, not flight per se.
+
+    Both feet airborne is a flight phase, but that alone does not distinguish
+    running from the symmetric two-foot bouncing gait the previous sprung
+    campaign converged to. Air-time asymmetry does:
+
+      - Running: at any flight instant the trailing foot has just left the
+        ground (small air time) while the leading foot is about to land (large
+        air time). |dt| / sum -> 1.
+      - Bouncing: both feet leave and land together, air times equal.
+        |dt| / sum -> 0.
+
+    Note this must be paired with `feet_air_time_capped` — the stock mjlab
+    `feet_air_time` sums its per-foot indicator, paying 2.0 for simultaneous
+    flight versus 1.0 for alternating, which pulls the other way.
+
+    Args:
+        sensor_name: ContactSensorCfg name with ``track_air_time=True`` and two
+            primary foot geoms, LEFT in column 0, RIGHT in column 1.
+        command_name: velocity command; the term is inert below
+            ``command_threshold``.
+
+    Returns:
+        Reward tensor (num_envs,) in [0, 1].
+    """
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    if sensor_name not in env.scene.sensors:
+        return zeros
+
+    air = env.scene.sensors[sensor_name].data.current_air_time
+    if air is None or air.dim() < 2 or air.shape[1] < 2:
+        return zeros
+    air = torch.nan_to_num(air, nan=0.0, posinf=0.0, neginf=0.0)
+
+    air_l, air_r = air[:, 0], air[:, 1]
+    flight = ((air_l > 0.0) & (air_r > 0.0)).float()
+    asymmetry = torch.abs(air_l - air_r) / (air_l + air_r + eps)
+
+    command = env.command_manager.get_command(command_name)
+    speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    reward = flight * asymmetry * (speed > command_threshold).float()
+
+    log = env.extras.get("log") if hasattr(env, "extras") else None
+    if log is not None:
+        # Average asymmetry over FLIGHT envs only — in single support one air
+        # time is 0, so asymmetry reads 1.0 and would swamp the metric.
+        n_flight = flight.sum().clamp(min=1.0)
+        log["Metrics/flight_asymmetry"] = (asymmetry * flight).sum() / n_flight
+        log["Metrics/flight_fraction"] = flight.mean()
+
+    return reward
