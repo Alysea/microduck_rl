@@ -78,3 +78,41 @@ def test_angular_range_held_constant(run_cfg):
     stages = run_cfg.curriculum["velocity_command_ranges"].params["velocity_stages"]
     angs = {s["ang_vel_range"] for s in stages}
     assert len(angs) == 1
+
+
+def test_run_rl_cfg_has_its_own_experiment_name():
+    # Baseline and sprung runs must not share a wandb grouping.
+    from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg
+    from mjlab_microduck.tasks.run import MicroduckRunRlCfg
+
+    assert MicroduckRunRlCfg.experiment_name != MicroduckRlCfg.experiment_name
+    assert MicroduckRunRlCfg.run_name != MicroduckRlCfg.run_name
+
+
+def test_run_rl_cfg_keeps_the_plain_gaussian_policy():
+    # Phase 1 deliberately does NOT change the distribution; the baseline stays
+    # as close to the working velocity config as possible.
+    from mjlab_microduck.tasks.run import MicroduckRunRlCfg
+
+    assert (
+        MicroduckRunRlCfg.actor.distribution_cfg["class_name"]
+        == "GaussianDistribution"
+    )
+    assert MicroduckRunRlCfg.actor.obs_normalization is True
+    assert MicroduckRunRlCfg.critic.obs_normalization is True
+
+
+def test_run_tasks_are_registered():
+    import mjlab_microduck.tasks  # noqa: F401  (import registers)
+    from mjlab.tasks.registry import list_tasks
+
+    tasks = list_tasks()
+    assert "Mjlab-Run-Flat-MicroDuck" in tasks
+    assert "Mjlab-Run-Rough-MicroDuck" in tasks
+
+
+def test_run_task_rl_cfg_round_trips_through_the_registry():
+    import mjlab_microduck.tasks  # noqa: F401
+    from mjlab.tasks.registry import load_rl_cfg
+
+    assert load_rl_cfg("Mjlab-Run-Flat-MicroDuck").experiment_name == "run"

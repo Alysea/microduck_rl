@@ -85,6 +85,7 @@ from .microduck_spin_env_cfg import (
     MicroduckSpinRlCfg,
 )
 from .backlash import make_backlash_variant
+from .run import make_run_variant, MicroduckRunRlCfg
 
 # Standard velocity task
 register_mjlab_task(
@@ -103,6 +104,29 @@ register_mjlab_task(
     rl_cfg=MicroduckRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# Run task — rigid running baseline (Phase 1 of the sprung-leg campaign).
+# Control for the later sprung comparison; see
+# docs/superpowers/specs/2026-08-17-sprung-running-design.md
+register_mjlab_task(
+    task_id="Mjlab-Run-Flat-MicroDuck",
+    env_cfg=make_run_variant(make_microduck_velocity_env_cfg()),
+    play_env_cfg=make_run_variant(make_microduck_velocity_env_cfg(play=True)),
+    rl_cfg=MicroduckRunRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+print("✓ Run task registered: Mjlab-Run-Flat-MicroDuck")
+
+register_mjlab_task(
+    task_id="Mjlab-Run-Rough-MicroDuck",
+    env_cfg=make_run_variant(make_microduck_velocity_env_cfg(rough=True)),
+    play_env_cfg=make_run_variant(
+        make_microduck_velocity_env_cfg(play=True, rough=True)
+    ),
+    rl_cfg=MicroduckRunRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+print("✓ Run task registered: Mjlab-Run-Rough-MicroDuck")
 
 # Velocity2 — microban reward/regularization recipe on the velocity task.
 register_mjlab_task(

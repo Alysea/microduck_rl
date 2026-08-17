@@ -103,3 +103,23 @@ def make_run_variant(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
     ]
 
     return cfg
+
+
+from dataclasses import replace
+
+from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg
+
+# Same hyperparameters as the velocity task — Phase 1 changes the task, not the
+# learner. Only the logging identity differs, so the baseline and the later
+# sprung runs land in separate wandb groups.
+MicroduckRunRlCfg = replace(
+    MicroduckRlCfg,
+    experiment_name="run",
+    run_name="run",
+)
+
+# Caveat: `replace` is shallow — MicroduckRunRlCfg.actor is the *same object*
+# as MicroduckRlCfg.actor. That is fine as long as nothing mutates it. If a
+# later phase needs to change the Run task's actor (for example swapping in a
+# squashed distribution), deep-copy the nested cfg first rather than assigning
+# into the shared one, or the velocity task silently changes too.
