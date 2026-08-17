@@ -199,3 +199,12 @@ def test_monitor_without_action_manager_returns_zeros():
     env = _ActionEnv([[0.5, 0.5]], with_manager=False)
     out = action_magnitude_monitor(env)
     assert float(out[0]) == 0.0
+
+
+def test_monitor_survives_non_finite_actions():
+    # The nan_to_num(posinf=..., neginf=...) guard exists for exactly this.
+    env = _ActionEnv([[float("inf"), float("-inf"), float("nan"), 2.0]])
+    out = action_magnitude_monitor(env)
+    assert float(out[0]) == 0.0
+    assert torch.isfinite(env.extras["log"]["Metrics/action_abs_max"])
+    assert torch.isfinite(env.extras["log"]["Metrics/action_abs_p99"])
