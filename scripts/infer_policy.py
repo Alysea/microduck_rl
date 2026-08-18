@@ -552,6 +552,15 @@ def main():
     parser.add_argument("--lin-vel-y", type=float, default=0.0, help="Initial linear velocity Y command (m/s)")
     parser.add_argument("--ang-vel-z", type=float, default=0.0, help="Initial angular velocity Z command (rad/s)")
     parser.add_argument("--action-scale", type=float, default=1.0, help="Action scale (default: 1.0)")
+    parser.add_argument("--vel-max-x", type=float, default=None,
+                        help="Override the forward speed the UP arrow commands (m/s). "
+                             "The default 0.3 matches the walking tasks; policies trained "
+                             "with a higher curriculum (e.g. Run, 1.5 m/s) need this raised "
+                             "or the arrow keys cannot reach the trained range.")
+    parser.add_argument("--vel-min-x", type=float, default=None,
+                        help="Override the backward speed the DOWN arrow commands (m/s). "
+                             "Set 0 for a forward_only policy — negative commands are "
+                             "out of distribution for those.")
     parser.add_argument("--raw-accelerometer", action="store_true", help="Use raw accelerometer instead of projected gravity")
     parser.add_argument("--delay", type=int, nargs='*', default=None, help="Enable actuator delay: --delay MIN MAX or --delay LAG")
     parser.add_argument("--debug", action="store_true", help="Print observations and actions")
@@ -683,6 +692,12 @@ def main():
         policy.vel_max_y = 0.2
         policy.vel_min_y = -0.2
         policy.vel_max_ang = 1.5
+
+    # CLI overrides win over the per-mode defaults above.
+    if args.vel_max_x is not None:
+        policy.vel_max_x = args.vel_max_x
+    if args.vel_min_x is not None:
+        policy.vel_min_x = args.vel_min_x
 
     # Set initial position to default pose
     freejoint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
