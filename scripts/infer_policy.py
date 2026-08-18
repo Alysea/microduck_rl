@@ -571,6 +571,11 @@ def main():
     parser.add_argument("--lin-vel-y", type=float, default=0.0, help="Initial linear velocity Y command (m/s)")
     parser.add_argument("--ang-vel-z", type=float, default=0.0, help="Initial angular velocity Z command (rad/s)")
     parser.add_argument("--action-scale", type=float, default=1.0, help="Action scale (default: 1.0)")
+    parser.add_argument("--follow", action="store_true",
+                        help="Start with the camera tracking the robot's trunk. "
+                             "Toggle at runtime with C.")
+    parser.add_argument("--follow-distance", type=float, default=1.0,
+                        help="Camera distance from the trunk when following (default: 1.0 m).")
     parser.add_argument("--vel-step-x", type=float, default=None,
                         help="Increment the UP/DOWN arrows apply to the forward "
                              "command (m/s per press, default 0.05).")
@@ -801,6 +806,11 @@ def main():
     csv_data = [] if args.save_csv else None
     recorded_observations = [] if args.record else None
     policy_enabled = not args.record
+
+    # Camera follow. The key callback only flips this flag — the camera itself
+    # is applied in the render loop, where `viewer` is in scope.
+    follow_cam = args.follow
+    trunk_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
     policy_enable_time = None
     original_kp = None
     if args.record:
@@ -814,6 +824,7 @@ def main():
     GLFW_KEY_G = 71
     GLFW_KEY_H = 72
     GLFW_KEY_P = 80
+    GLFW_KEY_C = 67
     GLFW_KEY_R = 82
     GLFW_KEY_S = 83
     GLFW_KEY_T = 84
@@ -928,6 +939,10 @@ def main():
                 random_push()
             elif key == GLFW_KEY_R:
                 reset_robot(verbose=True)
+            elif key == GLFW_KEY_C:
+                nonlocal follow_cam
+                follow_cam = not follow_cam
+                print(f"Camera follow: {'ON' if follow_cam else 'OFF (free camera)'}")
             elif key == GLFW_KEY_A:
                 if policy.head_mode:
                     policy.head_offset[3] = np.clip(policy.head_offset[3] + policy.head_step, -policy.head_max, policy.head_max)
@@ -982,6 +997,8 @@ def main():
     print("  G:                trigger ground pick (requires --ground-pick)")
     print("  Y:                toggle sit (with --sit) or slope mode (with --slope)")
     print(f"  P:                random push (trunk vel = {PUSH_MAX:.1f} m/s in random direction)")
+    print("  R:                reset robot to spawn pose (velocity command kept)")
+    print(f"  C:                toggle camera follow (currently {'ON' if args.follow else 'OFF'})")
     print("  [ Body pose mode — press B to toggle ]")
     print(f"  UP/DOWN arrow:    Δz ±10mm  (max ±{BODY_CMD_MAX_Z*1000:.0f}mm)")
     print(f"  LEFT/RIGHT arrow: Δpitch ±10°  (max ±{math.degrees(BODY_CMD_MAX_ANGLE):.0f}°)")
@@ -997,6 +1014,24 @@ def main():
     print("  SPACE:            reset head offset to zero")
 
     with mujoco.viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False, key_callback=key_callback) as viewer:
+        # Applied whenever the C key flips `follow_cam`, so the user keeps free
+        # orbit/zoom control while following (MuJoCo tracks position only).
+        applied_follow = None
+
+        def apply_camera():
+            nonlocal applied_follow
+            if follow_cam == applied_follow:
+                return
+            if follow_cam and trunk_body_id >= 0:
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                viewer.cam.trackbodyid = trunk_body_id
+                viewer.cam.distance = args.follow_distance
+                viewer.cam.elevation = -15.0
+            else:
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            applied_follow = follow_cam
+
+        apply_camera()
         viewer.sync()
         start_time = time.time()
 
@@ -1120,6 +1155,7 @@ def main():
                 for _ in range(decimation):
                     mujoco.mj_step(model, data)
 
+                apply_camera()
                 viewer.sync()
 
                 elapsed = time.time() - step_start
