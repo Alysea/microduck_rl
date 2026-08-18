@@ -406,6 +406,25 @@ class PolicyInference:
         """Get joint velocities."""
         return self.data.qvel[self.joint_qvel_indices].copy().astype(np.float32)
 
+    def reset_state(self):
+        """Clear per-episode controller state (used by the R key).
+
+        Zeroes the action history the observation carries and drops any aux
+        mode, so a reset robot is not fed the last actions from before it
+        fell. The ONNX sessions and the velocity command are left alone.
+        """
+        self.last_action[:] = 0.0
+        if getattr(self, "action_buffer", None) is not None:
+            for buf in self.action_buffer:
+                buf[:] = 0.0
+            self.buffer_index = 0
+        self.ground_pick_mode = False
+        self.ground_pick_phase = 0.0
+        self.sit_mode = False
+        if self.walking_session is not None:
+            self.ort_session = self.walking_session
+        self._update_command()
+
     def get_observations(self):
         """Collect observations matching policy input.
 
@@ -552,6 +571,9 @@ def main():
     parser.add_argument("--lin-vel-y", type=float, default=0.0, help="Initial linear velocity Y command (m/s)")
     parser.add_argument("--ang-vel-z", type=float, default=0.0, help="Initial angular velocity Z command (rad/s)")
     parser.add_argument("--action-scale", type=float, default=1.0, help="Action scale (default: 1.0)")
+    parser.add_argument("--vel-step-x", type=float, default=None,
+                        help="Increment the UP/DOWN arrows apply to the forward "
+                             "command (m/s per press, default 0.05).")
     parser.add_argument("--vel-max-x", type=float, default=None,
                         help="Override the forward speed the UP arrow commands (m/s). "
                              "The default 0.3 matches the walking tasks; policies trained "
@@ -694,6 +716,8 @@ def main():
         policy.vel_max_ang = 1.5
 
     # CLI overrides win over the per-mode defaults above.
+    if args.vel_step_x is not None:
+        policy.vel_step_x = args.vel_step_x
     if args.vel_max_x is not None:
         policy.vel_max_x = args.vel_max_x
     if args.vel_min_x is not None:
@@ -702,14 +726,29 @@ def main():
     # Set initial position to default pose
     freejoint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
     qpos_adr = model.jnt_qposadr[freejoint_id]
-    data.qpos[qpos_adr + 0] = 0.0
-    data.qpos[qpos_adr + 1] = 0.0
-    data.qpos[qpos_adr + 2] = 0.1385 if args.roller else 0.125  # rollers add 13.5mm height
-    data.qpos[qpos_adr + 3:qpos_adr + 7] = [1, 0, 0, 0]
-    for i, qpos_idx in enumerate(policy.joint_qpos_indices):
-        data.qpos[qpos_idx] = policy.default_pose[i]
-    data.ctrl[:] = policy.default_pose
-    mujoco.mj_forward(model, data)
+
+    def reset_robot(verbose: bool = False):
+        """Return the robot to the spawn pose at rest. Bound to the R key.
+
+        Clears velocities and accelerations as well as pose — leaving qvel
+        behind would launch the robot on the first step after a fall.
+        """
+        mujoco.mj_resetData(model, data)
+        data.qpos[qpos_adr + 0] = 0.0
+        data.qpos[qpos_adr + 1] = 0.0
+        data.qpos[qpos_adr + 2] = 0.1385 if args.roller else 0.125  # rollers add 13.5mm height
+        data.qpos[qpos_adr + 3:qpos_adr + 7] = [1, 0, 0, 0]
+        for i, qpos_idx in enumerate(policy.joint_qpos_indices):
+            data.qpos[qpos_idx] = policy.default_pose[i]
+        data.qvel[:] = 0.0
+        data.qacc[:] = 0.0
+        data.ctrl[:] = policy.default_pose
+        policy.reset_state()
+        mujoco.mj_forward(model, data)
+        if verbose:
+            print("Reset: robot returned to spawn pose (velocity command kept)")
+
+    reset_robot()
 
     # Verify observation size
     test_obs = policy.get_observations()
@@ -775,6 +814,7 @@ def main():
     GLFW_KEY_G = 71
     GLFW_KEY_H = 72
     GLFW_KEY_P = 80
+    GLFW_KEY_R = 82
     GLFW_KEY_S = 83
     GLFW_KEY_T = 84
     GLFW_KEY_Y = 89
@@ -812,7 +852,9 @@ def main():
                 elif policy.body_pose_mode:
                     policy.bump_body("z", policy.body_cmd_step_z)
                 else:
-                    policy.set_vel_cmd(policy.vel_max_x, policy.vel_cmd[1], policy.vel_cmd[2])
+                    new_x = np.clip(policy.vel_cmd[0] + policy.vel_step_x,
+                                    policy.vel_min_x, policy.vel_max_x)
+                    policy.set_vel_cmd(new_x, policy.vel_cmd[1], policy.vel_cmd[2])
             elif key == GLFW_KEY_DOWN:
                 if policy.head_mode:
                     policy.head_offset[1] = np.clip(policy.head_offset[1] - policy.head_step, -policy.head_max, policy.head_max)
@@ -821,7 +863,9 @@ def main():
                 elif policy.body_pose_mode:
                     policy.bump_body("z", -policy.body_cmd_step_z)
                 else:
-                    policy.set_vel_cmd(policy.vel_min_x, policy.vel_cmd[1], policy.vel_cmd[2])
+                    new_x = np.clip(policy.vel_cmd[0] - policy.vel_step_x,
+                                    policy.vel_min_x, policy.vel_max_x)
+                    policy.set_vel_cmd(new_x, policy.vel_cmd[1], policy.vel_cmd[2])
             elif key == GLFW_KEY_RIGHT:
                 if policy.head_mode:
                     policy.head_offset[2] = np.clip(policy.head_offset[2] - policy.head_step, -policy.head_max, policy.head_max)
@@ -833,7 +877,9 @@ def main():
                     new_ang = np.clip(policy.vel_cmd[2] - policy.vel_step_ang, -policy.vel_max_ang, policy.vel_max_ang)
                     policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_cmd[1], new_ang)
                 else:
-                    policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_min_y, policy.vel_cmd[2])
+                    new_y = np.clip(policy.vel_cmd[1] - policy.vel_step_y,
+                                    policy.vel_min_y, policy.vel_max_y)
+                    policy.set_vel_cmd(policy.vel_cmd[0], new_y, policy.vel_cmd[2])
             elif key == GLFW_KEY_LEFT:
                 if policy.head_mode:
                     policy.head_offset[2] = np.clip(policy.head_offset[2] + policy.head_step, -policy.head_max, policy.head_max)
@@ -845,7 +891,9 @@ def main():
                     new_ang = np.clip(policy.vel_cmd[2] + policy.vel_step_ang, -policy.vel_max_ang, policy.vel_max_ang)
                     policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_cmd[1], new_ang)
                 else:
-                    policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_max_y, policy.vel_cmd[2])
+                    new_y = np.clip(policy.vel_cmd[1] + policy.vel_step_y,
+                                    policy.vel_min_y, policy.vel_max_y)
+                    policy.set_vel_cmd(policy.vel_cmd[0], new_y, policy.vel_cmd[2])
             elif key == GLFW_KEY_SPACE:
                 if policy.head_mode:
                     policy.head_offset[:] = 0.0
@@ -878,6 +926,8 @@ def main():
                 policy.toggle_body_pose_mode()
             elif key == GLFW_KEY_P:
                 random_push()
+            elif key == GLFW_KEY_R:
+                reset_robot(verbose=True)
             elif key == GLFW_KEY_A:
                 if policy.head_mode:
                     policy.head_offset[3] = np.clip(policy.head_offset[3] + policy.head_step, -policy.head_max, policy.head_max)
@@ -886,7 +936,9 @@ def main():
                 elif policy.body_pose_mode:
                     policy.bump_body("roll", policy.body_cmd_step_angle)
                 else:
-                    policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_cmd[1], policy.vel_max_ang)
+                    new_ang = np.clip(policy.vel_cmd[2] + policy.vel_step_ang,
+                                      -policy.vel_max_ang, policy.vel_max_ang)
+                    policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_cmd[1], new_ang)
             elif key == GLFW_KEY_E:
                 if policy.head_mode:
                     policy.head_offset[3] = np.clip(policy.head_offset[3] - policy.head_step, -policy.head_max, policy.head_max)
@@ -895,7 +947,9 @@ def main():
                 elif policy.body_pose_mode:
                     policy.bump_body("roll", -policy.body_cmd_step_angle)
                 else:
-                    policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_cmd[1], -policy.vel_max_ang)
+                    new_ang = np.clip(policy.vel_cmd[2] - policy.vel_step_ang,
+                                      -policy.vel_max_ang, policy.vel_max_ang)
+                    policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_cmd[1], new_ang)
             elif key == GLFW_KEY_Z:
                 if policy.head_mode:
                     policy.head_offset[0] = np.clip(policy.head_offset[0] + policy.head_step, -policy.head_max, policy.head_max)
