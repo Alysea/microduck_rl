@@ -74,7 +74,12 @@ asymmetry. The final review worried this left bouncing too attractive.
 real arithmetic but the wrong conclusion; raising
 `ALTERNATING_FLIGHT_WEIGHT` would now be a change with no evidence behind it.
 
-**2. The Phase 3 confound is real and must be controlled.**
+**2. The Phase 3 confound is RETIRED — see the diagnostic sweep below.**
+The concern as originally written follows, but a four-arm sweep (2026-08-19)
+showed the foot-height and CoM terms are not limiting the gait, and the foot
+terms are if anything *generous*. Superseded; kept for the record.
+
+**2 (original, superseded). The Phase 3 confound is real and must be controlled.**
 `Metrics/peak_height_mean` = **0.0205 m** — pinned to the `foot_swing_height`
 / `foot_clearance` target of 0.02 m, with both penalties driven to near zero
 (−0.011, −0.014). The policy is not choosing a 2 cm foot lift; the shaping
@@ -99,3 +104,83 @@ mean_reward         220.07       track_linear_velocity 3.099
 com_height_target     1.174      action_rate_l2       -2.360
 air_time              2.810      alternating_flight    0.454
 ```
+
+
+---
+
+# Diagnostic sweep (2026-08-19/20)
+
+Four 8 000-iteration arms, each a single-variable CLI override on the Run task,
+compared against the control's matched 7 000–8 000 iteration window. The control
+needed no rerun — the 50 k baseline supplies that window directly.
+
+| Arm | Change | `forward_speed_mean` | Verdict |
+|---|---|---|---|
+| control | — | 0.4301 | — |
+| A | foot target 0.02 → 0.04 | 0.4272 (−0.7%) | negative; flawed instrument |
+| **B** | **`action_rate_l2` −1.0 → −0.5** | **0.4772 (+11.0%)** | **the sole limiter** |
+| C | CoM band 0.11–0.14 → 0.09–0.17 | 0.4322 (+0.5%) | negative; band was slack |
+| A′ | foot weights → ~0 | 0.4284 (−0.4%) | negative; terms *raise* lift |
+
+## The plateau is actuation-bandwidth-limited
+
+Arm B is the whole story. At 8 000 iterations it reached **0.4772 m/s — already
+above the control's fully converged 50 k value of 0.4691** — at one sixth the
+compute, and it had *not* plateaued: speed and flight fraction were still rising
+monotonically at the cutoff (0.4473 → 0.4776, flight 0.2005 → 0.2426).
+
+Cost: action acceleration +29.8%, `action_abs_max` +21.7%, policy std +18.4%.
+`action_rate_l2` is sim2real protection, so this is a real trade, not free speed.
+
+**This sharpens Phase 3 rather than invalidating the baseline.** If the rigid
+robot is limited by how fast it can actively change actions, that is exactly the
+limitation passive compliance removes — a spring stores and returns energy with
+no action-rate cost at all. So keep the penalty at −1.0 and treat it as a fixed
+smoothness budget. Phase 3's prediction becomes concrete and falsifiable:
+
+> **The sprung robot beats 0.468 m/s at `action_rate_l2` = −1.0.**
+
+## Why the other three arms came back negative
+
+**Foot height is not a constraint — it is a subsidy.** Arm A′ relaxed both foot
+penalties to ~1/200 of their weight (verified: costs fell to −0.0001 and
+−0.0000, i.e. the constraint was genuinely gone) and foot lift *dropped*, from
+2.02 cm to 1.87 cm, with speed flat. Those terms hold the foot **higher** than
+the policy would choose. ~2 cm is this robot's natural swing height, not a
+ceiling imposed by shaping. Corroborated by arm B, where the policy had 30% more
+action acceleration available and still lifted only 1.92 cm: extra speed comes
+from cadence and flight, never from bigger steps.
+
+**The CoM band was slack.** `com_height_target` returns ~1.0 in-range at weight
+1.2; the control's 1.1655 means the CoM was already inside 0.11–0.14 m about 97%
+of the time. Roughly doubling the band moved the reward only +0.9% (to ~98%
+in-range). Nothing was being suppressed.
+
+**Arm A's instrument was wrong, and this is worth remembering.**
+`feet_clearance` is `Σ |foot_height − target| × ‖foot_vel_xy‖` — the height error
+is *multiplied by foot speed*. Raising the target while the robot cannot comply
+makes the cheapest remedy **slowing the feet down**, not lifting them higher.
+That is exactly what happened: −14% flight fraction, −4% peak height, and the
+`foot_clearance` cost rose 170% as it ate the unavoidable error. To test whether
+a constraint binds, **relax its weight — never move its setpoint.**
+
+One unexplained detail, flagged rather than papered over: in arm A,
+`foot_swing_height`'s episode cost *improved* (−0.0103 → −0.0087) where its
+`(peak/target − 1)²` form predicts a ~2700× larger error. The class does reset
+its peak tracker on landing, so that is not the cause. It does not affect any
+verdict here (speed and peak height are measured independently) but it is worth
+a look if foot shaping is ever revisited.
+
+## What still needs watching in Phase 3
+
+The three terms are slack or generous **for the rigid robot**. That is not the
+same as neutral for the sprung one:
+
+- `com_height_target` — a spring's function is to oscillate the CoM. The moment
+  that oscillation leaves the 0.11–0.14 m band it starts paying, and only the
+  sprung condition pays. Report its episode sum.
+- foot terms — they currently subsidise ~2 cm of lift. If springs change the
+  natural foot trajectory, that subsidy lands differently. Report both sums.
+
+Monitor them; do not pre-emptively widen them. Widening changes the control for
+no measured benefit, and the sweep found no evidence any of them binds today.
