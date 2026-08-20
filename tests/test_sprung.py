@@ -69,6 +69,29 @@ def test_bottomed_fraction_catches_a_bottomed_spring():
     assert abs(float(env.extras["log"]["Metrics/spring_bottomed_fraction"]) - 0.5) < 1e-6
 
 
+def test_bottomed_fraction_tracks_the_threshold_magnitude():
+    """Just above the threshold counts; just below does not.
+
+    Guards the threshold VALUE (a regression comparing against `travel`
+    instead of `bottom_out_frac * travel` would move it by 5%). Deliberately
+    straddles rather than testing exact equality: q is float32 and the
+    threshold is a Python double, so exact-boundary comparison is unreliable,
+    and a compression landing exactly on it has measure zero anyway.
+    """
+    frac = 0.95
+    threshold = frac * _TRAVEL          # 0.01425 m
+
+    env_above = _Env([[threshold * 1.001, 0.0]])
+    spring_compression_monitor(env_above, joint_names=_JOINTS, travel=_TRAVEL,
+                               bottom_out_frac=frac)
+    assert abs(float(env_above.extras["log"]["Metrics/spring_bottomed_fraction"]) - 0.5) < 1e-6
+
+    env_below = _Env([[threshold * 0.999, 0.0]])
+    spring_compression_monitor(env_below, joint_names=_JOINTS, travel=_TRAVEL,
+                               bottom_out_frac=frac)
+    assert float(env_below.extras["log"]["Metrics/spring_bottomed_fraction"]) == 0.0
+
+
 def test_zero_travel_locked_variant_does_not_divide_by_zero():
     env = _Env([[0.0, 0.0]])
     out = spring_compression_monitor(env, joint_names=_JOINTS, travel=0.0)
@@ -79,7 +102,9 @@ def test_zero_travel_locked_variant_does_not_divide_by_zero():
 def test_nan_safe():
     env = _Env([[float("nan"), 0.006]])
     out = spring_compression_monitor(env, joint_names=_JOINTS, travel=_TRAVEL)
-    assert torch.isfinite(out).all()
+    assert out.shape == (1,)
+    assert float(out[0]) == 0.0
+    assert torch.isfinite(env.extras["log"]["Metrics/spring_compression_mean"])
     assert torch.isfinite(env.extras["log"]["Metrics/spring_compression_max"])
 
 
