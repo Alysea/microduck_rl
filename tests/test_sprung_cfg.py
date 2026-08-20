@@ -153,3 +153,34 @@ def test_sweep_arms_use_distinct_experiment_names():
         for s in ("Locked", "K800", "K1500", "K2200", "K3000")
     }
     assert len(names) == 5
+
+
+def test_sweep_arms_do_not_share_learner_cfg_objects():
+    """dataclasses.replace is shallow, so sprung_rl_cfg deep-copies the nested
+    cfgs. Without that, all five arms would share one actor object AND share it
+    with the Run baseline, so a later change to any single arm would silently
+    alter the other four and the control this sweep is compared against.
+
+    Asserts object identity, not values: the values are SUPPOSED to be
+    identical (same learner, different logging identity), so only identity can
+    distinguish a deep copy from a shared reference.
+    """
+    from mjlab_microduck.tasks.run import MicroduckRunRlCfg
+    from mjlab_microduck.tasks.sprung import sprung_rl_cfg
+
+    a = sprung_rl_cfg("k800")
+    b = sprung_rl_cfg("k1500")
+
+    for field in ("actor", "critic", "algorithm"):
+        assert getattr(a, field) is not getattr(b, field), f"{field} shared between arms"
+        assert getattr(a, field) is not getattr(MicroduckRunRlCfg, field), (
+            f"{field} shared with the Run baseline"
+        )
+
+    # Same learner, though: only the logging identity may differ.
+    assert a.actor.hidden_dims == MicroduckRunRlCfg.actor.hidden_dims
+    assert (
+        a.actor.distribution_cfg["class_name"]
+        == MicroduckRunRlCfg.actor.distribution_cfg["class_name"]
+    )
+    assert a.run_name != b.run_name
