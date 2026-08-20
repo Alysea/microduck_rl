@@ -93,10 +93,19 @@ def test_pad_mass_is_added_not_idealised_away(model):
 
 
 def test_locked_variant_has_zero_travel():
+    """The locked (travel=0) variant must be a true rigid control, not a
+    spring with an unenforced [0, 0] range (that would leave it unconstrained
+    -- see fix-round-1 notes in the report).
+    """
     m = make_sprung_foot_spec_fn(stiffness=1500.0, travel=0.0)().compile()
     for j in SPRING_JOINTS:
         jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, j)
-        assert m.jnt_range[jid][1] == pytest.approx(0.0)
+        assert jid == -1, f"{j} should not exist in the locked (travel=0) variant"
+
+
+def test_locked_variant_has_two_fewer_dofs(model):
+    locked = make_sprung_foot_spec_fn(stiffness=1500.0, travel=0.0)().compile()
+    assert locked.nv == model.nv - 2
 
 
 def test_contact_geom_and_site_live_on_the_pad(model):

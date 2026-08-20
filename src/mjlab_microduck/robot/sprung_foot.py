@@ -37,7 +37,13 @@ SPRING_AXIS = (0.0, 1.0, 0.0)
 # Distance from the ankle body origin down to the existing sole's contact plane,
 # measured at the home pose. The pad is placed h_add BELOW that, which is what
 # makes the sprung robot taller than the rigid one.
-ANKLE_TO_SOLE = 0.025
+#
+# Tuned (not the naive mesh measurement of 0.025) so that the settled
+# rigid-vs-sprung trunk-height delta lands on H_ADD: the rigid sole is a mesh
+# and the pad is a box, and the two settle to slightly different contact
+# penetration depths under gravity, so the naive value overshot the delta by
+# ~3-4 mm. See task-1-report.md fix-round-1 notes.
+ANKLE_TO_SOLE = 0.0215
 
 H_ADD = 0.025      # height the mechanism adds under the foot (m)
 PAD_MASS = 0.020   # mechanism mass per foot (kg) — distal, so it is modelled
@@ -91,22 +97,26 @@ def make_sprung_foot_spec_fn(
             pad = ankle.add_body(
                 name=f"{side}_foot_pad", pos=[0.0, -(ANKLE_TO_SOLE + h_add), 0.0]
             )
-            joint = pad.add_joint(
-                name=f"passive_{side}_foot_spring",
-                type=mujoco.mjtJoint.mjJNT_SLIDE,
-            )
-            joint.axis = list(SPRING_AXIS)
-            joint.range = [0.0, travel]
-            # Leave `limited` at its default (mjLIMITED_AUTO) rather than
-            # forcing 1: MuJoCo's compile-time check requires range[0] <
-            # range[1] whenever limited is explicitly true, which breaks the
-            # travel=0.0 locked variant (range [0, 0]). AUTO enables the limit
-            # only when range differs from the [0, 0] default, which is
-            # exactly what we want in both cases.
-            # These MUST be 3-arrays; MjsJoint rejects a scalar. Only element 0
-            # is used by the compiler.
-            joint.stiffness = np.array([stiffness, 0.0, 0.0])
-            joint.damping = np.array([damping, 0.0, 0.0])
+            # travel == 0.0 is the LOCKED control arm: no joint at all, so the
+            # pad is a rigid child of the ankle (identical mass and height,
+            # zero DoF). A slide joint with range [0, 0] compiles fine but is
+            # NOT locked -- MuJoCo leaves `limited` at AUTO in that case
+            # (range == the joint-type default), so the joint is actually
+            # unconstrained and held only by the spring. That silently turns
+            # the control arm into an infinite-travel spring, which defeats
+            # its purpose of isolating "extra height/mass" from "compliance".
+            if travel > 0.0:
+                joint = pad.add_joint(
+                    name=f"passive_{side}_foot_spring",
+                    type=mujoco.mjtJoint.mjJNT_SLIDE,
+                )
+                joint.axis = list(SPRING_AXIS)
+                joint.range = [0.0, travel]
+                joint.limited = 1
+                # These MUST be 3-arrays; MjsJoint rejects a scalar. Only
+                # element 0 is used by the compiler.
+                joint.stiffness = np.array([stiffness, 0.0, 0.0])
+                joint.damping = np.array([damping, 0.0, 0.0])
             # Re-use the ORIGINAL names so the contact sensor, the terrain
             # height-scan frames, foot_clearance and foot_slip all keep working
             # with no config change.
