@@ -41,3 +41,6 @@ logdir/.claude/worktrees/
 
 # superpowers SDD scratch
 .superpowers/
+
+# local-only branch guard (referenced by .claude/settings.local.json)
+.claude/hooks/
