@@ -111,3 +111,45 @@ def test_action_rate_curriculum_is_untouched():
     actual = [dict(s) for s in sprung.curriculum["action_rate_weight"].params["weight_stages"]]
 
     assert actual == expected
+
+
+def test_sweep_arms_cover_the_spec_grid():
+    from mjlab_microduck.tasks.sprung import SWEEP_ARMS
+
+    labels = [a[0] for a in SWEEP_ARMS]
+    assert "locked" in labels, "the locked arm is the geometric control"
+    stiffnesses = {a[1] for a in SWEEP_ARMS if a[0] != "locked"}
+    assert stiffnesses == {800.0, 1500.0, 2200.0, 3000.0}
+    # The locked arm must have zero travel; every other arm must have some.
+    for label, _k, travel in SWEEP_ARMS:
+        if label == "locked":
+            assert travel == 0.0
+        else:
+            assert travel > 0.0
+
+
+def test_all_sweep_task_ids_registered():
+    import mjlab_microduck.tasks  # noqa: F401  (import registers)
+    from mjlab.tasks.registry import list_tasks
+
+    tasks = list_tasks()
+    for tid in (
+        "Mjlab-Run-Flat-Sprung-Locked-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-K800-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-K1500-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-K2200-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-K3000-MicroDuck",
+    ):
+        assert tid in tasks, f"{tid} not registered"
+
+
+def test_sweep_arms_use_distinct_experiment_names():
+    """Each arm needs its own wandb grouping or the sweep is unreadable."""
+    import mjlab_microduck.tasks  # noqa: F401
+    from mjlab.tasks.registry import load_rl_cfg
+
+    names = {
+        load_rl_cfg(f"Mjlab-Run-Flat-Sprung-{s}-MicroDuck").run_name
+        for s in ("Locked", "K800", "K1500", "K2200", "K3000")
+    }
+    assert len(names) == 5

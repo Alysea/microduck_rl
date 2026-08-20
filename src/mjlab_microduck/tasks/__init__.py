@@ -86,6 +86,7 @@ from .microduck_spin_env_cfg import (
 )
 from .backlash import make_backlash_variant
 from .run import make_run_variant, MicroduckRunRlCfg
+from .sprung import SWEEP_ARMS, make_sprung_variant, sprung_rl_cfg, ARM_TASK_SUFFIX
 
 # Standard velocity task
 register_mjlab_task(
@@ -127,6 +128,27 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 print("✓ Run task registered: Mjlab-Run-Rough-MicroDuck")
+
+# Sprung-foot stiffness sweep — Phase 2. See
+# docs/superpowers/specs/2026-08-20-sprung-foot-design.md
+for _label, _k, _travel in SWEEP_ARMS:
+    _tid = f"Mjlab-Run-Flat-Sprung-{ARM_TASK_SUFFIX[_label]}-MicroDuck"
+    register_mjlab_task(
+        task_id=_tid,
+        env_cfg=make_sprung_variant(
+            make_run_variant(make_microduck_velocity_env_cfg()),
+            stiffness=_k,
+            travel=_travel,
+        ),
+        play_env_cfg=make_sprung_variant(
+            make_run_variant(make_microduck_velocity_env_cfg(play=True)),
+            stiffness=_k,
+            travel=_travel,
+        ),
+        rl_cfg=sprung_rl_cfg(_label),
+        runner_cls=MicroduckOnPolicyRunner,
+    )
+    print(f"✓ Sprung task registered: {_tid}")
 
 # Velocity2 — microban reward/regularization recipe on the velocity task.
 register_mjlab_task(

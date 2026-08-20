@@ -84,3 +84,49 @@ def make_sprung_variant(
     )
 
     return cfg
+
+
+from dataclasses import replace
+
+from mjlab_microduck.tasks.run import MicroduckRunRlCfg
+
+# (label, stiffness N/m, travel m). The locked arm is the geometric control:
+# identical height and mass, zero compliance. It — not the 0.468 m/s rigid
+# baseline — is what the sprung arms are compared against, because the rigid
+# baseline differs in geometry as well as compliance.
+#
+# k=800 is expected to bottom out (22.5 mm of deflection at an 18 N peak against
+# 15 mm of travel). It is included deliberately: it should reproduce the
+# abandoned branch's failure and establish the travel floor empirically.
+SWEEP_ARMS = (
+    ("locked", 1500.0, 0.0),
+    ("k800", 800.0, TRAVEL),
+    ("k1500", 1500.0, TRAVEL),
+    ("k2200", 2200.0, TRAVEL),
+    ("k3000", 3000.0, TRAVEL),
+)
+
+ARM_TASK_SUFFIX = {
+    "locked": "Locked",
+    "k800": "K800",
+    "k1500": "K1500",
+    "k2200": "K2200",
+    "k3000": "K3000",
+}
+
+
+def sprung_rl_cfg(label: str):
+    """Per-arm RL cfg: identical learner, distinct logging identity.
+
+    ``replace`` is shallow, so deepcopy the nested cfgs — otherwise every arm
+    would share one actor object and a later change to any of them would alter
+    all five plus the Run baseline.
+    """
+    return replace(
+        MicroduckRunRlCfg,
+        actor=deepcopy(MicroduckRunRlCfg.actor),
+        critic=deepcopy(MicroduckRunRlCfg.critic),
+        algorithm=deepcopy(MicroduckRunRlCfg.algorithm),
+        experiment_name=f"sprung_{label}",
+        run_name=f"sprung_{label}",
+    )
