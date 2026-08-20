@@ -54,7 +54,29 @@ All four checked against the installed MuJoCo before this plan was written:
 3. **Spec editing API:** `spec.body("ankle_left")`, `body.add_body(name=..., pos=...)`,
    `pad.add_joint(name=..., type=mujoco.mjtJoint.mjJNT_SLIDE)`, `pad.add_geom(...)`,
    `spec.compile()`. All confirmed working on this model.
-4. **`EntityCfg` takes `spec_fn`** (a zero-argument callable returning `MjSpec`),
+4. **The sole collision geom and foot site MUST be relocated to the pad, and
+   this is the single most important detail in Task 1.** The
+   `feet_ground_contact` sensor matches geoms by the pattern
+   `^(left_foot_collision|right_foot_collision)$`, and `foot_height_scan` takes
+   its frames from the `left_foot` / `right_foot` sites. If the pad is added
+   while those stay on the ankle body, the contact sensor watches a geom now
+   floating `h_add` above the ground — never in contact — and `air_time`,
+   `alternating_flight`, `flight_fraction`, `foot_clearance` and `foot_slip` all
+   silently read garbage. Verified working approach: rename the old geom and
+   site, disable the old geom's contact, then add a new geom and site on the pad
+   **under the original names**, so every downstream regex and sensor keeps
+   working untouched:
+   ```python
+   g = spec.geom("left_foot_collision"); g.name = "left_sole_disabled"
+   g.contype = 0; g.conaffinity = 0
+   spec.site("left_foot").name = "left_foot_old"
+   # ... then on the pad body:
+   pad.add_geom(name="left_foot_collision", ...)
+   pad.add_site(name="left_foot", pos=[0, 0, 0])
+   ```
+   Confirmed after compile: both `left_foot_collision` and the `left_foot` site
+   resolve to body `left_foot_pad`.
+5. **`EntityCfg` takes `spec_fn`** (a zero-argument callable returning `MjSpec`),
    plus `init_state`, `collisions`, `articulation`. See `MICRODUCK_WALK_ROBOT_CFG`
    at `microduck_constants.py:159`.
 
@@ -180,6 +202,30 @@ def test_locked_variant_has_zero_travel():
         assert m.jnt_range[jid][1] == pytest.approx(0.0)
 
 
+def test_contact_geom_and_site_live_on_the_pad(model):
+    """The most load-bearing assertion in this file.
+
+    feet_ground_contact matches ^(left_foot_collision|right_foot_collision)$ and
+    foot_height_scan frames off the left_foot/right_foot sites. If either still
+    resolves to the ankle body, contact is read from a geom floating above the
+    ground and every gait metric silently reads garbage.
+    """
+    for side in ("left", "right"):
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{side}_foot_collision")
+        sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_foot")
+        assert gid >= 0 and sid >= 0
+        pad = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_foot_pad")
+        assert model.geom_bodyid[gid] == pad
+        assert model.site_bodyid[sid] == pad
+
+
+def test_old_sole_no_longer_collides(model):
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "left_sole_disabled")
+    assert gid >= 0, "the rigid sole should be renamed, not deleted"
+    assert model.geom_contype[gid] == 0
+    assert model.geom_conaffinity[gid] == 0
+
+
 def test_h_add_lowers_the_pad(model):
     """Larger h_add must put the contact pad further below the ankle."""
     shallow = make_sprung_foot_spec_fn(stiffness=1500.0, h_add=0.010)().compile()
@@ -279,6 +325,16 @@ def make_sprung_foot_spec_fn(
         spec = get_walk_spec()
         for side in ("left", "right"):
             ankle = spec.body(f"ankle_{side}")
+
+            # Retire the rigid sole: rename it and switch off its contact, so
+            # the name `{side}_foot_collision` is free for the pad below. Left
+            # in place it would keep answering the feet_ground_contact sensor
+            # while floating h_add above the ground.
+            old_geom = spec.geom(f"{side}_foot_collision")
+            old_geom.name = f"{side}_sole_disabled"
+            old_geom.contype = 0
+            old_geom.conaffinity = 0
+            spec.site(f"{side}_foot").name = f"{side}_foot_old"
             # -y is downward in world at the home pose, so a negative y offset
             # puts the pad below the ankle.
             pad = ankle.add_body(
@@ -295,13 +351,17 @@ def make_sprung_foot_spec_fn(
             # is used by the compiler.
             joint.stiffness = np.array([stiffness, 0.0, 0.0])
             joint.damping = np.array([damping, 0.0, 0.0])
+            # Re-use the ORIGINAL names so the contact sensor, the terrain
+            # height-scan frames, foot_clearance and foot_slip all keep working
+            # with no config change.
             pad.add_geom(
-                name=f"{side}_pad_collision",
+                name=f"{side}_foot_collision",
                 type=mujoco.mjtGeom.mjGEOM_BOX,
                 size=list(_PAD_HALF_EXTENTS),
                 pos=[0.0, 0.0, 0.0],
                 mass=pad_mass,
             )
+            pad.add_site(name=f"{side}_foot", pos=[0.0, 0.0, 0.0])
         return spec
 
     return _spec_fn
@@ -338,7 +398,7 @@ def make_sprung_foot_robot_cfg(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_sprung_foot_model.py -v`
-Expected: 8 passed.
+Expected: 10 passed.
 
 If `HOME_FRAME.joint_vel` does not exist as an attribute, drop that kwarg — the
 base `HOME_FRAME` at `microduck_constants.py:73` is the reference for which
@@ -912,7 +972,7 @@ SWEEP_ARMS = (
     ("k3000", 3000.0, TRAVEL),
 )
 
-_ARM_TASK_SUFFIX = {
+ARM_TASK_SUFFIX = {
     "locked": "Locked",
     "k800": "K800",
     "k1500": "K1500",
@@ -943,7 +1003,7 @@ others (it must come **after** the `.run` import, since `sprung.py` imports
 from `run.py`):
 
 ```python
-from .sprung import SWEEP_ARMS, make_sprung_variant, sprung_rl_cfg, _ARM_TASK_SUFFIX
+from .sprung import SWEEP_ARMS, make_sprung_variant, sprung_rl_cfg, ARM_TASK_SUFFIX
 ```
 
 and register after the Run block:
@@ -952,7 +1012,7 @@ and register after the Run block:
 # Sprung-foot stiffness sweep — Phase 2. See
 # docs/superpowers/specs/2026-08-20-sprung-foot-design.md
 for _label, _k, _travel in SWEEP_ARMS:
-    _tid = f"Mjlab-Run-Flat-Sprung-{_ARM_TASK_SUFFIX[_label]}-MicroDuck"
+    _tid = f"Mjlab-Run-Flat-Sprung-{ARM_TASK_SUFFIX[_label]}-MicroDuck"
     register_mjlab_task(
         task_id=_tid,
         env_cfg=make_sprung_variant(
