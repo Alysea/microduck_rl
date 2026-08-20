@@ -6228,3 +6228,70 @@ def forward_speed_monitor(
         log["Metrics/forward_speed_max"] = fwd_vel.max()
 
     return zeros
+
+
+def spring_compression_monitor(
+    env: ManagerBasedRlEnv,
+    joint_names: tuple,
+    travel: float,
+    bottom_out_frac: float = 0.95,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Log sprung-foot compression. Contributes exactly zero reward.
+
+    This is the first thing to read in the stiffness sweep: a spring that never
+    deflects, or one pinned against its hard stop, is measuring nothing. The
+    abandoned sprung branch ran at 500 N/m over 10 mm of travel, which is 5 N
+    before the stop — it was riding a rigid limit, not a spring, and nothing
+    logged that fact.
+
+    Returns zeros, so the reward total is unaffected at any weight. **Register
+    it with a non-zero weight anyway**: ``RewardManager.compute``
+    (mjlab/managers/reward_manager.py:122) short-circuits before calling the
+    term function when ``weight == 0.0``.
+
+    Args:
+        joint_names: the spring joint names, resolved by name (so this function
+            has no dependency on the robot module).
+        travel: the spring's stroke in metres. 0.0 (the locked control variant)
+            reports zero compression rather than dividing by zero.
+        bottom_out_frac: fraction of travel counted as bottomed out.
+
+    Returns:
+        A zeros tensor (num_envs,).
+    """
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    asset: Entity = env.scene[asset_cfg.name]
+
+    ids = []
+    try:
+        for name in joint_names:
+            found, _ = asset.find_joints(name)
+            if not found:
+                return zeros
+            ids.append(found[0])
+    except ValueError:
+        # mjlab's resolve_matching_names RAISES when a pattern matches nothing.
+        # That is the normal case for the locked control arm, which has no
+        # spring joints — report "no compliance" rather than crashing.
+        return zeros
+    if not ids:
+        return zeros
+
+    q = torch.nan_to_num(
+        asset.data.joint_pos[:, ids].float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+
+    log = env.extras.get("log") if hasattr(env, "extras") else None
+    if log is not None:
+        log["Metrics/spring_compression_mean"] = q.mean()
+        log["Metrics/spring_compression_max"] = q.max()
+        if travel > 0.0:
+            log["Metrics/spring_bottomed_fraction"] = (
+                q >= bottom_out_frac * travel
+            ).float().mean()
+        else:
+            # Locked control variant: no travel, so nothing can bottom out.
+            log["Metrics/spring_bottomed_fraction"] = torch.zeros((), device=env.device)
+
+    return zeros
