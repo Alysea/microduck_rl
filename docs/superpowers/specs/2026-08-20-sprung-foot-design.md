@@ -138,7 +138,10 @@ spring: keeping peak deflection under 12 mm at an 18 N peak needs
 
 ## Height offset is a first-class parameter
 
-**Any mechanism adds height under the foot**, and that is not cosmetic:
+**Any mechanism adds height under the foot**, and that is not cosmetic. Note up
+front that height is only one of **four** ways a sprung arm differs from the
+rigid 0.468 m/s baseline — height, mass, compliance, and **foot contact
+geometry** (see "The foot contact geometry also changes" below):
 
 - **It shifts the CoM out of the reward band.** At a nominal +25 mm the trunk
   stands at 0.150 m against a 0.11-0.14 m band, so the sprung robot would be
@@ -158,12 +161,47 @@ stated as assumptions to be revised once a mechanism exists. Also requires the
 foot contact site and the per-foot terrain-height ray sensor to move down to the
 new pad, or `foot_clearance` / `foot_swing_height` will measure the wrong body.
 
+## The foot contact geometry also changes
+
+The pad that carries contact is a **40 x 28 x 8 mm box** (`rbound` 0.0247). The
+sole it replaces was a **mesh**, oriented-bbox **54.0 x 41.1 x 12.9 mm**
+(`rbound` 0.0355). So the sprung foot has:
+
+- **~half the contact footprint** — 1120 mm^2 against 2219 mm^2, and
+- **26% less fore-aft length** (40.0 mm against 54.0 mm), which is the axis that
+  matters most for push-off and for pitch stability at speed, plus
+- **box-vs-mesh contact**, which settles to a different penetration depth under
+  the same load (this is why `ANKLE_TO_SOLE` is tuned to 0.0215 rather than the
+  naive 0.025 mesh measurement).
+
+**This is deliberate and is NOT to be "fixed" by widening the pad.** The pad is
+a *hardware design parameter* handed forward to the mechanism phase: a 1-DoF
+prismatic slide or Sarrus linkage has to fit inside the foot, and its contact
+plate is the size it is. Changing it here to flatter the comparison would make
+the sim model a mechanism nobody intends to build.
+
+What it does mean is that the sprung arms differ from the rigid baseline in
+**four** ways, not three: height, mass, compliance, and foot contact geometry.
+Hence the next section.
+
 ## The sweep
 
 **Five arms, 8000 iterations each**, matching the diagnostic-sweep protocol and
 compared over the 7000-8000 iteration window. Travel fixed at 15 mm, damping
 fixed low (0.5 N.s/m, representing a good steel spring — hardware hysteresis
 will be worse and is a hardware-phase concern, not a sweep axis).
+
+For that "idealised spring" claim to be true of what is actually built, the
+spring joint's `frictionloss` and `armature` are **explicitly set to 0.0**
+(`SPRING_FRICTIONLOSS` / `SPRING_ARMATURE` in `robot/sprung_foot.py`). They have
+to be stated: the joint is created inside the `microduck` childclass, whose
+`<joint frictionloss="0.1" armature="0.005"/>` default it would otherwise
+inherit silently — a dry-friction term worth roughly a third of total
+dissipation, plus 5 g of effective inertia on a 20 g pad (+25%, and invisible in
+the total-mass check). Uniform across arms, so the *ranking* would survive, but
+the absolute energy-return figure and the `(k, travel)` number handed to the
+hardware phase would both be wrong. Zero is not a claim about a real mechanism:
+stiction and mechanism inertia are hardware-phase concerns this spec defers.
 
 | Arm | k (N/m) | static sag (2-foot) | peak @ 18 N | purpose |
 |---|---|---|---|---|
@@ -175,15 +213,27 @@ will be worse and is a hardware-phase concern, not a sweep axis).
 
 ### The locked arm is the real control
 
-The 0.468 m/s baseline was measured on a robot **without** the added height and
-mass. Comparing a sprung foot against it changes two things at once —
-compliance *and* geometry — which is exactly the attribution failure this
-campaign was restructured to avoid.
+The 0.468 m/s baseline was measured on a robot **without** the added height,
+without the added mass, and on the **original mesh sole**. Comparing a sprung
+foot against it changes **four** things at once:
 
-The locked arm carries identical geometry, identical mass and a spring locked to
-zero travel. **The hypothesis is tested as sprung vs locked.** The 0.468 m/s
-figure remains a useful reference for how much the geometry alone costs, but it
-is not the control.
+1. **height** (+25 mm under the foot),
+2. **mass** (+20 g per foot, distal),
+3. **compliance** (the spring itself), and
+4. **foot contact geometry** — a 40 x 28 x 8 mm box (`rbound` 0.0247) in place
+   of the sole mesh (oriented-bbox 54.0 x 41.1 x 12.9 mm, `rbound` 0.0355):
+   ~half the contact footprint (1120 vs 2219 mm^2), 26% shorter fore-aft, and
+   box-vs-mesh contact.
+
+That is exactly the attribution failure this campaign was restructured to avoid,
+and (4) is the one an earlier draft of this spec missed.
+
+**The locked arm controls for all four.** It carries the same +25 mm, the same
++20 g, and — crucially — **the same pad**, with no compliance. So sprung-vs-
+locked isolates variable (3) alone, which is the hypothesis. **The hypothesis is
+tested as sprung vs locked.** The 0.468 m/s figure remains a useful reference for
+how much the geometry (1, 2 and 4 together) costs, but it is not the control —
+and this four-way difference is precisely why.
 
 The soft arm is included on purpose: it should reproduce the abandoned branch's
 bottoming-out failure, validating the compression monitor and establishing the
@@ -204,8 +254,15 @@ Follows paths already proven in this repo:
    `dof_pos_limits` and the `pose` reward's `asset_cfg` off the new joints, and
    shift the `com_height_target` band by `H_add`.
 3. **`spring_compression_monitor`** in `tasks/mdp.py` — returns a zeros tensor
-   and logs `Metrics/spring_compression_mean`, `_max`, and
-   `Metrics/spring_bottomed_fraction`. Registered with a **non-zero** weight:
+   and logs `Metrics/spring_compression_mean`, `_loaded_mean`, `_p95`, and
+   `Metrics/spring_bottomed_fraction`, on **every** arm including `locked`
+   (as explicit zeros), so an absent series means a bug rather than a normal
+   arm. `_loaded_mean` (mean over samples with q > 1e-4 m) is the figure to
+   compare against the static-sag table: the all-steps `_mean` is duty-diluted
+   by flight, and reads ~1.9 mm at k=1500 against a 2.4 mm static sag. `_p95`
+   replaces an earlier `_max`, which read ~`travel` as soon as any single
+   sample of 4096 x 2 touched the stop and so carried no information.
+   Registered with a **non-zero** weight:
    `RewardManager.compute` short-circuits before calling terms whose weight is
    0.0, which would silently disable it.
 4. **Registration** — one task id per sweep arm
@@ -222,9 +279,12 @@ Follows paths already proven in this repo:
 ## Success criteria
 
 1. **The compression monitor shows the spring is actually working** — non-zero
-   mean compression, and `bottomed_fraction` near zero for the arms that matter.
-   A sprung model that never deflects, or that rides its hard stop, is measuring
-   nothing. This is the first thing to check, before any speed number.
+   `spring_compression_loaded_mean` in the neighbourhood of the static-sag
+   table, and `bottomed_fraction` near zero for the arms that matter. Read
+   `_loaded_mean`, not `_mean`: the latter is diluted by flight and will look
+   low even on a healthy spring. A sprung model that never deflects, or that
+   rides its hard stop, is measuring nothing. This is the first thing to check,
+   before any speed number.
 2. **A stiffness that beats the locked arm on `forward_speed_mean`**, with
    `flight_asymmetry` holding near 0.70 — faster *and* still alternating, not
    faster by degenerating into a bounce.

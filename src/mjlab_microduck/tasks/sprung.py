@@ -18,6 +18,7 @@ no compliance.
 """
 
 from copy import deepcopy
+from dataclasses import replace
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers import RewardTermCfg
@@ -30,6 +31,7 @@ from mjlab_microduck.robot.sprung_foot import (
     make_sprung_foot_robot_cfg,
 )
 from mjlab_microduck.tasks import mdp as microduck_mdp
+from mjlab_microduck.tasks.run import MicroduckRunRlCfg
 
 SPRING_MONITOR_WEIGHT = 1.0
 
@@ -85,10 +87,6 @@ def make_sprung_variant(
 
     return cfg
 
-
-from dataclasses import replace
-
-from mjlab_microduck.tasks.run import MicroduckRunRlCfg
 
 # (label, stiffness N/m, travel m). The locked arm is the geometric control:
 # identical height and mass, zero compliance. It — not the 0.468 m/s rigid

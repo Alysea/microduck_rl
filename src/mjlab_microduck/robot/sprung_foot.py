@@ -50,7 +50,24 @@ PAD_MASS = 0.020   # mechanism mass per foot (kg) — distal, so it is modelled
 TRAVEL = 0.015     # spring stroke (m)
 DAMPING = 0.5      # N.s/m — represents a good steel spring, low hysteresis
 
+# These exist to OVERRIDE the `microduck` childclass joint defaults
+# (frictionloss=0.1, armature=0.005 in robot_walk.xml), which the spring joint
+# would otherwise inherit silently — the joint is added inside that childclass
+# scope. Zero is not a physical claim about a real mechanism: it makes the model
+# match the spec's *idealised* spring, whose only dissipation is DAMPING.
+# Mechanism stiction and mechanism inertia are hardware-phase concerns the spec
+# explicitly defers.
+SPRING_FRICTIONLOSS = 0.0
+SPRING_ARMATURE = 0.0
+
 SPRING_JOINTS = ("passive_left_foot_spring", "passive_right_foot_spring")
+
+# The `<default class="collision">` block in robot_walk.xml (group=3). The pad's
+# contact geom MUST inherit it: `foot_height_scan` rays are restricted to
+# `include_geom_groups=(0,)` (terrain only), so a group-0 pad geom would be hit
+# by the opposite foot's height ray and reported as ground, corrupting
+# `foot_clearance` and `foot_swing_height`.
+_COLLISION_CLASS = "collision"
 
 # Contact pad half-extents (m). Local y is world-up here, so the middle number
 # is half the pad thickness.
@@ -117,10 +134,17 @@ def make_sprung_foot_spec_fn(
                 # element 0 is used by the compiler.
                 joint.stiffness = np.array([stiffness, 0.0, 0.0])
                 joint.damping = np.array([damping, 0.0, 0.0])
+                # Set explicitly to override the `microduck` childclass joint
+                # defaults (0.1 / 0.005) this joint would otherwise inherit.
+                # See the constants above. Unlike stiffness/damping these two
+                # are SCALARS on MjsJoint (a 3-array raises TypeError).
+                joint.frictionloss = SPRING_FRICTIONLOSS
+                joint.armature = SPRING_ARMATURE
             # Re-use the ORIGINAL names so the contact sensor, the terrain
             # height-scan frames, foot_clearance and foot_slip all keep working
             # with no config change.
             pad.add_geom(
+                spec.find_default(_COLLISION_CLASS),
                 name=f"{side}_foot_collision",
                 type=mujoco.mjtGeom.mjGEOM_BOX,
                 size=list(_PAD_HALF_EXTENTS),

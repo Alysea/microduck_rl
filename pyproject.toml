@@ -26,6 +26,10 @@ dependencies = [
     "scipy>=1.16",
 ]
 
+[dependency-groups]
+# Without this, a fresh `uv sync` prunes pytest and none of the test suite runs.
+dev = ["pytest"]
+
 [project.entry-points."mjlab.tasks"]
 mjlab_microduck = "mjlab_microduck.tasks"
 

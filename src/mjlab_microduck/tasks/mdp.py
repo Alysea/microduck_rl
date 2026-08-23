@@ -6250,17 +6250,50 @@ def spring_compression_monitor(
     (mjlab/managers/reward_manager.py:122) short-circuits before calling the
     term function when ``weight == 0.0``.
 
+    Which series to read, and why there are two means:
+
+    * ``spring_compression_mean`` averages over ALL steps, stance and flight
+      alike. In flight the pad hangs at q=0, so this figure is **duty-diluted**
+      — at k=1500 expect ~1.9 mm against the spec's 2.4 mm static-sag table.
+      That is not the spring under-deflecting, it is the flight fraction. Use it
+      for trends across arms, never against a static-sag number.
+    * ``spring_compression_loaded_mean`` averages only over samples with
+      q > 1e-4 m, which approximates stance-gating without taking a dependency
+      on the contact sensor. **This** is the series to compare against a static
+      sag figure.
+    * ``spring_compression_p95`` replaced an earlier ``_max``. A max over
+      num_envs x 2 samples reads essentially ``travel`` as soon as any single
+      sample touches the stop, so it carried no information.
+
+    Every series is logged on EVERY arm, the locked control included (as
+    explicit zeros). An absent series therefore means a bug, not a normal arm.
+
     Args:
         joint_names: the spring joint names, resolved by name (so this function
             has no dependency on the robot module).
         travel: the spring's stroke in metres. 0.0 (the locked control variant)
-            reports zero compression rather than dividing by zero.
+            logs explicit zeros rather than dividing by zero.
         bottom_out_frac: fraction of travel counted as bottomed out.
 
     Returns:
         A zeros tensor (num_envs,).
     """
     zeros = torch.zeros(env.num_envs, device=env.device)
+    log = env.extras.get("log") if hasattr(env, "extras") else None
+
+    # Locked control arm: no spring joints exist, so short-circuit BEFORE the
+    # lookup. Logging explicit zeros keeps the series present on every arm, so
+    # an ABSENT metric means a bug rather than a normal arm — and it avoids
+    # constructing a ValueError every step on the control arm.
+    if travel <= 0.0:
+        if log is not None:
+            zero = torch.zeros((), device=env.device)
+            log["Metrics/spring_compression_mean"] = zero
+            log["Metrics/spring_compression_loaded_mean"] = zero
+            log["Metrics/spring_compression_p95"] = zero
+            log["Metrics/spring_bottomed_fraction"] = zero
+        return zeros
+
     asset: Entity = env.scene[asset_cfg.name]
 
     ids = []
@@ -6272,8 +6305,9 @@ def spring_compression_monitor(
             ids.append(found[0])
     except ValueError:
         # mjlab's resolve_matching_names RAISES when a pattern matches nothing.
-        # That is the normal case for the locked control arm, which has no
-        # spring joints — report "no compliance" rather than crashing.
+        # Unreachable for the locked arm now (short-circuited above), so this
+        # only fires if a sprung arm's joints were renamed — report zeros rather
+        # than crashing a run.
         return zeros
     if not ids:
         return zeros
@@ -6282,16 +6316,17 @@ def spring_compression_monitor(
         asset.data.joint_pos[:, ids].float(), nan=0.0, posinf=0.0, neginf=0.0
     )
 
-    log = env.extras.get("log") if hasattr(env, "extras") else None
     if log is not None:
-        log["Metrics/spring_compression_mean"] = q.mean()
-        log["Metrics/spring_compression_max"] = q.max()
-        if travel > 0.0:
-            log["Metrics/spring_bottomed_fraction"] = (
-                q >= bottom_out_frac * travel
-            ).float().mean()
-        else:
-            # Locked control variant: no travel, so nothing can bottom out.
-            log["Metrics/spring_bottomed_fraction"] = torch.zeros((), device=env.device)
+        flat = q.flatten()
+        log["Metrics/spring_compression_mean"] = flat.mean()
+        log["Metrics/spring_compression_p95"] = torch.quantile(flat, 0.95)
+        # Stance proxy: a pad in flight rests at exactly q=0.
+        loaded = flat[flat > 1e-4]
+        log["Metrics/spring_compression_loaded_mean"] = (
+            loaded.mean() if loaded.numel() > 0 else torch.zeros((), device=env.device)
+        )
+        log["Metrics/spring_bottomed_fraction"] = (
+            flat >= bottom_out_frac * travel
+        ).float().mean()
 
     return zeros

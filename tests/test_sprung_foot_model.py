@@ -11,10 +11,16 @@ import pytest
 from mjlab_microduck.robot.sprung_foot import (
     H_ADD,
     PAD_MASS,
+    SPRING_ARMATURE,
+    SPRING_FRICTIONLOSS,
     SPRING_JOINTS,
     TRAVEL,
     make_sprung_foot_spec_fn,
 )
+
+# `<default class="collision"><geom group="3"/>` in robot_walk.xml. Every
+# collidable geom on the rigid robot sits in this group.
+COLLISION_GROUP = 3
 
 
 @pytest.fixture(scope="module")
@@ -126,10 +132,61 @@ def test_contact_geom_and_site_live_on_the_pad(model):
 
 
 def test_old_sole_no_longer_collides(model):
-    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "left_sole_disabled")
-    assert gid >= 0, "the rigid sole should be renamed, not deleted"
-    assert model.geom_contype[gid] == 0
-    assert model.geom_conaffinity[gid] == 0
+    for side in ("left", "right"):
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{side}_sole_disabled")
+        assert gid >= 0, f"the rigid {side} sole should be renamed, not deleted"
+        assert model.geom_contype[gid] == 0
+        assert model.geom_conaffinity[gid] == 0
+
+
+def test_pad_geom_is_in_the_collision_group(model):
+    """The pad geom must inherit `<default class="collision">` (group 3).
+
+    `foot_height_scan` is configured with `include_geom_groups=(0,)` — terrain
+    ONLY. A group-0 pad geom is therefore a valid ray target, so one foot's
+    height ray terminates on the OPPOSITE foot's pad and reports it as ground,
+    feeding a wrong height to `foot_clearance` (weight -2.0) and
+    `foot_swing_height`. `exclude_parent_body=True` removes a foot's own pad but
+    not the other one. This silently held while every other test passed.
+    """
+    for side in ("left", "right"):
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"{side}_foot_collision")
+        assert model.geom_group[gid] == COLLISION_GROUP
+        # The class change must not cost the pad its contact with the floor.
+        assert model.geom_contype[gid] != 0
+        assert model.geom_conaffinity[gid] != 0
+
+
+def test_no_group_zero_collidable_geoms_on_the_robot(model):
+    """The stronger form of the test above: the rigid model has NO group-0
+    collidable geom (every collision geom comes from the `collision` class), so
+    the sprung model must not introduce one either.
+    """
+    offenders = [
+        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i)
+        for i in range(model.ngeom)
+        if model.geom_group[i] == 0
+        and (model.geom_contype[i] or model.geom_conaffinity[i])
+    ]
+    assert offenders == []
+
+
+def test_spring_joint_does_not_inherit_xml_joint_defaults(model):
+    """`<default class="microduck"><joint frictionloss="0.1" armature="0.005"/>`.
+
+    The spring joint is added inside that childclass scope, so it silently
+    inherited both: a dry-friction term worth roughly a third of total
+    dissipation, and 5 g of effective inertia on a 20 g pad (+25%), invisible in
+    the mass check. The spec's spring is IDEALISED — its only dissipation is
+    `damping`.
+    """
+    for j in SPRING_JOINTS:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+        dof = model.jnt_dofadr[jid]
+        assert model.dof_frictionloss[dof] == pytest.approx(SPRING_FRICTIONLOSS)
+        assert model.dof_armature[dof] == pytest.approx(SPRING_ARMATURE)
+        assert model.dof_frictionloss[dof] == 0.0
+        assert model.dof_armature[dof] == 0.0
 
 
 def test_h_add_lowers_the_pad(model):

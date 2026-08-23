@@ -47,12 +47,53 @@ def test_returns_exactly_zeros():
     assert float(out[0]) == 0.0
 
 
-def test_reports_mean_and_max_compression():
+def test_reports_mean_and_p95_compression():
     env = _Env([[0.004, 0.010]])
     spring_compression_monitor(env, joint_names=_JOINTS, travel=_TRAVEL)
     log = env.extras["log"]
     assert abs(float(log["Metrics/spring_compression_mean"]) - 0.007) < 1e-6
-    assert abs(float(log["Metrics/spring_compression_max"]) - 0.010) < 1e-6
+    # torch.quantile interpolates linearly: 0.004 + 0.95 * 0.006.
+    assert abs(float(log["Metrics/spring_compression_p95"]) - 0.0097) < 1e-6
+
+
+def test_p95_ignores_a_single_bottomed_sample():
+    """The reason _max was replaced.
+
+    One sample pinned at the stop out of many must NOT drag the headline
+    compression figure to `travel`; a max over num_envs x 2 samples did exactly
+    that, which is why it carried no information.
+    """
+    q = [[0.003, 0.003] for _ in range(50)]
+    q[0][0] = _TRAVEL
+    env = _Env(q)
+    spring_compression_monitor(env, joint_names=_JOINTS, travel=_TRAVEL)
+    p95 = float(env.extras["log"]["Metrics/spring_compression_p95"])
+    assert p95 < 0.005, p95
+
+
+def test_loaded_mean_excludes_flight_samples():
+    """`loaded_mean` is the series compared against the static-sag table.
+
+    Half these samples are at q=0 (pad in flight). The all-steps mean is
+    duty-diluted to 0.002; the loaded mean must report the true 0.004.
+    """
+    env = _Env([[0.004, 0.0], [0.004, 0.0]])
+    spring_compression_monitor(env, joint_names=_JOINTS, travel=_TRAVEL)
+    log = env.extras["log"]
+    assert abs(float(log["Metrics/spring_compression_mean"]) - 0.002) < 1e-6
+    assert abs(float(log["Metrics/spring_compression_loaded_mean"]) - 0.004) < 1e-6
+
+
+def test_loaded_mean_is_zero_when_nothing_is_loaded():
+    """Fully airborne (or a spring that never deflects): no loaded samples, so
+    the mean is over an empty tensor. Must be 0.0, not NaN — a NaN here would
+    poison the wandb series it is meant to diagnose.
+    """
+    env = _Env([[0.0, 0.0]])
+    spring_compression_monitor(env, joint_names=_JOINTS, travel=_TRAVEL)
+    loaded = env.extras["log"]["Metrics/spring_compression_loaded_mean"]
+    assert torch.isfinite(loaded)
+    assert float(loaded) == 0.0
 
 
 def test_bottomed_fraction_is_zero_when_well_inside_travel():
@@ -99,19 +140,54 @@ def test_zero_travel_locked_variant_does_not_divide_by_zero():
     assert torch.isfinite(env.extras["log"]["Metrics/spring_bottomed_fraction"])
 
 
+def test_locked_arm_logs_all_four_series_as_zeros():
+    """The locked control arm must LOG zeros, not omit the series.
+
+    It has no spring joints at all, so the old code returned before reaching the
+    logging block and the arm produced no `spring_*` series whatsoever. That
+    made "metric absent" a normal condition and destroyed the diagnostic value
+    of absence: with this test, an absent series means a bug.
+
+    Uses an asset whose joint lookup RAISES, i.e. the real locked-arm model, to
+    prove the zeros are logged before any lookup is attempted.
+    """
+    class _RaisingAsset(_Asset):
+        def find_joints(self, name):
+            raise AssertionError("must short-circuit before the joint lookup")
+
+    env = _Env([[0.0, 0.0]])
+    env.scene._a = _RaisingAsset([[0.0, 0.0]])
+    out = spring_compression_monitor(env, joint_names=_JOINTS, travel=0.0)
+    assert float(out[0]) == 0.0
+    log = env.extras["log"]
+    for key in (
+        "Metrics/spring_compression_mean",
+        "Metrics/spring_compression_loaded_mean",
+        "Metrics/spring_compression_p95",
+        "Metrics/spring_bottomed_fraction",
+    ):
+        assert key in log, f"{key} missing on the locked arm"
+        assert float(log[key]) == 0.0
+
+
 def test_nan_safe():
     env = _Env([[float("nan"), 0.006]])
     out = spring_compression_monitor(env, joint_names=_JOINTS, travel=_TRAVEL)
     assert out.shape == (1,)
     assert float(out[0]) == 0.0
     assert torch.isfinite(env.extras["log"]["Metrics/spring_compression_mean"])
-    assert torch.isfinite(env.extras["log"]["Metrics/spring_compression_max"])
+    assert torch.isfinite(env.extras["log"]["Metrics/spring_compression_p95"])
+    assert torch.isfinite(env.extras["log"]["Metrics/spring_compression_loaded_mean"])
 
 
 def test_missing_joints_return_zeros_without_raising():
-    """The locked control arm has NO spring joints, so this path runs in
-    production on every step of that arm. mjlab's find_joints RAISES
-    ValueError when a name matches nothing rather than returning empty.
+    """mjlab's find_joints RAISES ValueError when a name matches nothing rather
+    than returning empty.
+
+    No longer the locked arm's production path — travel=0.0 short-circuits
+    before the lookup (see test_locked_arm_logs_all_four_series_as_zeros). This
+    now guards a sprung arm whose joints were renamed: report zeros, do not
+    crash a run.
     """
     class _RaisingAsset(_Asset):
         def find_joints(self, name):
