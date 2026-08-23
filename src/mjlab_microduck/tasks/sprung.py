@@ -26,6 +26,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from mjlab_microduck.robot.sprung_foot import (
     H_ADD,
+    PAD_MASS,
     SPRING_JOINTS,
     TRAVEL,
     make_sprung_foot_robot_cfg,
@@ -45,13 +46,14 @@ def make_sprung_variant(
     stiffness: float,
     travel: float = TRAVEL,
     h_add: float = H_ADD,
+    pad_mass: float = PAD_MASS,
 ) -> ManagerBasedRlEnvCfg:
     """Convert a Run-task env cfg into its sprung-foot counterpart."""
     # 1. Robot.
     cfg.scene.entities = {
         **cfg.scene.entities,
         "robot": make_sprung_foot_robot_cfg(
-            stiffness=stiffness, travel=travel, h_add=h_add
+            stiffness=stiffness, travel=travel, h_add=h_add, pad_mass=pad_mass
         ),
     }
 
@@ -88,36 +90,35 @@ def make_sprung_variant(
     return cfg
 
 
-# (label, stiffness N/m, travel m). The locked arm is the geometric control:
-# identical height and mass, zero compliance. It — not the 0.468 m/s rigid
-# baseline — is what the sprung arms are compared against, because the rigid
-# baseline differs in geometry as well as compliance.
+# STAGE 1 — mass budget. The design-space question is how heavy a boot can be
+# before the swing-inertia penalty eats the compliance benefit. k is held at the
+# measured prototype spring (3900 N/m, also near the stance-matched optimum) and
+# travel at the measured 12 mm, because both are near-decoupled from mass:
+# stance-matched k shifts only ~3150->3560 N/m across this whole mass range, and
+# travel_min ~ 2.485*t^2 is mass-independent.
 #
-# Grid revised for the measured Sarrus prototype (70 g/boot, 12 mm travel,
-# k=3920 N/m measured spring). The old grid (800/1500/2200/3000) is mostly
-# invalid at 877 g total with only 12 mm of travel: 800 and 1500 both bottom
-# out before doing useful work. k1500 is KEPT anyway as a deliberate
-# bottom-out marker (needs 14.3 mm of deflection at the 21.5 N landing peak,
-# more than the 12 mm available) — same role k800 played in the old grid.
-# k3900 is the spring actually built; k2500/k5500 bracket it.
+# The TWO locked arms are what make this a budget rather than a ranking:
+#   sprung vs locked at MATCHED mass -> compliance's benefit
+#   locked M30 vs locked M90         -> the pure mass penalty
+# Where those two curves cross is the mass constraint.
 #
-# The locked arm's stiffness is 3900 purely for tidiness (matching the built
-# spring) — it is INERT, since travel=0.0 omits the spring joint entirely (see
-# sprung_foot.py), so no force from this number ever reaches the model.
+# (label, stiffness N/m, travel m, pad_mass kg per boot).
 SWEEP_ARMS = (
-    ("locked", 3900.0, 0.0),
-    ("k1500", 1500.0, TRAVEL),   # deliberate bottom-out marker: needs 14.3 mm
-    ("k2500", 2500.0, TRAVEL),
-    ("k3900", 3900.0, TRAVEL),   # the spring Steve actually built
-    ("k5500", 5500.0, TRAVEL),
+    ("m30_locked",  3900.0, 0.0,    0.030),
+    ("m90_locked",  3900.0, 0.0,    0.090),
+    ("m30_k3900",   3900.0, TRAVEL, 0.030),
+    ("m50_k3900",   3900.0, TRAVEL, 0.050),
+    ("m70_k3900",   3900.0, TRAVEL, 0.070),   # the built prototype
+    ("m90_k3900",   3900.0, TRAVEL, 0.090),
 )
 
 ARM_TASK_SUFFIX = {
-    "locked": "Locked",
-    "k1500": "K1500",
-    "k2500": "K2500",
-    "k3900": "K3900",
-    "k5500": "K5500",
+    "m30_locked": "M30-Locked",
+    "m90_locked": "M90-Locked",
+    "m30_k3900": "M30-K3900",
+    "m50_k3900": "M50-K3900",
+    "m70_k3900": "M70-K3900",
+    "m90_k3900": "M90-K3900",
 }
 
 
@@ -126,7 +127,7 @@ def sprung_rl_cfg(label: str):
 
     ``replace`` is shallow, so deepcopy the nested cfgs — otherwise every arm
     would share one actor object and a later change to any of them would alter
-    all five plus the Run baseline.
+    all six plus the Run baseline.
     """
     return replace(
         MicroduckRunRlCfg,

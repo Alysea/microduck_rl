@@ -1,4 +1,4 @@
-# Spec — Phase 2: sprung-foot stiffness study
+# Spec — Phase 2: sprung-foot design-space search
 
 Branch: `spring_v2`.
 Follows `2026-08-17-sprung-running-design.md` and its results in
@@ -6,18 +6,32 @@ Follows `2026-08-17-sprung-running-design.md` and its results in
 
 ## Goal
 
-Find the **useful (stiffness, travel) window** for a compliant foot on the
-MicroDuck, and hand the hardware phase a target spec instead of a guess.
+Find the **constraints on (mass, stiffness, travel)** that produce good
+compliant-foot behaviour on the MicroDuck, and hand the hardware phase a
+target spec instead of a guess.
 
 Phase 2 was originally "design the spring mechanism". It is now a simulation
-study, because the mechanism cannot be chosen well before the stiffness is
+study, because the mechanism cannot be chosen well before the design point is
 known — a stiff, short-travel result and a soft, long-travel result imply
-different mechanisms.
+different mechanisms, and likewise a boot that must stay under some mass
+budget rules out mechanisms a heavier boot could use.
+
+This is a **design-space search**, not a validation of the built prototype.
+The Sarrus boot that has been measured (70 g, 12 mm travel, k≈3920 N/m) is an
+early proof-of-principle and one datapoint on that space — a nominal point to
+calibrate the sim against, not a fixed property to defend. The question this
+phase answers is what the *next* boot should be built to, and analysis below
+(see "Design-space structure") shows the three axes are not equally free:
+travel is effectively fixed by geometry that already exists, stiffness tracks
+mass almost for free once travel is fixed, and mass is the axis actually worth
+spending a sweep on. That is why the study is staged (mass, then stiffness,
+then — likely unnecessary — travel) rather than run as a single sweep or a
+full factorial.
 
 ## Framed decisions
 
-1. **Sim first.** The sweep's output is a `(k, travel)` target that constrains
-   mechanism design.
+1. **Sim first.** The sweep's output is a `(mass, k, travel)` target that
+   constrains mechanism design.
 2. **Simulatability is a first-class design criterion, not a convenience.**
    The whole programme is sim-driven RL, so a mechanism that MuJoCo cannot model
    exactly is a mechanism whose experiment cannot be trusted. This is why the
@@ -106,6 +120,58 @@ and `damping`. The sweep is therefore valid for either, and the mechanism can
 be chosen on manufacturing grounds later without invalidating any result. That
 is the concrete payoff of decision 2, and the reason deferring costs nothing.
 
+## Design-space structure: why mass is the binding axis
+
+Before spending sweeps, it is worth asking algebraically which of the three
+axes (mass, stiffness, travel) actually constrains the design and which are
+along for the ride.
+
+**Stance-matching pins stiffness to mass and stance time.** Treating the
+stance phase as a quarter period of a mass-spring oscillator,
+`t ~= pi*sqrt(m/k)`, so a spring tuned to match a given stance time `t` must
+satisfy
+
+```
+k ~= pi^2 * m / t^2
+```
+
+**Avoiding bottom-out sets a minimum travel.** The peak running load is taken
+as `2.5 * m * g` (a 2.5x body-weight landing peak), so the deflection at that
+peak must not exceed the available travel:
+
+```
+travel >= 2.5 * m * g / k
+```
+
+Substituting the stance-matched `k` from above, **mass cancels**:
+
+```
+travel_min ~= 2.5 * m * g / (pi^2 * m / t^2) = (2.5 * g / pi^2) * t^2 ~= 2.485 * t^2
+```
+
+`travel_min` depends only on the stance time being matched, not on mass. At
+the measured 12 mm of travel, solving for `t` gives `t ~= sqrt(0.012 / 2.485)
+~= 0.0695 s`, i.e. **12 mm of travel supports stance-matched compliance up to
+~69 ms of stance time.** The rigid gait's measured stance is ~51 ms, comfortably
+under that ceiling. **Travel is therefore not the binding axis for this
+robot's actual gait speed** — it would only bind for a much slower, longer-stance
+gait than this robot runs (see the SLIP-band correction below).
+
+**Stiffness and mass are nearly decoupled over the mass range this study
+sweeps.** Moving the pad mass from 30 g to 90 g moves total robot mass from
+0.797 kg to 0.917 kg — only ~15%. Since stance-matched `k` is linear in `m` at
+fixed `t`, the stance-matched stiffness across that whole range shifts only
+~3150 -> 3560 N/m — a small correction relative to the built spring's k=3900,
+and small enough that a single stiffness (the measured prototype's) is a
+reasonable common value to hold across a mass sweep.
+
+**Conclusion: mass is the axis actually worth sweeping.** Travel is
+oversized relative to what this robot's gait needs, and stiffness barely moves
+across the mass range of interest. What is NOT yet known is how heavy a boot
+can get before its swing-inertia penalty (see "It adds distal mass" below)
+eats the compliance benefit — that is a question about mass, not about
+stiffness or travel, hence Stage 1's mass-budget sweep.
+
 ## Load and stiffness analysis
 
 **Updated for the measured Sarrus prototype.** The boot has now been built and
@@ -150,17 +216,30 @@ deflection is `F/k - 0.00074`) shifts these down slightly: 13.6 mm at k=1500
 k1500 is retained in the sweep specifically *because* it bottoms out — a
 deliberate marker, replacing the role k=800 played in the old grid.
 
-**A new finding this measurement forces onto the table: the biological SLIP
-band is out of reach.** The classic dimensionless SLIP stiffness for running
-gaits is `k~ = k*L0/(m*g)` in the range 10-30. At this mass (0.877 kg) and a
-leg length `L0` of 0.155 m, that band is **k = 555-1665 N/m**. The softest end
-of that band (k=555) needs `w/k = 8.60/555 ~= 15.5 mm` of deflection from
-static single support *alone* — before any running load is added. **With only
-12 mm of stroke, the mechanism cannot operate in the biological SLIP band at
-all.** This boot is therefore committed to stiffer-than-biological compliance:
-a shorter, harder stance rather than a bouncy one. If SLIP-like bounce is ever
-wanted, more travel — not a softer spring within the current stroke — is the
-design lever.
+**A finding this measurement forces onto the table, corrected below: the
+biological SLIP band is out of reach for a long-stance gait, but that is not
+the same as saying it is out of reach for this robot.** The classic
+dimensionless SLIP stiffness for running gaits is `k~ = k*L0/(m*g)` in the
+range 10-30. At this mass (0.877 kg) and a leg length `L0` of 0.155 m, that
+band is **k = 555-1665 N/m**, which corresponds to stance times of roughly
+**76-134 ms** (`t ~= pi*sqrt(m/k)` over that k range). The softest end of that
+band (k=555) needs `w/k = 8.60/555 ~= 15.5 mm` of deflection from static
+single support *alone* — before any running load is added, more than the
+12 mm of stroke available.
+
+**Correction to an earlier draft of this spec:** that draft concluded from
+this "the mechanism cannot operate in the biological SLIP band at all," full
+stop. That is only true against the 76-134 ms stance the classic SLIP band
+implies — a much slower gait than this robot actually runs (~51 ms measured
+stance). The honest statement, per the design-space analysis above, is
+narrower: **12 mm of travel rules out *long-stance* biological compliance, not
+compliance at this robot's actual gait speed** — at ~51 ms stance, 12 mm of
+travel is comfortably sufficient (the ceiling is ~69 ms). This boot is
+committed to stiffer-than-biological-SLIP-band compliance only in the sense
+that it cannot slow down to a bouncier, longer-stance gait and still fit its
+travel; it is not committed to a harder stance than the gait it actually runs
+calls for. If a bouncier, longer-stance gait were ever wanted, more travel —
+not a softer spring within the current stroke — is the design lever.
 
 The 2.9 N preload measured at k=3920 N/m is **0.74 mm** of precompression
 (`2.9 / 3920`). It is modelled as the spring joint's `springref`, not as extra
@@ -238,13 +317,35 @@ What it does mean is that the sprung arms differ from the rigid baseline in
 **four** ways, not three: height, mass, compliance, and foot contact geometry.
 Hence the next section.
 
-## The sweep
+## The sweep is staged, not a single grid
 
-**Five arms, 8000 iterations each**, matching the diagnostic-sweep protocol and
-compared over the 7000-8000 iteration window. Travel fixed at the measured
-**12 mm**, damping fixed low (0.5 N.s/m, representing a good steel spring —
-hardware hysteresis will be worse and is a hardware-phase concern, not a sweep
-axis).
+A single sweep or a full factorial over (mass, stiffness, travel) would be
+wasteful: the design-space analysis above shows travel is not binding at this
+robot's gait speed and stiffness barely moves across the mass range of
+interest, so most cells of even a modest 4x4x3 grid (mass x stiffness x
+travel) would be answering a question the algebra already answered for free.
+Instead the study runs in **stages**, each one informed by the previous:
+
+- **Stage 1 — mass budget (this change).** How heavy can the boot get before
+  the swing-inertia penalty eats the compliance benefit? k held at the
+  measured prototype spring (3900 N/m), travel held at the measured 12 mm,
+  because both are near-decoupled from mass over this range (see above). Mass
+  is the only variable.
+- **Stage 2 — stiffness confirmation (deferred).** Once Stage 1 has picked a
+  viable mass, confirm the stiffness choice around that mass by reusing the
+  1500/2500/3900/5500 N/m grid this campaign already built (see below) —
+  cheaper to re-run at the chosen mass than to have swept stiffness x mass
+  jointly from the start.
+- **Stage 3 — travel (likely unnecessary).** The `travel_min ~= 2.485*t^2`
+  result above says 12 mm already covers this robot's gait with margin, so
+  this stage is expected to confirm the measured travel rather than change it.
+  Only worth running if Stage 1 or 2 turn up a surprise the algebra didn't
+  predict.
+
+**Common protocol across stages**: 8000 iterations per arm, matching the
+diagnostic-sweep protocol, compared over the 7000-8000 iteration window.
+Damping fixed low (0.5 N.s/m, representing a good steel spring — hardware
+hysteresis will be worse and is a hardware-phase concern, not a sweep axis).
 
 For that "idealised spring" claim to be true of what is actually built, the
 spring joint's `frictionloss` and `armature` are **explicitly set to 0.0**
@@ -252,20 +353,45 @@ spring joint's `frictionloss` and `armature` are **explicitly set to 0.0**
 to be stated: the joint is created inside the `microduck` childclass, whose
 `<joint frictionloss="0.1" armature="0.005"/>` default it would otherwise
 inherit silently — a dry-friction term worth roughly a third of total
-dissipation, plus proportionally-scaled effective inertia on the now 70 g pad
-(invisible in the total-mass check). Uniform across arms, so the *ranking*
-would survive, but the absolute energy-return figure and the `(k, travel)`
-number handed to the hardware phase would both be wrong. Zero is not a claim
-about a real mechanism: stiction and mechanism inertia are hardware-phase
-concerns this spec defers. The one dissipative/reactive term that IS modelled
-now is the measured **preload** (`springref`), because unlike stiction it is
-intentional, not incidental.
+dissipation, plus proportionally-scaled effective inertia on the pad (invisible
+in the total-mass check). Uniform across arms, so the *ranking* would survive,
+but the absolute energy-return figure and the design point handed to the
+hardware phase would both be wrong. Zero is not a claim about a real
+mechanism: stiction and mechanism inertia are hardware-phase concerns this
+spec defers. The one dissipative/reactive term that IS modelled now is the
+measured **preload** (`springref`), because unlike stiction it is intentional,
+not incidental.
 
-The old grid (800/1500/2200/3000) is now mostly invalid: at 877 g total with
-only 12 mm of travel, 800 and 1500 both bottom out before doing useful work.
-Static sag and peak deflection below both include the preload (a spring does
-not start compressing until the applied force exceeds its own preload-holding
-force, `k * 0.00074 m`):
+### Stage 1 — mass budget
+
+**Six arms**: two locked (no spring joint) at the mass extremes, and four
+sprung arms at k=3900 N/m spanning the same mass range. `h_add` (30 mm) is
+identical across every arm — same mechanism geometry, lighter materials — so
+mass is isolated as the one variable.
+
+| Arm | pad mass (per boot) | total robot mass | travel | purpose |
+|---|---|---|---|---|
+| m30_locked | 30 g | 0.797 kg | 0 (locked) | mass-penalty floor |
+| m90_locked | 90 g | 0.917 kg | 0 (locked) | mass-penalty ceiling |
+| m30_k3900 | 30 g | 0.797 kg | 12 mm | compliance at light mass |
+| m50_k3900 | 50 g | 0.837 kg | 12 mm | interpolation point |
+| m70_k3900 | 70 g | 0.877 kg | 12 mm | **the built prototype's mass** |
+| m90_k3900 | 90 g | 0.917 kg | 12 mm | compliance at heavy mass |
+
+The two locked arms are what turn this into a **budget** rather than a
+ranking — see "The locked arm is the real control" below for how the pairing
+decomposes mass penalty from compliance benefit.
+
+### Stage 2 — stiffness confirmation (deferred, reuses this grid)
+
+The grid below was built for the single-mass (877 g, the built prototype)
+stiffness sweep this campaign ran before the mass axis was opened up. It is
+kept here as the input Stage 2 will reuse once Stage 1 picks a viable mass,
+rather than re-derived: the old grid (800/1500/2200/3000) is mostly invalid at
+877 g total with only 12 mm of travel — 800 and 1500 both bottom out before
+doing useful work. Static sag and peak deflection below both include the
+preload (a spring does not start compressing until the applied force exceeds
+its own preload-holding force, `k * 0.00074 m`):
 
 | Arm | k (N/m) | static sag (2-foot) | peak @ 21.5 N | purpose |
 |---|---|---|---|---|
@@ -281,10 +407,17 @@ two-foot load per foot (4.3 N), so the mechanism is predicted to sit
 essentially fully extended (q ~= 0) under ordinary standing load, not
 partially compressed — see FIX 5's settling measurement for confirmation.
 
-The locked arm's stiffness (3900) is set purely for tidiness, matching the
-built spring — it has **zero effect**, since `travel=0.0` omits the spring
-joint from the model entirely (see `make_sprung_foot_spec_fn` in
-`robot/sprung_foot.py`).
+The k1500 arm was included on purpose (the role k800 played in the grid
+before it): it should reproduce the abandoned branch's bottoming-out failure,
+validating the compression monitor and establishing the travel floor
+empirically rather than from the arithmetic above. When Stage 2 re-runs this
+grid at the mass Stage 1 picks, the same bottom-out marker logic applies —
+swap in whichever k, at that mass, is predicted to exceed the 12 mm stroke.
+
+The locked arm's stiffness (3900) in this grid is set purely for tidiness,
+matching the built spring — it has **zero effect**, since `travel=0.0` omits
+the spring joint from the model entirely (see `make_sprung_foot_spec_fn` in
+`robot/sprung_foot.py`). The same is true of both Stage 1 locked arms.
 
 ### The locked arm is the real control
 
@@ -307,16 +440,38 @@ pad, (2) is also a materially bigger confound than assumed — see the
 actuation-bandwidth tension noted above.
 
 **The locked arm controls for all four.** It carries the same +30 mm, the same
-+70 g, and — crucially — **the same pad**, with no compliance. So sprung-vs-
+mass, and — crucially — **the same pad**, with no compliance. So sprung-vs-
 locked isolates variable (3) alone, which is the hypothesis. **The hypothesis is
 tested as sprung vs locked.** The 0.468 m/s figure remains a useful reference for
 how much the geometry (1, 2 and 4 together) costs, but it is not the control —
 and this four-way difference is precisely why.
 
-The k1500 arm is included on purpose (the role k800 played in the old grid): it
-should reproduce the abandoned branch's bottoming-out failure, validating the
-compression monitor and establishing the travel floor empirically rather than
-from the arithmetic above.
+### The two-locked-arm decomposition (Stage 1)
+
+Stage 1 sweeps mass, which the single-locked-arm design above did not need to
+handle: mass was fixed at the built prototype's 70 g, so one locked arm was
+enough to control for it. Once mass is a swept axis, "the locked arm" has to
+become **two** locked arms — one at each mass extreme (`m30_locked`,
+`m90_locked`) — because a single locked arm can only control for *its own*
+mass, not for mass in general.
+
+With two locked arms, Stage 1's six-arm grid decomposes into two orthogonal
+comparisons, each holding one variable fixed:
+
+- **sprung vs locked at matched mass** (e.g. `m30_k3900` vs `m30_locked`, or
+  `m90_k3900` vs `m90_locked`) — mass is identical on both sides, so the gap
+  is **compliance's benefit at that mass**, exactly as sprung-vs-locked
+  isolated compliance in the single-mass design.
+- **locked vs locked across mass** (`m30_locked` vs `m90_locked`) — compliance
+  is absent from both sides (travel=0 on both), so the gap is the **pure mass
+  penalty**: added swing inertia and static load, with no compliance to offset
+  it.
+
+Plotting both comparisons against mass gives two curves — a "compliance
+benefit" curve and a "mass penalty" curve — and **where they cross is the mass
+constraint**: the heaviest boot for which compliance's benefit still exceeds
+the mass penalty it drags in. That crossing point is the number this stage
+exists to produce.
 
 ## Implementation
 
@@ -345,11 +500,13 @@ Follows paths already proven in this repo:
    `RewardManager.compute` short-circuits before calling terms whose weight is
    0.0, which would silently disable it.
 4. **Registration** — one task id per sweep arm
-   (`Mjlab-Run-Flat-Sprung-K1500-MicroDuck`, ...). MuJoCo joint stiffness lives
-   in the model rather than the env cfg, so it is not CLI-overridable the way
-   the reward params were; a spec-edit parameter on the factory plus one id per
-   arm keeps it declarative and needs no new plumbing. Explicitly throwaway
-   scaffolding for the sweep.
+   (`Mjlab-Run-Flat-Sprung-M30-K3900-MicroDuck`, ...). MuJoCo joint stiffness
+   and the pad's mass both live in the model rather than the env cfg, so
+   neither is CLI-overridable the way the reward params were; a spec-edit
+   parameter on the factory plus one id per arm keeps it declarative and needs
+   no new plumbing. Explicitly throwaway scaffolding for the sweep — expect
+   `SWEEP_ARMS` to be replaced wholesale when Stage 2 (and, if needed, Stage 3)
+   run.
 5. **Tests** — `tests/test_sprung.py` (monitor logic on synthetic tensors) and
    `tests/test_sprung_cfg.py` (joints named `passive_*`; stiffness and travel
    reach the model; the CoM band is shifted by exactly `H_add`; the monitor's
@@ -364,15 +521,18 @@ Follows paths already proven in this repo:
    low even on a healthy spring. A sprung model that never deflects, or that
    rides its hard stop, is measuring nothing. This is the first thing to check,
    before any speed number.
-2. **A stiffness that beats the locked arm on `forward_speed_mean`**, with
-   `flight_asymmetry` holding near 0.70 — faster *and* still alternating, not
-   faster by degenerating into a bounce.
-3. **A `(k, travel)` target for the hardware**: the best k, and the travel it
-   actually consumed.
+2. **A mass at which the sprung arm beats its matched-mass locked arm on
+   `forward_speed_mean`**, with `flight_asymmetry` holding near 0.70 — faster
+   *and* still alternating, not faster by degenerating into a bounce. Stage 1
+   answers this per the two-locked-arm decomposition above: the mass budget is
+   wherever the compliance-benefit curve stops beating the mass-penalty curve.
+3. **A `(mass, k, travel)` target for the hardware**: the heaviest mass at
+   which compliance still wins, the k that produces that win (Stage 2), and
+   the travel it actually consumed (Stage 3, if run).
 
-If no arm beats the locked control, that is a real answer: passive foot
-compliance does not help this robot within this smoothness budget, and the
-mechanism phase should not be entered.
+If no sprung arm beats its matched-mass locked arm at any mass in the grid,
+that is a real answer: passive foot compliance does not help this robot within
+this smoothness budget, and the mechanism phase should not be entered.
 
 ## Out of scope
 

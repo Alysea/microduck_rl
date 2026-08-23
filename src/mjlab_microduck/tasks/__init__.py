@@ -131,7 +131,7 @@ print("✓ Run task registered: Mjlab-Run-Rough-MicroDuck")
 
 # Sprung-foot stiffness sweep — Phase 2. See
 # docs/superpowers/specs/2026-08-20-sprung-foot-design.md
-for _label, _k, _travel in SWEEP_ARMS:
+for _label, _k, _travel, _pad_mass in SWEEP_ARMS:
     _tid = f"Mjlab-Run-Flat-Sprung-{ARM_TASK_SUFFIX[_label]}-MicroDuck"
     register_mjlab_task(
         task_id=_tid,
@@ -139,11 +139,13 @@ for _label, _k, _travel in SWEEP_ARMS:
             make_run_variant(make_microduck_velocity_env_cfg()),
             stiffness=_k,
             travel=_travel,
+            pad_mass=_pad_mass,
         ),
         play_env_cfg=make_sprung_variant(
             make_run_variant(make_microduck_velocity_env_cfg(play=True)),
             stiffness=_k,
             travel=_travel,
+            pad_mass=_pad_mass,
         ),
         rl_cfg=sprung_rl_cfg(_label),
         runner_cls=MicroduckOnPolicyRunner,

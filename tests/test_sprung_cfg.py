@@ -1,5 +1,7 @@
 """Config-level assertions for the sprung-foot variant transform."""
 
+import mujoco
+import numpy as np
 import pytest
 
 from mjlab_microduck.robot.sprung_foot import H_ADD, SPRING_JOINTS, TRAVEL
@@ -114,15 +116,23 @@ def test_action_rate_curriculum_is_untouched():
 
 
 def test_sweep_arms_cover_the_spec_grid():
+    """Stage 1 is a mass budget: k and travel are held fixed and mass sweeps."""
     from mjlab_microduck.tasks.sprung import SWEEP_ARMS
 
     labels = [a[0] for a in SWEEP_ARMS]
-    assert "locked" in labels, "the locked arm is the geometric control"
-    stiffnesses = {a[1] for a in SWEEP_ARMS if a[0] != "locked"}
-    assert stiffnesses == {1500.0, 2500.0, 3900.0, 5500.0}
-    # The locked arm must have zero travel; every other arm must have some.
-    for label, _k, travel in SWEEP_ARMS:
-        if label == "locked":
+    assert "m30_locked" in labels and "m90_locked" in labels, (
+        "the two locked arms are the geometric+mass control pair"
+    )
+    # k is held at the measured prototype spring for every arm.
+    stiffnesses = {a[1] for a in SWEEP_ARMS}
+    assert stiffnesses == {3900.0}
+    # Mass is the swept axis: exactly {0.030, 0.050, 0.070, 0.090} kg, with the
+    # two locked masses (30, 90) each reused by a sprung arm at the same mass.
+    masses = {a[3] for a in SWEEP_ARMS}
+    assert masses == {0.030, 0.050, 0.070, 0.090}
+    # The locked arms must have zero travel; every sprung arm must have some.
+    for label, _k, travel, _m in SWEEP_ARMS:
+        if label.endswith("_locked"):
             assert travel == 0.0
         else:
             assert travel > 0.0
@@ -134,11 +144,12 @@ def test_all_sweep_task_ids_registered():
 
     tasks = list_tasks()
     for tid in (
-        "Mjlab-Run-Flat-Sprung-Locked-MicroDuck",
-        "Mjlab-Run-Flat-Sprung-K1500-MicroDuck",
-        "Mjlab-Run-Flat-Sprung-K2500-MicroDuck",
-        "Mjlab-Run-Flat-Sprung-K3900-MicroDuck",
-        "Mjlab-Run-Flat-Sprung-K5500-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-M30-Locked-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-M90-Locked-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-M30-K3900-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-M50-K3900-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-M70-K3900-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-M90-K3900-MicroDuck",
     ):
         assert tid in tasks, f"{tid} not registered"
 
@@ -150,9 +161,9 @@ def test_sweep_arms_use_distinct_experiment_names():
 
     names = {
         load_rl_cfg(f"Mjlab-Run-Flat-Sprung-{s}-MicroDuck").run_name
-        for s in ("Locked", "K1500", "K2500", "K3900", "K5500")
+        for s in ("M30-Locked", "M90-Locked", "M30-K3900", "M50-K3900", "M70-K3900", "M90-K3900")
     }
-    assert len(names) == 5
+    assert len(names) == 6
 
 
 def test_sweep_arms_do_not_share_learner_cfg_objects():
@@ -168,8 +179,8 @@ def test_sweep_arms_do_not_share_learner_cfg_objects():
     from mjlab_microduck.tasks.run import MicroduckRunRlCfg
     from mjlab_microduck.tasks.sprung import sprung_rl_cfg
 
-    a = sprung_rl_cfg("k1500")
-    b = sprung_rl_cfg("k2500")
+    a = sprung_rl_cfg("m30_k3900")
+    b = sprung_rl_cfg("m50_k3900")
 
     for field in ("actor", "critic", "algorithm"):
         assert getattr(a, field) is not getattr(b, field), f"{field} shared between arms"
@@ -184,3 +195,94 @@ def test_sweep_arms_do_not_share_learner_cfg_objects():
         == MicroduckRunRlCfg.actor.distribution_cfg["class_name"]
     )
     assert a.run_name != b.run_name
+
+
+def test_pad_mass_reaches_the_compiled_model():
+    """FIX 1: pad_mass must thread through make_sprung_variant to the spec,
+    not stop at the cfg layer.
+    """
+    m_a, m_b = 0.030, 0.090
+    cfg_a = make_sprung_variant(
+        make_run_variant(make_microduck_velocity_env_cfg()),
+        stiffness=3900.0, travel=TRAVEL, pad_mass=m_a,
+    )
+    cfg_b = make_sprung_variant(
+        make_run_variant(make_microduck_velocity_env_cfg()),
+        stiffness=3900.0, travel=TRAVEL, pad_mass=m_b,
+    )
+    model_a = cfg_a.scene.entities["robot"].spec_fn().compile()
+    model_b = cfg_b.scene.entities["robot"].spec_fn().compile()
+
+    # Two pads (left + right foot), so the total-mass delta is 2x the per-pad
+    # mass delta.
+    assert model_a.body_mass.sum() - model_b.body_mass.sum() == pytest.approx(
+        2 * (m_a - m_b), abs=1e-6
+    )
+
+
+def test_two_locked_arms_differ_only_in_mass():
+    """The two locked arms (m30_locked, m90_locked) are the pure mass-penalty
+    pair: same mechanism geometry, no compliance, only mass differs.
+    """
+    from mjlab_microduck.tasks.sprung import SWEEP_ARMS
+
+    arms = {label: (k, travel, m) for label, k, travel, m in SWEEP_ARMS}
+    k30, t30, m30 = arms["m30_locked"]
+    k90, t90, m90 = arms["m90_locked"]
+    assert t30 == 0.0 and t90 == 0.0
+
+    cfg30 = make_sprung_variant(
+        make_run_variant(make_microduck_velocity_env_cfg()),
+        stiffness=k30, travel=t30, pad_mass=m30,
+    )
+    cfg90 = make_sprung_variant(
+        make_run_variant(make_microduck_velocity_env_cfg()),
+        stiffness=k90, travel=t90, pad_mass=m90,
+    )
+    model30 = cfg30.scene.entities["robot"].spec_fn().compile()
+    model90 = cfg90.scene.entities["robot"].spec_fn().compile()
+
+    # Neither locked arm has a spring joint.
+    for name in SPRING_JOINTS:
+        assert mujoco.mj_name2id(model30, mujoco.mjtObj.mjOBJ_JOINT, name) == -1
+        assert mujoco.mj_name2id(model90, mujoco.mjtObj.mjOBJ_JOINT, name) == -1
+
+    # Same jnt_range across every remaining joint (identical joint topology).
+    assert model30.njnt == model90.njnt
+    assert np.allclose(model30.jnt_range, model90.jnt_range)
+
+    # Same h_add: the pad sits at the same local offset under the ankle.
+    pad30 = mujoco.mj_name2id(model30, mujoco.mjtObj.mjOBJ_BODY, "left_foot_pad")
+    pad90 = mujoco.mj_name2id(model90, mujoco.mjtObj.mjOBJ_BODY, "left_foot_pad")
+    assert np.allclose(model30.body_pos[pad30], model90.body_pos[pad90])
+
+    # Same CoM band (h_add-driven, not mass-driven).
+    p30 = cfg30.rewards["com_height_target"].params
+    p90 = cfg90.rewards["com_height_target"].params
+    assert p30["target_height_min"] == pytest.approx(p90["target_height_min"])
+    assert p30["target_height_max"] == pytest.approx(p90["target_height_max"])
+
+    # Mass is the ONE thing that differs.
+    assert model90.body_mass.sum() - model30.body_mass.sum() == pytest.approx(
+        2 * (m90 - m30), abs=1e-6
+    )
+
+
+def test_all_six_arms_share_the_same_com_band():
+    """Mass must not perturb the CoM band — only h_add does, and h_add is
+    identical (0.030) across every Stage 1 arm.
+    """
+    from mjlab_microduck.tasks.sprung import SWEEP_ARMS
+
+    bands = set()
+    for _label, k, travel, pad_mass in SWEEP_ARMS:
+        cfg = make_sprung_variant(
+            make_run_variant(make_microduck_velocity_env_cfg()),
+            stiffness=k, travel=travel, pad_mass=pad_mass,
+        )
+        params = cfg.rewards["com_height_target"].params
+        bands.add((
+            round(params["target_height_min"], 9),
+            round(params["target_height_max"], 9),
+        ))
+    assert len(bands) == 1, f"CoM band must be identical across all arms: {bands}"
