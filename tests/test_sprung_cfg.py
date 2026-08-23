@@ -119,7 +119,7 @@ def test_sweep_arms_cover_the_spec_grid():
     labels = [a[0] for a in SWEEP_ARMS]
     assert "locked" in labels, "the locked arm is the geometric control"
     stiffnesses = {a[1] for a in SWEEP_ARMS if a[0] != "locked"}
-    assert stiffnesses == {800.0, 1500.0, 2200.0, 3000.0}
+    assert stiffnesses == {1500.0, 2500.0, 3900.0, 5500.0}
     # The locked arm must have zero travel; every other arm must have some.
     for label, _k, travel in SWEEP_ARMS:
         if label == "locked":
@@ -135,10 +135,10 @@ def test_all_sweep_task_ids_registered():
     tasks = list_tasks()
     for tid in (
         "Mjlab-Run-Flat-Sprung-Locked-MicroDuck",
-        "Mjlab-Run-Flat-Sprung-K800-MicroDuck",
         "Mjlab-Run-Flat-Sprung-K1500-MicroDuck",
-        "Mjlab-Run-Flat-Sprung-K2200-MicroDuck",
-        "Mjlab-Run-Flat-Sprung-K3000-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-K2500-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-K3900-MicroDuck",
+        "Mjlab-Run-Flat-Sprung-K5500-MicroDuck",
     ):
         assert tid in tasks, f"{tid} not registered"
 
@@ -150,7 +150,7 @@ def test_sweep_arms_use_distinct_experiment_names():
 
     names = {
         load_rl_cfg(f"Mjlab-Run-Flat-Sprung-{s}-MicroDuck").run_name
-        for s in ("Locked", "K800", "K1500", "K2200", "K3000")
+        for s in ("Locked", "K1500", "K2500", "K3900", "K5500")
     }
     assert len(names) == 5
 
@@ -168,8 +168,8 @@ def test_sweep_arms_do_not_share_learner_cfg_objects():
     from mjlab_microduck.tasks.run import MicroduckRunRlCfg
     from mjlab_microduck.tasks.sprung import sprung_rl_cfg
 
-    a = sprung_rl_cfg("k800")
-    b = sprung_rl_cfg("k1500")
+    a = sprung_rl_cfg("k1500")
+    b = sprung_rl_cfg("k2500")
 
     for field in ("actor", "critic", "algorithm"):
         assert getattr(a, field) is not getattr(b, field), f"{field} shared between arms"

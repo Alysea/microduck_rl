@@ -108,33 +108,71 @@ is the concrete payoff of decision 2, and the reason deferring costs nothing.
 
 ## Load and stiffness analysis
 
-Robot mass is **0.737 kg** (summed body masses in `robot_walk.xml`); standing
-trunk height 0.125 m. Static load is ~3.6 N per foot on two feet, ~7.2 N in
-single support, and perhaps 18 N at a 2.5x body-weight running peak.
+**Updated for the measured Sarrus prototype.** The boot has now been built and
+measured: **70 g per boot** (was assumed 20 g), **30 mm** of added height (was
+assumed 25 mm), **12 mm** of travel (was assumed 15 mm). The spring itself was
+measured at two points (3 mm -> 1500 g, 8 mm -> 3500 g) and fits to
+**k ~= 3920 N/m with a 2.9 N force offset at zero deflection** — confirmed to be
+*intentional preload* built into the Sarrus linkage's assembly geometry, not
+stiction. Numbers below are recomputed from these measurements, not the
+original assumptions.
 
-Three independent arguments all point at **stiff**:
+Robot mass is **0.737 kg** rigid (summed body masses in `robot_walk.xml`), so
+the sprung robot is **0.737 + 2 x 0.070 = 0.877 kg**. Weight is 8.60 N; static
+load is 4.30 N per foot on two feet, 8.60 N in single support, and ~21.5 N at a
+2.5x body-weight running peak.
 
-1. **Asymmetric failure.** Too stiff degrades gracefully toward the rigid
-   baseline — nothing is lost. Too soft sinks, drags stance, compromises
-   push-off and bottoms out. Prefer the harmless failure.
-2. **Stance-time matching.** A SLIP spring's stance is `t ~ pi*sqrt(m/k)`. The
-   measured baseline gait (`flight_fraction` 0.221 -> per-leg duty ~0.39, with
-   `air_time_mean` 0.0795 s -> step period ~0.130 s) has a stance of **~51 ms**,
-   which corresponds to k ~ 2800 N/m. Softer springs lengthen stance — a
-   legitimate gait change that also demands less actuation bandwidth — but are a
-   larger departure from what already works.
-3. **The CoM reward sets a floor.** `com_height_target` holds the trunk in
-   0.11-0.14 m and is currently satisfied ~97% of the time. Static sag eats into
-   that: below roughly **240 N/m** the robot sags out of band while merely
-   standing. This retroactively explains the abandoned branch, whose 500 N/m was
-   close enough to that floor to be fighting the CoM reward *and* bottoming out
-   at the same time.
+Three independent arguments still point at **stiff**, now re-run against the
+measured numbers:
 
-**Travel is 15 mm, not 25.** 25 mm is 20% of standing height inside a foot
-region only ~26 mm tall — the mechanism would nearly fully collapse. 15 mm is
-self-consistent with the stiffness answer, since less travel forces a stiffer
-spring: keeping peak deflection under 12 mm at an 18 N peak needs
-**k >= 1500 N/m**, which is the same figure argument 2 reached independently.
+1. **Asymmetric failure.** Unchanged: too stiff degrades gracefully toward the
+   rigid baseline; too soft sinks, drags stance, and bottoms out. Prefer the
+   harmless failure.
+2. **Stance-time matching.** `t ~ pi*sqrt(m/k)` at m = 0.877 kg: **76 ms at
+   k=1500, 59 ms at k=2500, 47 ms at k=3900, 40 ms at k=5500**. The rigid gait's
+   measured stance is ~51 ms, so **k=3900 — the spring Steve actually built —
+   sits closest**, which is a useful cross-check that the built spring landed
+   near the value this analysis would have picked anyway.
+3. **The CoM reward sets a floor.** Unchanged in kind: `com_height_target`
+   holds the trunk in a band (now shifted by `H_ADD`, see below) and static sag
+   below some stiffness will violate it while merely standing. Not recomputed
+   here — the earlier ~240 N/m floor was for a 0.737 kg robot on two feet; at
+   0.877 kg the floor is proportionally higher but still well under every arm in
+   the new grid.
+
+**Peak deflection at the 21.5 N landing peak** (ignoring the small preload
+offset, i.e. `F/k`): **14.3 mm at k=1500 — exceeds the 12 mm of travel and
+bottoms out**, 8.6 mm at k=2500, 5.5 mm at k=3900, 3.9 mm at k=5500. Including
+the preload (the mechanism doesn't start compressing until the applied force
+exceeds the preload's own holding force, `k * 0.00074 m`, so the usable
+deflection is `F/k - 0.00074`) shifts these down slightly: 13.6 mm at k=1500
+(still bottoms out), 7.9 mm at k=2500, **4.8 mm at k=3900**, 3.2 mm at k=5500.
+k1500 is retained in the sweep specifically *because* it bottoms out — a
+deliberate marker, replacing the role k=800 played in the old grid.
+
+**A new finding this measurement forces onto the table: the biological SLIP
+band is out of reach.** The classic dimensionless SLIP stiffness for running
+gaits is `k~ = k*L0/(m*g)` in the range 10-30. At this mass (0.877 kg) and a
+leg length `L0` of 0.155 m, that band is **k = 555-1665 N/m**. The softest end
+of that band (k=555) needs `w/k = 8.60/555 ~= 15.5 mm` of deflection from
+static single support *alone* — before any running load is added. **With only
+12 mm of stroke, the mechanism cannot operate in the biological SLIP band at
+all.** This boot is therefore committed to stiffer-than-biological compliance:
+a shorter, harder stance rather than a bouncy one. If SLIP-like bounce is ever
+wanted, more travel — not a softer spring within the current stroke — is the
+design lever.
+
+The 2.9 N preload measured at k=3920 N/m is **0.74 mm** of precompression
+(`2.9 / 3920`). It is modelled as the spring joint's `springref`, not as extra
+stiffness or an added force term — see `robot/sprung_foot.py::SPRING_PRELOAD`.
+Because it is parameterised as a displacement (fixed by the linkage geometry at
+assembly) rather than a force, preload force scales with the swept stiffness:
+**1.1 N at k=1500, 4.1 N at k=5500.** That is a physically faithful consequence
+of the design, not a modelling artifact.
+
+The prototype is explicitly a rough, unoptimised first build, so **70 g should
+be read as a pessimistic mass figure** — a refined mechanism is expected to
+weigh less, not more.
 
 ## Height offset is a first-class parameter
 
@@ -143,23 +181,39 @@ front that height is only one of **four** ways a sprung arm differs from the
 rigid 0.468 m/s baseline — height, mass, compliance, and **foot contact
 geometry** (see "The foot contact geometry also changes" below):
 
-- **It shifts the CoM out of the reward band.** At a nominal +25 mm the trunk
-  stands at 0.150 m against a 0.11-0.14 m band, so the sprung robot would be
-  penalised for being tall before compliance is in play. The band must shift by
+- **It shifts the CoM out of the reward band.** At the measured +30 mm the
+  trunk stands 30 mm taller than rigid, so the sprung robot would be penalised
+  for being tall before compliance is in play. The band must shift by
   *exactly* the geometric offset, preserving width — an equivalent
   normalisation, not a reward change.
-- **It changes leg length**, so `k~ = k*L0/mg` shifts (at L0 = 0.150 m,
-  k = 1500 N/m gives k~ = 31) and Froude numbers for a given speed change.
+- **It changes leg length**, so `k~ = k*L0/mg` shifts (at L0 = 0.155 m and the
+  built spring, k = 3900 N/m gives k~ ~= 70 — well above the 10-30 SLIP band,
+  consistent with the new finding above that this boot cannot run
+  biologically) and Froude numbers for a given speed change.
 - **It raises the CoM**, lengthening moment arms and reducing stability. This is
   a genuine physical consequence of the design, so it belongs in the model.
 - **It adds distal mass** — the worst place to add it, since it is paid through
   the whole swing. The mechanism's own mass must be modelled, not idealised
-  away.
+  away. Measured, this is worse than assumed: **70 g per boot is a 19% increase
+  in total robot mass (0.737 -> 0.877 kg), concentrated entirely in the foot**
+  — the existing `ankle_left` body is ~30 g, so foot mass rises **~3.3x**
+  (30 g -> 100 g). This creates real tension with this campaign's central
+  finding: Phase 1 established the rigid robot's plateau is
+  **actuation-bandwidth limited**, and passive compliance was attractive
+  precisely because it adds flight energy without costing actuation budget.
+  But 3.3x distal mass *increases* swing-torque demand against servos that are
+  already the binding constraint — the mechanism could be fighting the same
+  limitation it is meant to relieve. **The locked arm is what decomposes the
+  two effects**: locked-vs-rigid-baseline measures the boot's cost (added
+  height, mass, and contact geometry, with zero compliance), and
+  sprung-vs-locked measures compliance's benefit in isolation. Only the second
+  comparison speaks to whether the mechanism is worth its own weight.
 
-Nominal for the study: **`H_add` = 25 mm, mechanism mass 20 g per foot**, both
-stated as assumptions to be revised once a mechanism exists. Also requires the
-foot contact site and the per-foot terrain-height ray sensor to move down to the
-new pad, or `foot_clearance` / `foot_swing_height` will measure the wrong body.
+Measured for the study: **`H_ADD` = 30 mm, mechanism mass 70 g per foot,
+12 mm of travel** — no longer assumptions; see `robot/sprung_foot.py`. Also
+requires the foot contact site and the per-foot terrain-height ray sensor to
+move down to the new pad, or `foot_clearance` / `foot_swing_height` will
+measure the wrong body.
 
 ## The foot contact geometry also changes
 
@@ -187,9 +241,10 @@ Hence the next section.
 ## The sweep
 
 **Five arms, 8000 iterations each**, matching the diagnostic-sweep protocol and
-compared over the 7000-8000 iteration window. Travel fixed at 15 mm, damping
-fixed low (0.5 N.s/m, representing a good steel spring — hardware hysteresis
-will be worse and is a hardware-phase concern, not a sweep axis).
+compared over the 7000-8000 iteration window. Travel fixed at the measured
+**12 mm**, damping fixed low (0.5 N.s/m, representing a good steel spring —
+hardware hysteresis will be worse and is a hardware-phase concern, not a sweep
+axis).
 
 For that "idealised spring" claim to be true of what is actually built, the
 spring joint's `frictionloss` and `armature` are **explicitly set to 0.0**
@@ -197,19 +252,39 @@ spring joint's `frictionloss` and `armature` are **explicitly set to 0.0**
 to be stated: the joint is created inside the `microduck` childclass, whose
 `<joint frictionloss="0.1" armature="0.005"/>` default it would otherwise
 inherit silently — a dry-friction term worth roughly a third of total
-dissipation, plus 5 g of effective inertia on a 20 g pad (+25%, and invisible in
-the total-mass check). Uniform across arms, so the *ranking* would survive, but
-the absolute energy-return figure and the `(k, travel)` number handed to the
-hardware phase would both be wrong. Zero is not a claim about a real mechanism:
-stiction and mechanism inertia are hardware-phase concerns this spec defers.
+dissipation, plus proportionally-scaled effective inertia on the now 70 g pad
+(invisible in the total-mass check). Uniform across arms, so the *ranking*
+would survive, but the absolute energy-return figure and the `(k, travel)`
+number handed to the hardware phase would both be wrong. Zero is not a claim
+about a real mechanism: stiction and mechanism inertia are hardware-phase
+concerns this spec defers. The one dissipative/reactive term that IS modelled
+now is the measured **preload** (`springref`), because unlike stiction it is
+intentional, not incidental.
 
-| Arm | k (N/m) | static sag (2-foot) | peak @ 18 N | purpose |
+The old grid (800/1500/2200/3000) is now mostly invalid: at 877 g total with
+only 12 mm of travel, 800 and 1500 both bottom out before doing useful work.
+Static sag and peak deflection below both include the preload (a spring does
+not start compressing until the applied force exceeds its own preload-holding
+force, `k * 0.00074 m`):
+
+| Arm | k (N/m) | static sag (2-foot) | peak @ 21.5 N | purpose |
 |---|---|---|---|---|
-| **locked** | rigid (travel 0) | 0 | 0 | **geometric control** |
-| soft | 800 | 4.5 mm | 22.5 mm — bottoms out | deliberate failure case |
-| mid | 1500 | 2.4 mm | 12.0 mm | plausible |
-| stiff | 2200 | 1.6 mm | 8.2 mm | plausible |
-| very stiff | 3000 | 1.2 mm | 6.0 mm | approaches rigid |
+| **locked** | inert (3900, travel 0) | 0 | 0 | **geometric control** |
+| k1500 | 1500 | 2.1 mm | 13.6 mm — bottoms out | deliberate bottom-out marker |
+| k2500 | 2500 | 1.0 mm | 7.9 mm | plausible |
+| k3900 | 3900 | 0.4 mm | 4.8 mm | **the spring Steve actually built** |
+| k5500 | 5500 | ~0.0 mm | 3.2 mm | approaches rigid |
+
+Note how the preload changes the qualitative picture at the stiff end: at
+k=5500 the preload-holding force (4.1 N) is nearly equal to the static
+two-foot load per foot (4.3 N), so the mechanism is predicted to sit
+essentially fully extended (q ~= 0) under ordinary standing load, not
+partially compressed — see FIX 5's settling measurement for confirmation.
+
+The locked arm's stiffness (3900) is set purely for tidiness, matching the
+built spring — it has **zero effect**, since `travel=0.0` omits the spring
+joint from the model entirely (see `make_sprung_foot_spec_fn` in
+`robot/sprung_foot.py`).
 
 ### The locked arm is the real control
 
@@ -217,8 +292,9 @@ The 0.468 m/s baseline was measured on a robot **without** the added height,
 without the added mass, and on the **original mesh sole**. Comparing a sprung
 foot against it changes **four** things at once:
 
-1. **height** (+25 mm under the foot),
-2. **mass** (+20 g per foot, distal),
+1. **height** (+30 mm under the foot),
+2. **mass** (+70 g per foot, distal — a 19% total-mass increase, ~3.3x on the
+   foot alone),
 3. **compliance** (the spring itself), and
 4. **foot contact geometry** — a 40 x 28 x 8 mm box (`rbound` 0.0247) in place
    of the sole mesh (oriented-bbox 54.0 x 41.1 x 12.9 mm, `rbound` 0.0355):
@@ -226,18 +302,21 @@ foot against it changes **four** things at once:
    box-vs-mesh contact.
 
 That is exactly the attribution failure this campaign was restructured to avoid,
-and (4) is the one an earlier draft of this spec missed.
+and (4) is the one an earlier draft of this spec missed. With the measured 70 g
+pad, (2) is also a materially bigger confound than assumed — see the
+actuation-bandwidth tension noted above.
 
-**The locked arm controls for all four.** It carries the same +25 mm, the same
-+20 g, and — crucially — **the same pad**, with no compliance. So sprung-vs-
+**The locked arm controls for all four.** It carries the same +30 mm, the same
++70 g, and — crucially — **the same pad**, with no compliance. So sprung-vs-
 locked isolates variable (3) alone, which is the hypothesis. **The hypothesis is
 tested as sprung vs locked.** The 0.468 m/s figure remains a useful reference for
 how much the geometry (1, 2 and 4 together) costs, but it is not the control —
 and this four-way difference is precisely why.
 
-The soft arm is included on purpose: it should reproduce the abandoned branch's
-bottoming-out failure, validating the compression monitor and establishing the
-travel floor empirically rather than from the arithmetic above.
+The k1500 arm is included on purpose (the role k800 played in the old grid): it
+should reproduce the abandoned branch's bottoming-out failure, validating the
+compression monitor and establishing the travel floor empirically rather than
+from the arithmetic above.
 
 ## Implementation
 
@@ -266,7 +345,7 @@ Follows paths already proven in this repo:
    `RewardManager.compute` short-circuits before calling terms whose weight is
    0.0, which would silently disable it.
 4. **Registration** — one task id per sweep arm
-   (`Mjlab-Run-Flat-Sprung-K800-MicroDuck`, ...). MuJoCo joint stiffness lives
+   (`Mjlab-Run-Flat-Sprung-K1500-MicroDuck`, ...). MuJoCo joint stiffness lives
    in the model rather than the env cfg, so it is not CLI-overridable the way
    the reward params were; a spec-edit parameter on the factory plus one id per
    arm keeps it declarative and needs no new plumbing. Explicitly throwaway

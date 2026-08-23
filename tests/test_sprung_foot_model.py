@@ -14,6 +14,7 @@ from mjlab_microduck.robot.sprung_foot import (
     SPRING_ARMATURE,
     SPRING_FRICTIONLOSS,
     SPRING_JOINTS,
+    SPRING_PRELOAD,
     TRAVEL,
     make_sprung_foot_spec_fn,
 )
@@ -187,6 +188,38 @@ def test_spring_joint_does_not_inherit_xml_joint_defaults(model):
         assert model.dof_armature[dof] == pytest.approx(SPRING_ARMATURE)
         assert model.dof_frictionloss[dof] == 0.0
         assert model.dof_armature[dof] == 0.0
+
+
+def test_springref_encodes_the_preload(model):
+    """The Sarrus mechanism's intentional 0.74 mm precompression.
+
+    MuJoCo has no per-joint `jnt_springref` array on the compiled model (only
+    `qpos_spring`, indexed by qpos address); for a 1-dof slide joint that is
+    the same one number. Our sign convention is q=0 extended, q>0 compressed,
+    so the precompression is encoded as a NEGATIVE springref.
+    """
+    for j in SPRING_JOINTS:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+        adr = model.jnt_qposadr[jid]
+        assert model.qpos_spring[adr] == pytest.approx(-SPRING_PRELOAD)
+
+
+def test_preload_spring_force_opposes_compression_at_zero(model):
+    """Sign-convention check: at q=0 the spring must push toward EXTENSION
+    (negative q), i.e. it presses the pad against its own lower (extension)
+    stop rather than sagging into the travel. That is what "preload" means
+    physically: a spring that is already loaded at the unloaded (q=0) pose.
+    """
+    data = mujoco.MjData(model)
+    for j in SPRING_JOINTS:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+        dof = model.jnt_dofadr[jid]
+        data.qpos[model.jnt_qposadr[jid]] = 0.0
+    mujoco.mj_forward(model, data)
+    for j in SPRING_JOINTS:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+        dof = model.jnt_dofadr[jid]
+        assert data.qfrc_spring[dof] < 0.0
 
 
 def test_h_add_lowers_the_pad(model):

@@ -93,23 +93,31 @@ def make_sprung_variant(
 # baseline — is what the sprung arms are compared against, because the rigid
 # baseline differs in geometry as well as compliance.
 #
-# k=800 is expected to bottom out (22.5 mm of deflection at an 18 N peak against
-# 15 mm of travel). It is included deliberately: it should reproduce the
-# abandoned branch's failure and establish the travel floor empirically.
+# Grid revised for the measured Sarrus prototype (70 g/boot, 12 mm travel,
+# k=3920 N/m measured spring). The old grid (800/1500/2200/3000) is mostly
+# invalid at 877 g total with only 12 mm of travel: 800 and 1500 both bottom
+# out before doing useful work. k1500 is KEPT anyway as a deliberate
+# bottom-out marker (needs 14.3 mm of deflection at the 21.5 N landing peak,
+# more than the 12 mm available) — same role k800 played in the old grid.
+# k3900 is the spring actually built; k2500/k5500 bracket it.
+#
+# The locked arm's stiffness is 3900 purely for tidiness (matching the built
+# spring) — it is INERT, since travel=0.0 omits the spring joint entirely (see
+# sprung_foot.py), so no force from this number ever reaches the model.
 SWEEP_ARMS = (
-    ("locked", 1500.0, 0.0),
-    ("k800", 800.0, TRAVEL),
-    ("k1500", 1500.0, TRAVEL),
-    ("k2200", 2200.0, TRAVEL),
-    ("k3000", 3000.0, TRAVEL),
+    ("locked", 3900.0, 0.0),
+    ("k1500", 1500.0, TRAVEL),   # deliberate bottom-out marker: needs 14.3 mm
+    ("k2500", 2500.0, TRAVEL),
+    ("k3900", 3900.0, TRAVEL),   # the spring Steve actually built
+    ("k5500", 5500.0, TRAVEL),
 )
 
 ARM_TASK_SUFFIX = {
     "locked": "Locked",
-    "k800": "K800",
     "k1500": "K1500",
-    "k2200": "K2200",
-    "k3000": "K3000",
+    "k2500": "K2500",
+    "k3900": "K3900",
+    "k5500": "K5500",
 }
 
 
