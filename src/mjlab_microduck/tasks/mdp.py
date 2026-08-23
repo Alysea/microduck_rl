@@ -6316,11 +6316,23 @@ def spring_compression_monitor(
         asset.data.joint_pos[:, ids].float(), nan=0.0, posinf=0.0, neginf=0.0
     )
 
+    # Clamp at zero: negative q is JOINT-LIMIT PENETRATION, not compression.
+    # The spring is preloaded (springref < 0), so when unloaded it presses the
+    # pad against its lower limit and MuJoCo's soft limit constraint lets it
+    # settle slightly past zero — measured -0.59 mm at k=3900 with the default
+    # jnt_solref of [0.02, 1.0]. Left unclamped, those negative flight-phase
+    # samples cancel the positive stance samples and drive
+    # `spring_compression_mean` to ~0 while p95 and bottomed_fraction stay
+    # clearly non-zero — an internally contradictory reading that cost a smoke
+    # run to diagnose. The force curve above q=0 is unaffected and matches the
+    # measured hardware, so this is a metric correction, not a physics one.
+    q = q.clamp(min=0.0)
+
     if log is not None:
         flat = q.flatten()
         log["Metrics/spring_compression_mean"] = flat.mean()
         log["Metrics/spring_compression_p95"] = torch.quantile(flat, 0.95)
-        # Stance proxy: a pad in flight rests at exactly q=0.
+        # Stance proxy: an unloaded pad reads exactly 0 after the clamp above.
         loaded = flat[flat > 1e-4]
         log["Metrics/spring_compression_loaded_mean"] = (
             loaded.mean() if loaded.numel() > 0 else torch.zeros((), device=env.device)

@@ -213,3 +213,35 @@ def test_empty_joint_lookup_returns_zeros():
     out = spring_compression_monitor(env, joint_names=_JOINTS, travel=_TRAVEL)
     assert out.shape == (1,)
     assert float(out[0]) == 0.0
+
+
+def test_negative_q_is_treated_as_zero_compression():
+    """Preload pushes the pad past its lower limit when unloaded.
+
+    MuJoCo's soft joint limit lets a preloaded spring settle slightly below
+    q=0 (measured -0.59 mm at k=3900). Those samples are limit PENETRATION,
+    not compression. Unclamped they cancel positive stance samples and drive
+    `spring_compression_mean` to ~0 while p95 and bottomed_fraction stay
+    non-zero — the contradictory reading that surfaced in a smoke run.
+    """
+    # left foot in flight (resting past the limit), right foot loaded in stance
+    env = _Env([[-0.00059, 0.008]])
+    out = spring_compression_monitor(env, joint_names=_JOINTS, travel=_TRAVEL)
+    log = env.extras["log"]
+
+    assert float(out[0]) == 0.0
+    # mean of (0.0, 0.008) — NOT (-0.00059 + 0.008)/2
+    assert abs(float(log["Metrics/spring_compression_mean"]) - 0.004) < 1e-6
+    # the clamped sample must not count as loaded
+    assert abs(float(log["Metrics/spring_compression_loaded_mean"]) - 0.008) < 1e-6
+    assert float(log["Metrics/spring_compression_p95"]) > 0.0
+
+
+def test_all_negative_q_reads_as_zero_not_negative():
+    """A fully airborne robot must report zero compression, never negative."""
+    env = _Env([[-0.00059, -0.00061]])
+    spring_compression_monitor(env, joint_names=_JOINTS, travel=_TRAVEL)
+    log = env.extras["log"]
+    assert float(log["Metrics/spring_compression_mean"]) == 0.0
+    assert float(log["Metrics/spring_compression_loaded_mean"]) == 0.0
+    assert float(log["Metrics/spring_bottomed_fraction"]) == 0.0
