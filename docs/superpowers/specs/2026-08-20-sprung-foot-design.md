@@ -161,7 +161,10 @@ gait than this robot runs (see the SLIP-band correction below).
 sweeps.** Moving the pad mass from 30 g to 90 g moves total robot mass from
 0.797 kg to 0.917 kg — only ~15%. Since stance-matched `k` is linear in `m` at
 fixed `t`, the stance-matched stiffness across that whole range shifts only
-~3150 -> 3560 N/m — a small correction relative to the built spring's k=3900,
+**3024 -> 3479 N/m** (`k = pi^2*m/t^2` at the rigid gait's measured t = 51 ms;
+the prototype's own 0.877 kg sits at 3327 N/m, and its built k = 3900
+corresponds to a slightly shorter 47 ms stance) — a small correction relative to
+the built spring,
 and small enough that a single stiffness (the measured prototype's) is a
 reasonable common value to hold across a mass sweep.
 
@@ -222,14 +225,14 @@ the same as saying it is out of reach for this robot.** The classic
 dimensionless SLIP stiffness for running gaits is `k~ = k*L0/(m*g)` in the
 range 10-30. At this mass (0.877 kg) and a leg length `L0` of 0.155 m, that
 band is **k = 555-1665 N/m**, which corresponds to stance times of roughly
-**76-134 ms** (`t ~= pi*sqrt(m/k)` over that k range). The softest end of that
+**72-125 ms** (`t ~= pi*sqrt(m/k)` over that k range). The softest end of that
 band (k=555) needs `w/k = 8.60/555 ~= 15.5 mm` of deflection from static
 single support *alone* — before any running load is added, more than the
 12 mm of stroke available.
 
 **Correction to an earlier draft of this spec:** that draft concluded from
 this "the mechanism cannot operate in the biological SLIP band at all," full
-stop. That is only true against the 76-134 ms stance the classic SLIP band
+stop. That is only true against the 72-125 ms stance the classic SLIP band
 implies — a much slower gait than this robot actually runs (~51 ms measured
 stance). The honest statement, per the design-space analysis above, is
 narrower: **12 mm of travel rules out *long-stance* biological compliance, not
