@@ -108,6 +108,14 @@ def test_upward_velocity_scales_below_saturation():
     assert abs(float(out[0]) - 0.5) < 1e-6
 
 
+def test_upward_velocity_is_gated_by_the_launch_phase():
+    """sin < 0 is the recovery half — upward velocity there must not be paid
+    for, or the policy is rewarded for launching outside the hop cycle."""
+    env = _Env(cmd=[[0.0, -1.0, 0.0]], vz=[10.0])
+    out = hop_upward_velocity(env, command_name=_CMD, max_vel=0.5)
+    assert float(out[0]) == 0.0
+
+
 # --- hop_body_height --------------------------------------------------------
 
 def test_body_height_peaks_at_the_target():
