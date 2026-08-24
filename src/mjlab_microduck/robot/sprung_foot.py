@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Callable
 
+import math
+
 import mujoco
 import numpy as np
 
@@ -55,7 +57,33 @@ ANKLE_TO_SOLE = 0.01744
 H_ADD = 0.030      # measured on the Sarrus prototype (was an assumed 0.025)
 PAD_MASS = 0.070   # measured (was an assumed 0.020) — 70 g per boot
 TRAVEL = 0.012     # measured (was an assumed 0.015)
-DAMPING = 0.5      # N.s/m — represents a good steel spring, low hysteresis
+# Damping is specified as a RATIO, not an absolute rate, and derived per arm as
+# c = 2*zeta*sqrt(k*pad_mass).
+#
+# Why: an absolute c=0.5 N.s/m ("a good steel spring, low hysteresis") is the
+# right figure for the SPRING but leaves the PAD-ON-SPRING subsystem essentially
+# undamped — zeta came out at 0.013-0.023, the pad rang at 33-57 Hz against a
+# 50 Hz controller, and it retained 65-87% of its amplitude across a 51 ms
+# stance, so it never settled between steps. The 30 g pad rang ABOVE the control
+# rate entirely. In the first Stage 1 sweep this made sprung speed *improve*
+# monotonically with pad mass (lighter pad = faster ringing = worse), the
+# opposite of the locked arms' trend — resonance masquerading as a mass effect.
+#
+# A ratio also keeps resonance CONSTANT across a mass sweep instead of letting it
+# confound the axis, and is physically defensible: a larger mechanism carries
+# proportionally more joint friction. Reaching zeta=0.3 needs c = 6.5-11 N.s/m
+# across the 30-90 g range, i.e. 13-22x the old absolute value.
+#
+# This is provisional. The real number is measurable on the prototype as
+# loading-vs-unloading hysteresis; that measurement should replace this estimate.
+DAMPING_RATIO = 0.3
+
+DAMPING = None     # absolute N.s/m; None derives it from DAMPING_RATIO
+
+
+def damping_for(stiffness: float, pad_mass: float, ratio: float = DAMPING_RATIO) -> float:
+    """Critical-damping-scaled rate: c = 2*zeta*sqrt(k*m) for the pad on its spring."""
+    return 2.0 * ratio * math.sqrt(stiffness * pad_mass)
 
 # Intentional spring preload in the Sarrus mechanism, as a DISPLACEMENT.
 # Measured: 2.9 N offset at k = 3920 N/m -> 2.9/3920 = 0.74 mm of precompression.
@@ -72,7 +100,8 @@ SPRING_PRELOAD = 0.00074   # m of precompression at rest
 # (frictionloss=0.1, armature=0.005 in robot_walk.xml), which the spring joint
 # would otherwise inherit silently — the joint is added inside that childclass
 # scope. Zero is not a physical claim about a real mechanism: it makes the model
-# match the spec's *idealised* spring, whose only dissipation is DAMPING.
+# match the spec's *idealised* spring, whose only dissipation is the
+# viscous DAMPING_RATIO term.
 # Mechanism stiction and mechanism inertia are hardware-phase concerns the spec
 # explicitly defers.
 SPRING_FRICTIONLOSS = 0.0
@@ -95,10 +124,11 @@ _PAD_HALF_EXTENTS = (0.020, 0.004, 0.014)
 def make_sprung_foot_spec_fn(
     stiffness: float,
     travel: float = TRAVEL,
-    damping: float = DAMPING,
+    damping: float | None = DAMPING,
     h_add: float = H_ADD,
     pad_mass: float = PAD_MASS,
     preload: float = SPRING_PRELOAD,
+    damping_ratio: float = DAMPING_RATIO,
 ) -> Callable[[], mujoco.MjSpec]:
     """Build a zero-argument ``spec_fn`` for a sprung-foot MicroDuck.
 
@@ -109,12 +139,22 @@ def make_sprung_foot_spec_fn(
     Args:
         stiffness: spring rate in N/m, applied to both feet.
         travel: stroke in m. 0.0 locks the spring.
-        damping: N.s/m on the spring DoF.
+        damping: absolute N.s/m on the spring DoF. ``None`` (the default)
+            derives it from ``damping_ratio`` as ``2*zeta*sqrt(k*pad_mass)``,
+            which holds the pad's damping ratio constant as pad_mass varies.
+            Pass an explicit value once the prototype's real hysteresis is
+            measured.
+        damping_ratio: target zeta for the pad-on-spring subsystem, used only
+            when ``damping`` is None.
         h_add: metres of height the mechanism adds below the existing sole.
         pad_mass: mass per pad in kg.
         preload: metres of precompression built into the mechanism at
             assembly. Applied as ``springref = -preload`` (see below).
     """
+
+    resolved_damping = (
+        damping if damping is not None else damping_for(stiffness, pad_mass, damping_ratio)
+    )
 
     def _spec_fn() -> mujoco.MjSpec:
         spec = get_walk_spec()
@@ -154,7 +194,7 @@ def make_sprung_foot_spec_fn(
                 # These MUST be 3-arrays; MjsJoint rejects a scalar. Only
                 # element 0 is used by the compiler.
                 joint.stiffness = np.array([stiffness, 0.0, 0.0])
-                joint.damping = np.array([damping, 0.0, 0.0])
+                joint.damping = np.array([resolved_damping, 0.0, 0.0])
                 # MuJoCo's spring force is -stiffness * (qpos - springref).
                 # Our convention is q=0 extended, q>0 compressed, so a NEGATIVE
                 # springref puts a compression-resisting force at q=0: the
@@ -188,7 +228,7 @@ def make_sprung_foot_spec_fn(
 def make_sprung_foot_robot_cfg(
     stiffness: float,
     travel: float = TRAVEL,
-    damping: float = DAMPING,
+    damping: float | None = DAMPING,
     h_add: float = H_ADD,
     pad_mass: float = PAD_MASS,
     preload: float = SPRING_PRELOAD,

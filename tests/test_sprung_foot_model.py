@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 
 from mjlab_microduck.robot.sprung_foot import (
+    DAMPING_RATIO,
+    damping_for,
     H_ADD,
     PAD_MASS,
     SPRING_ARMATURE,
@@ -55,7 +57,12 @@ def test_stiffness_and_damping_reach_the_compiled_model(model):
     for j in SPRING_JOINTS:
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j)
         assert model.jnt_stiffness[jid] == pytest.approx(1500.0)
-        assert model.dof_damping[model.jnt_dofadr[jid]] == pytest.approx(0.5)
+        # Damping is DERIVED per arm as c = 2*zeta*sqrt(k*pad_mass), so the
+        # pad's damping ratio stays constant as pad mass varies. An absolute
+        # 0.5 N.s/m left zeta at 0.013-0.023 — the pad rang at 33-57 Hz against
+        # a 50 Hz controller and never settled between steps.
+        expected_c = damping_for(1500.0, PAD_MASS)
+        assert model.dof_damping[model.jnt_dofadr[jid]] == pytest.approx(expected_c)
 
 
 def test_stiffness_is_actually_parameterised():
@@ -231,3 +238,30 @@ def test_h_add_lowers_the_pad(model):
     pad_deep = d_deep.xpos[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "left_foot_pad")]
     pad_shallow = d_shallow.xpos[mujoco.mj_name2id(shallow, mujoco.mjtObj.mjOBJ_BODY, "left_foot_pad")]
     assert pad_deep[2] < pad_shallow[2]
+
+
+def test_damping_scales_with_pad_mass_to_hold_zeta_constant():
+    """The pad's damping RATIO must not vary across the mass sweep.
+
+    A fixed absolute damping made zeta vary 0.023 -> 0.013 across 30-90 g pads,
+    so resonance changed with mass and confounded the very axis the sweep
+    measures: sprung speed improved monotonically with pad mass (lighter pad =
+    faster ringing = worse), the opposite of the locked arms' trend.
+    """
+    import math
+
+    k = 3900.0
+    for pad in (0.030, 0.090):
+        m = make_sprung_foot_spec_fn(stiffness=k, pad_mass=pad)().compile()
+        jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, SPRING_JOINTS[0])
+        c = m.dof_damping[m.jnt_dofadr[jid]]
+        zeta = c / (2.0 * math.sqrt(k * pad))
+        assert zeta == pytest.approx(DAMPING_RATIO, rel=1e-6)
+
+
+def test_explicit_damping_overrides_the_ratio():
+    """An absolute value must win, so a measured hysteresis figure can replace
+    the estimate without touching the ratio machinery."""
+    m = make_sprung_foot_spec_fn(stiffness=3900.0, damping=7.5)().compile()
+    jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, SPRING_JOINTS[0])
+    assert m.dof_damping[m.jnt_dofadr[jid]] == pytest.approx(7.5)

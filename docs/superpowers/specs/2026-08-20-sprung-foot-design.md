@@ -347,8 +347,35 @@ Instead the study runs in **stages**, each one informed by the previous:
 
 **Common protocol across stages**: 8000 iterations per arm, matching the
 diagnostic-sweep protocol, compared over the 7000-8000 iteration window.
-Damping fixed low (0.5 N.s/m, representing a good steel spring — hardware
-hysteresis will be worse and is a hardware-phase concern, not a sweep axis).
+Damping specified as a **ratio**, `c = 2*zeta*sqrt(k*pad_mass)` with
+`zeta = 0.3`, rather than as an absolute rate.
+
+**This replaces an earlier absolute 0.5 N.s/m ("a good steel spring, low
+hysteresis"), which produced a pathological model.** That figure is right for
+the *spring* but leaves the *pad-on-spring* subsystem essentially undamped:
+`zeta` came out at 0.013-0.023, the pad resonated at 33-57 Hz against a 50 Hz
+controller, and it retained 65-87% of its amplitude across a 51 ms stance, so
+it rang on through 2-7 subsequent steps and never settled. The 30 g pad rang
+*above* the control rate entirely, where the policy cannot observe it.
+
+The first Stage 1 sweep is invalidated by this. Its sprung arms produced
+0.054-0.085 m/s against locked arms at 0.179-0.386, and — the tell — sprung
+speed *improved* monotonically with pad mass while the locked arms fell with
+it. A mass penalty cannot produce that; pad resonance can, because a lighter
+pad on a stiff spring rings faster. The sprung ranking was measuring resonance,
+not compliance.
+
+A ratio also holds resonance **constant across the mass sweep** instead of
+letting it confound the axis, and is physically defensible: a larger mechanism
+carries proportionally more joint friction. At `zeta = 0.3` the derived rate is
+6.5-11.2 N.s/m across the 30-90 g range, and decay `tau` falls from 120-360 ms
+to 9-16 ms — inside a single stance.
+
+`zeta = 0.3` is provisional. The real figure is measurable on the prototype as
+loading-versus-unloading hysteresis, and that measurement should replace it;
+`make_sprung_foot_spec_fn` accepts an absolute `damping=` override for exactly
+that purpose. The Stage 1 mass-penalty result from the LOCKED arms is unaffected
+by any of this — those carry no spring DoF.
 
 For that "idealised spring" claim to be true of what is actually built, the
 spring joint's `frictionloss` and `armature` are **explicitly set to 0.0**
