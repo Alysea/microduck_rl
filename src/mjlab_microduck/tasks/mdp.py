@@ -6416,3 +6416,60 @@ def hop_body_height(
     cmd = env.command_manager.get_command(command_name)
     launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
     return launch * height_reward
+
+
+def hop_energy_monitor(
+    env: ManagerBasedRlEnv,
+    joint_names: tuple,
+    stiffness: float,
+    preload: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Log elastic energy stored in the foot springs. Contributes zero reward.
+
+    A hop height is uninterpretable without knowing how much energy the spring
+    actually stored: the drop-rig probe measured restitution 0.57-0.70 at
+    zeta = 0.3, i.e. ~63% of stored energy is dissipated, so a poor hop could
+    mean "stored little" or "stored plenty and lost it". This separates them.
+
+    E = 0.5*k*q^2 + k*preload*q per foot (the second term is the work done
+    against the preload), summed over both feet. Negative q is limit
+    penetration, not compression, and is clamped away.
+
+    Returns zeros, so the reward total is unaffected. **Register with a non-zero
+    weight anyway**: RewardManager.compute short-circuits before calling a term
+    whose weight is 0.0. The Locked arm has no spring joints, so the lookup
+    raises there; that is normal and reports zero energy.
+    """
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    log = env.extras.get("log") if hasattr(env, "extras") else None
+
+    def _log_zero():
+        if log is not None:
+            z = torch.zeros((), device=env.device)
+            log["Metrics/hop_spring_energy_mean"] = z
+            log["Metrics/hop_spring_energy_peak"] = z
+
+    asset: Entity = env.scene[asset_cfg.name]
+    ids = []
+    try:
+        for name in joint_names:
+            found, _ = asset.find_joints(name)
+            if not found:
+                _log_zero()
+                return zeros
+            ids.append(found[0])
+    except ValueError:
+        # Locked control arm: no spring joints exist.
+        _log_zero()
+        return zeros
+
+    q = torch.nan_to_num(
+        asset.data.joint_pos[:, ids].float(), nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp(min=0.0)
+
+    energy = (0.5 * stiffness * q.pow(2) + stiffness * preload * q).sum(dim=1)
+    if log is not None:
+        log["Metrics/hop_spring_energy_mean"] = energy.mean()
+        log["Metrics/hop_spring_energy_peak"] = energy.max()
+    return zeros
