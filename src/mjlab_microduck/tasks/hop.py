@@ -162,3 +162,45 @@ def make_hop_variant(
     )
 
     return cfg
+
+
+from copy import deepcopy
+from dataclasses import replace
+
+from mjlab_microduck.robot.sprung_foot import H_ADD, PAD_MASS, TRAVEL
+from mjlab_microduck.tasks.run import MicroduckRunRlCfg
+
+# (label, stiffness N/m, travel m, pad mass kg).
+#
+# Three arms, not six. The drop-rig probe already narrowed stiffness: at a
+# 100 mm drop k2500 rebounded 35.3 mm, k3900 32.8 mm, k5500 28.3 mm, and k1500
+# only 20.6 mm because it bottoms out and slams. So the optimum is the softest
+# spring that does NOT bottom, and 2500-3900 brackets it.
+#
+# Mass is held at the measured 70 g because Stage 1's locked arms already
+# measured the mass penalty separately (-17.7% at 30 g, -61.9% at 90 g vs the
+# rigid running baseline).
+HOP_ARMS = (
+    ("locked", 3900.0, 0.0, PAD_MASS),
+    ("k2500", 2500.0, TRAVEL, PAD_MASS),
+    ("k3900", 3900.0, TRAVEL, PAD_MASS),
+)
+
+HOP_ARM_SUFFIX = {"locked": "Locked", "k2500": "K2500", "k3900": "K3900"}
+
+
+def hop_rl_cfg(label: str):
+    """Per-arm RL cfg: identical learner, distinct logging identity.
+
+    ``replace`` is shallow, so the nested cfgs are deep-copied -- otherwise all
+    three arms would share one actor object AND share it with the Run baseline,
+    so a later change to any arm would silently alter the others.
+    """
+    return replace(
+        MicroduckRunRlCfg,
+        actor=deepcopy(MicroduckRunRlCfg.actor),
+        critic=deepcopy(MicroduckRunRlCfg.critic),
+        algorithm=deepcopy(MicroduckRunRlCfg.algorithm),
+        experiment_name=f"hop_{label}",
+        run_name=f"hop_{label}",
+    )

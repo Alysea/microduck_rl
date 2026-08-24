@@ -87,6 +87,8 @@ from .microduck_spin_env_cfg import (
 from .backlash import make_backlash_variant
 from .run import make_run_variant, MicroduckRunRlCfg
 from .sprung import SWEEP_ARMS, make_sprung_variant, sprung_rl_cfg, ARM_TASK_SUFFIX
+from .hop import HOP_ARMS, HOP_ARM_SUFFIX, hop_rl_cfg, make_hop_variant
+from mjlab_microduck.robot.sprung_foot import H_ADD
 
 # Standard velocity task
 register_mjlab_task(
@@ -151,6 +153,36 @@ for _label, _k, _travel, _pad_mass in SWEEP_ARMS:
         runner_cls=MicroduckOnPolicyRunner,
     )
     print(f"✓ Sprung task registered: {_tid}")
+
+# Periodic hop on the sprung foot — Phase 4. See
+# docs/superpowers/specs/2026-08-24-sprung-hop-design.md
+#
+# NOTE: stiffness=_k is passed into make_hop_variant (not just
+# make_sprung_variant) for every arm below. make_hop_variant registers
+# hop_energy_monitor with a stiffness used to compute stored spring energy,
+# defaulting to 3900.0 -- left unpassed, the k2500 arm's
+# Metrics/hop_spring_energy_* would read 56% high, and the spec requires
+# reading the spring instruments before any hop-height number.
+for _label, _k, _travel, _pad in HOP_ARMS:
+    _tid = f"Mjlab-Hop-Flat-Sprung-{HOP_ARM_SUFFIX[_label]}-MicroDuck"
+    register_mjlab_task(
+        task_id=_tid,
+        env_cfg=make_sprung_variant(
+            make_hop_variant(
+                make_microduck_velocity_env_cfg(), h_add=H_ADD, stiffness=_k
+            ),
+            stiffness=_k, travel=_travel, pad_mass=_pad,
+        ),
+        play_env_cfg=make_sprung_variant(
+            make_hop_variant(
+                make_microduck_velocity_env_cfg(play=True), h_add=H_ADD, stiffness=_k
+            ),
+            stiffness=_k, travel=_travel, pad_mass=_pad,
+        ),
+        rl_cfg=hop_rl_cfg(_label),
+        runner_cls=MicroduckOnPolicyRunner,
+    )
+    print(f"✓ Hop task registered: {_tid}")
 
 # Velocity2 — microban reward/regularization recipe on the velocity task.
 register_mjlab_task(

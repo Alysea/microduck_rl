@@ -104,3 +104,71 @@ def test_hop_period_is_above_the_spring_mass_period():
     """At k=3900 and 0.877 kg the spring-mass period is ~94 ms. A hop period at
     or below that would drive the spring faster than it can cycle."""
     assert HOP_PERIOD > 0.094
+
+
+def test_hop_arms_are_locked_plus_two_stiffnesses():
+    from mjlab_microduck.tasks.hop import HOP_ARMS
+
+    labels = [a[0] for a in HOP_ARMS]
+    assert "locked" in labels, "the locked arm is the geometric control"
+    stiffnesses = {a[1] for a in HOP_ARMS if a[0] != "locked"}
+    assert stiffnesses == {2500.0, 3900.0}
+    for label, _k, travel, pad in HOP_ARMS:
+        assert pad == pytest.approx(0.070), "mass is held; Stage 1 measured it"
+        if label == "locked":
+            assert travel == 0.0
+        else:
+            assert travel > 0.0
+
+
+def test_hop_task_ids_registered():
+    import mjlab_microduck.tasks  # noqa: F401
+    from mjlab.tasks.registry import list_tasks
+
+    tasks = list_tasks()
+    for tid in (
+        "Mjlab-Hop-Flat-Sprung-Locked-MicroDuck",
+        "Mjlab-Hop-Flat-Sprung-K2500-MicroDuck",
+        "Mjlab-Hop-Flat-Sprung-K3900-MicroDuck",
+    ):
+        assert tid in tasks, f"{tid} not registered"
+
+
+def test_hop_arms_have_distinct_wandb_identities():
+    import mjlab_microduck.tasks  # noqa: F401
+    from mjlab.tasks.registry import load_rl_cfg
+
+    names = {
+        load_rl_cfg(f"Mjlab-Hop-Flat-Sprung-{s}-MicroDuck").run_name
+        for s in ("Locked", "K2500", "K3900")
+    }
+    assert len(names) == 3
+
+
+def test_registered_hop_cfgs_carry_the_shifted_height_target():
+    """End-to-end: the registered task, not just the transform in isolation."""
+    import mjlab_microduck.tasks  # noqa: F401
+    from mjlab.tasks.registry import load_env_cfg
+
+    cfg = load_env_cfg("Mjlab-Hop-Flat-Sprung-K3900-MicroDuck")
+    assert cfg.rewards["hop_body_height"].params["target_height"] == pytest.approx(
+        hop_target_height(H_ADD)
+    )
+
+
+def test_k2500_arm_energy_monitor_uses_its_own_stiffness_not_the_default():
+    """The registration loop must thread stiffness=_k into make_hop_variant for
+    every arm, not only into make_sprung_variant. make_hop_variant's default
+    stiffness (3900.0) is only correct for the k3900 arm -- if the k2500 arm's
+    registration omitted it, hop_energy_monitor would report that arm's stored
+    spring energy 56% high, and the spec requires reading the spring
+    instruments (hop_spring_energy_*, spring_bottomed_fraction) BEFORE any
+    hop-height number, so a wrong energy metric would corrupt the primary
+    result this whole phase exists to produce."""
+    from mjlab_microduck.tasks.hop import HOP_ARMS
+
+    label, k, _travel, _pad = next(a for a in HOP_ARMS if a[0] == "k2500")
+    assert k == 2500.0
+
+    cfg = make_hop_variant(make_microduck_velocity_env_cfg(), h_add=H_ADD, stiffness=k)
+    assert cfg.rewards["hop_energy_monitor"].params["stiffness"] == 2500.0
