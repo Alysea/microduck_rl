@@ -74,6 +74,16 @@ RIGID_STAND_HEIGHT = 0.1095
 # error in the reward, not a tuning choice. RIGID_STAND_HEIGHT stays as the
 # documented settled value (it is what the CoM band and stance behaviour are
 # about); it is simply not the datum for an airborne apex.
+#
+# This fixes a measurement error, but it does not exhaust the robot's posture
+# headroom: a grid search over symmetric hip_pitch/knee/ankle poses (pad kept
+# flat) found a maximum sag-free stance root height of 0.16133 -- vs
+# HOME_FRAME's 0.14710 -- so about 14.2 mm of headroom survives this fix,
+# roughly TWICE the 7.6 mm it removed. That headroom is identical on all three
+# arms, so it biases none of them relative to each other, but it means the real
+# room between UNLOADED_RIGID_HEIGHT and the hop target's HOP_COM_HEIGHT_MAX
+# (0.1871 sprung) is ~26 mm, not the ~40 mm a reader might infer from treating
+# this datum fix as pure spring rebound.
 UNLOADED_RIGID_HEIGHT = 0.1171
 
 # Height gain above the unloaded reference that the Gaussian peaks at, and its
@@ -154,6 +164,19 @@ _LOCOMOTION_REWARDS = ("track_linear_velocity", "track_angular_velocity")
 # airborne reward, `hop_both_feet_airborne` at weight 3.0 -- which pays only when
 # BOTH feet are off the ground, i.e. for the behaviour we actually want.
 _WALKING_GAIT_REWARDS = ("air_time",)
+
+# NOT removed, deliberately: `foot_swing_height` (weight -0.25, relative-squared
+# cost, target_height=0.02) is the same CLASS of walking-gait term as `air_time`
+# above -- a retained term whose interaction with the hop rewards needs
+# checking, not assuming -- but its shape doesn't create the same conflict.
+# It's a bowl centred on 20 mm of foot peak height: harmless across the 5-33 mm
+# evidence band (<1% of the per-cycle total there), but quadratic above it
+# (-0.36 per landing at 33 mm gain, -0.72 at 40 mm, -2.42 at 60 mm). It is
+# IDENTICAL across all three arms, so it biases none of them relative to each
+# other -- but it is where the reward's new ceiling actually comes from: the
+# hop total now peaks around ~65 mm of gain because this is the term that
+# finally overtakes the airborne terms (which grow only as sqrt(h)). Its
+# logged `Metrics/peak_height_mean` is the arm-comparison observable to watch.
 
 # LANDING SURVIVAL: the spec asks for a landing-survival term. It is met by the
 # terms already present rather than by a new one -- the velocity env's `upright`

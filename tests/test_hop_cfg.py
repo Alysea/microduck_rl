@@ -350,10 +350,27 @@ def test_registered_arms_carry_the_widened_height_gaussian():
         tid = _hop_task_id(label)
         assert params["target_height"] == pytest.approx(hop_target_height(H_ADD)), tid
         assert params["std"] == pytest.approx(HOP_HEIGHT_STD), tid
-        # Relationship, not a second hardcoded number: the peak must sit above
-        # the top of the discriminating band, not inside it.
-        gain = params["target_height"] - (UNLOADED_RIGID_HEIGHT + H_ADD)
-        assert gain > 0.033, tid
+        # Datum guard, independent of HOP_HEIGHT_GAIN's value.
+        #
+        # The assertion this replaced (`gain > 0.033` where
+        # `gain = target_height - (UNLOADED_RIGID_HEIGHT + H_ADD)`) is identically
+        # `HOP_HEIGHT_GAIN > 0.033` by construction, so it asserted only "the
+        # constant exceeds a hardcoded 0.033" -- and it caught the
+        # RIGID_STAND_HEIGHT-vs-UNLOADED_RIGID_HEIGHT datum revert only by
+        # coincidence: 0.040 - 0.0076 = 0.0324 happens to land 0.6 mm under that
+        # threshold. Someone who raises HOP_HEIGHT_GAIN to 0.045 while reverting
+        # the datum back to RIGID_STAND_HEIGHT (double-counting the leg sag
+        # again) would pass the whole suite.
+        #
+        # Assert the datum directly instead, and separately assert it is NOT the
+        # settled-height alternative -- the second assertion is the one that
+        # survives any future change to the gain.
+        assert params["target_height"] == pytest.approx(
+            UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
+        ), tid
+        assert params["target_height"] != pytest.approx(
+            RIGID_STAND_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
+        ), tid
 
 
 def test_upward_velocity_does_not_saturate_below_the_height_target():
@@ -452,3 +469,40 @@ def test_height_gaussian_discriminates_locked_from_sprung():
     # Monotone across the band, so a taller hop is never worth less.
     samples = [reward(g / 1000.0) for g in range(5, 34)]
     assert samples == sorted(samples)
+
+
+def test_height_gaussian_pays_from_a_standing_start():
+    """The >=10x ratio test above is satisfiable by a cliff, not just a slope.
+
+    Reverting HOP_HEIGHT_STD to its old 0.008 while leaving HOP_HEIGHT_GAIN at
+    0.040 still passes `sprung_like / locked_like >= 10.0` above (0.465 / 5e-9
+    is a huge, monotone ratio) yet pays approximately zero reward below 25 mm of
+    gain -- a cliff the policy cannot climb from a standing start (0 mm), which
+    is exactly the risk the widening from (0.015, 0.008) to (0.040, 0.020) was
+    meant to remove. The ratio test never checks the low end in absolute terms,
+    so it cannot see this.
+
+    Two guards:
+      1. an absolute floor -- the registered Gaussian evaluated at a 5 mm gain
+         (the Locked-arm drop-rig datum) must be worth at least 0.03, so there
+         is always a live gradient from a standing start;
+      2. the relationship that makes (1) robust to future retuning: std must be
+         at least 40% of gain, written as a relationship between the two
+         constants rather than as two more hardcoded numbers.
+    """
+    params = _registered("k3900").rewards["hop_body_height"].params
+    target, std = params["target_height"], params["std"]
+    reference = target - HOP_HEIGHT_GAIN
+
+    def reward(gain_m: float) -> float:
+        return math.exp(-(((reference + gain_m - target) / std) ** 2))
+
+    assert reward(0.005) >= 0.03, (
+        f"5 mm of gain scores {reward(0.005):.4f}, below the 0.03 floor -- "
+        "there is no usable gradient from a standing start"
+    )
+    assert HOP_HEIGHT_STD >= 0.4 * HOP_HEIGHT_GAIN, (
+        f"HOP_HEIGHT_STD ({HOP_HEIGHT_STD}) is less than 40% of HOP_HEIGHT_GAIN "
+        f"({HOP_HEIGHT_GAIN}) -- the Gaussian can be narrowed back into a cliff "
+        "without failing the discrimination ratio test above"
+    )
