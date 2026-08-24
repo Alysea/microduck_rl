@@ -163,6 +163,14 @@ for _label, _k, _travel, _pad_mass in SWEEP_ARMS:
 # defaulting to 3900.0 -- left unpassed, the k2500 arm's
 # Metrics/hop_spring_energy_* would read 56% high, and the spec requires
 # reading the spring instruments before any hop-height number.
+#
+# NOTE 2: h_add=H_ADD is likewise passed EXPLICITLY to BOTH transforms below,
+# even though make_sprung_variant defaults to the same H_ADD. The two must agree:
+# make_hop_variant uses it to shift the hop height TARGET, make_sprung_variant
+# uses it to shift the com_height_target BAND, and both describe the same
+# physical fact -- the boot makes the robot stand H_ADD taller. Overriding one
+# and not the other desynchronises the two silently, with no error, so the shared
+# value is written at the call site where it is visibly one value.
 for _label, _k, _travel, _pad in HOP_ARMS:
     _tid = f"Mjlab-Hop-Flat-Sprung-{HOP_ARM_SUFFIX[_label]}-MicroDuck"
     register_mjlab_task(
@@ -171,13 +179,13 @@ for _label, _k, _travel, _pad in HOP_ARMS:
             make_hop_variant(
                 make_microduck_velocity_env_cfg(), h_add=H_ADD, stiffness=_k
             ),
-            stiffness=_k, travel=_travel, pad_mass=_pad,
+            stiffness=_k, travel=_travel, pad_mass=_pad, h_add=H_ADD,
         ),
         play_env_cfg=make_sprung_variant(
             make_hop_variant(
                 make_microduck_velocity_env_cfg(play=True), h_add=H_ADD, stiffness=_k
             ),
-            stiffness=_k, travel=_travel, pad_mass=_pad,
+            stiffness=_k, travel=_travel, pad_mass=_pad, h_add=H_ADD,
         ),
         rl_cfg=hop_rl_cfg(_label),
         runner_cls=MicroduckOnPolicyRunner,
