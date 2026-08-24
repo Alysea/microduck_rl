@@ -1,14 +1,20 @@
 """Config-level assertions for the hop variant transform."""
 
+import math
+
 import pytest
 
 from mjlab_microduck.robot.sprung_foot import H_ADD
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.hop import (
+    HOP_ARM_SUFFIX,
     HOP_HEIGHT_GAIN,
+    HOP_HEIGHT_STD,
+    HOP_MAX_LAUNCH_VEL,
     HOP_PERIOD,
     RIGID_STAND_HEIGHT,
     SENSOR_NAME,
+    UNLOADED_RIGID_HEIGHT,
     hop_target_height,
     make_hop_variant,
 )
@@ -31,14 +37,14 @@ def test_command_is_the_cyclic_phase_command(hop_cfg):
 def test_height_target_is_shifted_by_h_add(hop_cfg):
     """The ported reward hardcodes 0.135 for the RIGID robot. The sprung robot
     stands H_ADD taller, so an unshifted target asks it to CROUCH."""
-    expected = RIGID_STAND_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
+    expected = UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
     assert hop_cfg.rewards["hop_body_height"].params["target_height"] == pytest.approx(expected)
     assert hop_target_height(H_ADD) == pytest.approx(expected)
 
 
 def test_rigid_variant_target_is_not_shifted():
     rigid = make_hop_variant(make_microduck_velocity_env_cfg(), h_add=0.0)
-    expected = RIGID_STAND_HEIGHT + HOP_HEIGHT_GAIN
+    expected = UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN
     assert rigid.rewards["hop_body_height"].params["target_height"] == pytest.approx(expected)
 
 
@@ -254,6 +260,10 @@ def test_rigid_stand_height_is_pinned_to_the_measured_locked_arm_geometry():
     )
     kinematic_rigid = -lowest - H_ADD
     assert kinematic_rigid == pytest.approx(0.11710, abs=0.002)
+    # UNLOADED_RIGID_HEIGHT *is* this sag-free kinematic height -- it is the datum
+    # the airborne-gated hop height reward is built on, so pin it to the geometry
+    # rather than to a copied literal.
+    assert UNLOADED_RIGID_HEIGHT == pytest.approx(kinematic_rigid, abs=0.002)
     assert RIGID_STAND_HEIGHT < kinematic_rigid, (
         "the robot cannot stand taller in HOME_FRAME than its own kinematics allow"
     )
@@ -279,3 +289,166 @@ def test_registered_hop_cfgs_carry_their_own_arm_stiffness():
         tid = f"Mjlab-Hop-Flat-Sprung-{HOP_ARM_SUFFIX[label]}-MicroDuck"
         cfg = load_env_cfg(tid)
         assert cfg.rewards["hop_energy_monitor"].params["stiffness"] == k, tid
+
+
+# ---------------------------------------------------------------------------
+# The reward ceiling. Four independent mechanisms capped the height reward at
+# roughly 15-20 mm of gain while the drop-rig evidence spans 5 mm (Locked) to
+# 33 mm (k3900), so all three arms would have sat at the ceiling and the
+# arm-to-arm comparison -- which IS the experiment -- would have returned an
+# uninformative null. The tests below pin all four, plus the discrimination
+# property that motivates them.
+# ---------------------------------------------------------------------------
+
+
+def _hop_task_id(label: str) -> str:
+    return f"Mjlab-Hop-Flat-Sprung-{HOP_ARM_SUFFIX[label]}-MicroDuck"
+
+
+def _registered(label: str):
+    import mjlab_microduck.tasks  # noqa: F401
+    from mjlab.tasks.registry import load_env_cfg
+
+    return load_env_cfg(_hop_task_id(label))
+
+
+def test_height_target_references_the_unloaded_not_the_settled_height():
+    """`hop_body_height` is gated on BOTH FEET AIRBORNE, so it is only ever
+    evaluated in flight with the legs unloaded. Referencing RIGID_STAND_HEIGHT
+    (the SETTLED height, measured with the full 877 g sagging the position
+    actuators off their targets) hands the robot the sag for free: it scores
+    "gain" for merely unloading its legs, without leaving the ground any higher.
+    That is a measurement error in the reward, not a tuning choice.
+
+    Both halves matter: the exact value, and the size of the error the old datum
+    introduced.
+    """
+    assert hop_target_height(0.0) == pytest.approx(UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN)
+    assert hop_target_height(H_ADD) == pytest.approx(
+        UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
+    )
+
+    settled_based = RIGID_STAND_HEIGHT + HOP_HEIGHT_GAIN
+    free_gain = hop_target_height(0.0) - settled_based
+    assert free_gain == pytest.approx(0.0076, abs=1e-4), (
+        "the settled reference under-shoots the flight datum by the actuator sag; "
+        "that 7.6 mm was free reward for unloading the legs"
+    )
+
+
+def test_registered_arms_carry_the_widened_height_gaussian():
+    """End-to-end through the registered tasks, not the transform in isolation.
+
+    The old (gain 0.015, std 0.008) pair put the entire 5-33 mm evidence band at
+    ~0.000 reward. Assert the registered params, and assert the peak still sits
+    ABOVE the ~27 mm energetic ceiling estimated for k=3900 so the whole band
+    stays on the Gaussian's RISING limb instead of straddling its peak.
+    """
+    for label in HOP_ARM_SUFFIX:
+        cfg = _registered(label)
+        params = cfg.rewards["hop_body_height"].params
+        tid = _hop_task_id(label)
+        assert params["target_height"] == pytest.approx(hop_target_height(H_ADD)), tid
+        assert params["std"] == pytest.approx(HOP_HEIGHT_STD), tid
+        # Relationship, not a second hardcoded number: the peak must sit above
+        # the top of the discriminating band, not inside it.
+        gain = params["target_height"] - (UNLOADED_RIGID_HEIGHT + H_ADD)
+        assert gain > 0.033, tid
+
+
+def test_upward_velocity_does_not_saturate_below_the_height_target():
+    """`hop_upward_velocity` clamps vel_z/max_vel to [0, 1]. A ballistic launch at
+    v rises v**2/(2*g), so max_vel caps the rise the term is willing to pay for.
+    At the old 0.5 m/s that cap was 12.7 mm -- below the ENTIRE 5-33 mm band, so
+    the velocity term stopped paying long before the height term peaked, and the
+    two terms fought each other.
+
+    The second assertion is the real content and is written as a RELATIONSHIP:
+    whatever the two constants become, the velocity term must not saturate before
+    the height term peaks.
+    """
+    for label in HOP_ARM_SUFFIX:
+        cfg = _registered(label)
+        max_vel = cfg.rewards["hop_upward_velocity"].params["max_vel"]
+        tid = _hop_task_id(label)
+        # The relationship first, so it is the assertion that actually fails when
+        # either constant regresses rather than being shadowed by the literal.
+        saturating_rise = max_vel**2 / (2 * 9.81)
+        assert saturating_rise > HOP_HEIGHT_GAIN, (
+            f"{tid}: hop_upward_velocity saturates at {saturating_rise * 1e3:.1f} mm of "
+            f"rise, at or below the {HOP_HEIGHT_GAIN * 1e3:.1f} mm the height reward "
+            "peaks at -- the velocity term stops paying before the height term does"
+        )
+        assert max_vel == pytest.approx(HOP_MAX_LAUNCH_VEL), tid
+        assert max_vel == pytest.approx(1.0), tid
+
+
+def test_com_band_ceiling_is_above_the_hop_apex():
+    """`com_height_target` pays a flat +1 in band and -(z - max)**2 above it, so
+    crossing the top forfeits the whole +1 as a STEP, times its weight of 1.2.
+    With the old 0.14 rigid top (0.17 sprung) that step landed at 23 mm of gain --
+    inside the range the experiment needs explored, penalising exactly the hops we
+    are trying to measure.
+
+    Written as a relationship so it cannot silently regress if HOP_HEIGHT_GAIN,
+    UNLOADED_RIGID_HEIGHT or H_ADD moves. Checked on a sprung arm AND on the
+    Locked control, which wears the same boot and so gets the same shift.
+    """
+    apex = hop_target_height(H_ADD)
+    for label in ("k3900", "locked"):
+        params = _registered(label).rewards["com_height_target"].params
+        tid = _hop_task_id(label)
+        assert params["target_height_max"] > apex, (
+            f"{tid}: CoM band top {params['target_height_max']:.4f} is at or below the "
+            f"target apex {apex:.4f} -- reaching the commanded hop height forfeits the "
+            "band's +1 as a step penalty"
+        )
+
+
+def test_com_band_floor_is_untouched_by_the_hop_variant():
+    """Only the UPPER edge moves. `target_height_min` still pays for not
+    collapsing during stance, and the Phase-2 h_add translation in
+    make_sprung_variant (explicitly out of scope) must still be the only thing
+    acting on it.
+    """
+    base_min = make_microduck_velocity_env_cfg().rewards["com_height_target"].params[
+        "target_height_min"
+    ]
+    for label in HOP_ARM_SUFFIX:
+        params = _registered(label).rewards["com_height_target"].params
+        assert params["target_height_min"] == pytest.approx(base_min + H_ADD), _hop_task_id(label)
+
+
+def test_height_gaussian_discriminates_locked_from_sprung():
+    """The property the whole change exists for, and the test that would have
+    caught the original ceiling.
+
+    The drop-rig probe rebounded 5 mm on the Locked arm and 33 mm at k=3900. If
+    the reward cannot tell those two apart, all three arms score the same and the
+    campaign returns an uninformative null after hours of GPU time per arm. Under
+    the old (0.015, 0.008) params both read ~1e-8 and the ratio was ~1.0.
+
+    The Gaussian is recomputed here from the REGISTERED params -- exp(-((h -
+    target)/std)**2), matching microduck_mdp.hop_body_height -- rather than from
+    module constants, so a registration that fails to thread them through fails
+    this test too.
+    """
+    params = _registered("k3900").rewards["hop_body_height"].params
+    target, std = params["target_height"], params["std"]
+    # The reward is evaluated airborne, so gain is measured from the UNLOADED
+    # stand height -- which is exactly `target - HOP_HEIGHT_GAIN`.
+    reference = target - HOP_HEIGHT_GAIN
+
+    def reward(gain_m: float) -> float:
+        return math.exp(-(((reference + gain_m - target) / std) ** 2))
+
+    locked_like = reward(0.005)
+    sprung_like = reward(0.033)
+    assert sprung_like > locked_like, "the reward must increase across the band"
+    assert sprung_like / locked_like >= 10.0, (
+        f"5 mm scores {locked_like:.4f} and 33 mm scores {sprung_like:.4f} -- only "
+        f"{sprung_like / locked_like:.1f}x apart. The arms would be indistinguishable."
+    )
+    # Monotone across the band, so a taller hop is never worth less.
+    samples = [reward(g / 1000.0) for g in range(5, 34)]
+    assert samples == sorted(samples)
