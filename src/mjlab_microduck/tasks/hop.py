@@ -93,8 +93,27 @@ def make_hop_variant(
     # never hits this). Filter vars(command) down to the fields
     # GroundPickPhaseCommandCfg actually accepts instead of forwarding all of
     # them verbatim.
+    #
+    # `rel_turn_in_place_envs` is the one field we know is safe to drop: it is
+    # only ever read by VelocityCommandCommandOnly._resample_command, and
+    # GroundPickPhaseCommand's own _resample_command override is a no-op
+    # `pass` -- nothing in the built command ever looks at it. Any OTHER
+    # dropped field is unproven and must fail loudly rather than vanish
+    # silently into a training run (this campaign has been burned by silent
+    # drops before), so we raise if drift introduces one.
     command = cfg.commands["twist"]
     valid_fields = {f.name for f in dataclasses.fields(microduck_mdp.GroundPickPhaseCommandCfg)}
+    dropped = set(vars(command)) - valid_fields
+    _KNOWN_INERT_DROPS = {"rel_turn_in_place_envs"}
+    unexpected_drops = dropped - _KNOWN_INERT_DROPS
+    if unexpected_drops:
+        raise ValueError(
+            f"make_hop_variant: cfg.commands['twist'] ({type(command).__name__}) carries "
+            f"field(s) {sorted(unexpected_drops)} that GroundPickPhaseCommandCfg does not "
+            "declare and that are not in the known-inert allow-list. Either mirror the "
+            "field onto GroundPickPhaseCommandCfg or confirm it is unused (like "
+            "rel_turn_in_place_envs) and add it to _KNOWN_INERT_DROPS."
+        )
     command_kwargs = {k: v for k, v in vars(command).items() if k in valid_fields}
     cfg.commands["twist"] = microduck_mdp.GroundPickPhaseCommandCfg(
         **{

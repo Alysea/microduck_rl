@@ -67,6 +67,24 @@ def test_energy_monitor_stiffness_threads_through_the_variant():
     assert cfg.rewards["hop_energy_monitor"].params["stiffness"] == 2500.0
 
 
+def test_command_construction_preserves_base_fields():
+    """The command-construction step filters vars(command) down to the fields
+    GroundPickPhaseCommandCfg declares, then rebuilds it. A regression that
+    dropped or mangled behaviour-carrying fields (ranges, rel_standing_envs,
+    viz) would not show up as a TypeError -- it would silently ship a policy
+    that ignores its velocity-sampling ranges. Assert the carry-over directly."""
+    rigid = make_microduck_velocity_env_cfg()
+    original = rigid.commands["twist"]
+    hop_cfg = make_hop_variant(rigid, h_add=H_ADD)
+    rebuilt = hop_cfg.commands["twist"]
+
+    assert rebuilt.ranges == original.ranges
+    assert rebuilt.rel_standing_envs == original.rel_standing_envs
+    assert rebuilt.rel_heading_envs == original.rel_heading_envs
+    assert rebuilt.viz.z_offset == original.viz.z_offset
+    assert rebuilt.entity_name == original.entity_name
+
+
 def test_forward_locomotion_rewards_removed(hop_cfg):
     """This is a hop in place. Leaving velocity tracking in would reward the
     policy for running away instead of hopping, and the phase command has
