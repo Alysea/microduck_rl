@@ -156,19 +156,23 @@ def test_registered_hop_cfgs_carry_the_shifted_height_target():
     )
 
 
-def test_k2500_arm_energy_monitor_uses_its_own_stiffness_not_the_default():
-    """The registration loop must thread stiffness=_k into make_hop_variant for
-    every arm, not only into make_sprung_variant. make_hop_variant's default
-    stiffness (3900.0) is only correct for the k3900 arm -- if the k2500 arm's
-    registration omitted it, hop_energy_monitor would report that arm's stored
-    spring energy 56% high, and the spec requires reading the spring
-    instruments (hop_spring_energy_*, spring_bottomed_fraction) BEFORE any
-    hop-height number, so a wrong energy metric would corrupt the primary
-    result this whole phase exists to produce."""
-    from mjlab_microduck.tasks.hop import HOP_ARMS
+def test_registered_hop_cfgs_carry_their_own_arm_stiffness():
+    """End-to-end, through the registered task -- not the transform in
+    isolation. The registration loop must thread stiffness=_k into
+    make_hop_variant for every arm, not only into make_sprung_variant.
+    make_hop_variant's default stiffness (3900.0) is only correct for the
+    k3900/locked arms -- if the k2500 arm's registration omitted it,
+    hop_energy_monitor would report that arm's stored spring energy 56% high,
+    and the spec requires reading the spring instruments
+    (hop_spring_energy_*, spring_bottomed_fraction) BEFORE any hop-height
+    number, so a wrong energy metric would corrupt the primary result this
+    whole phase exists to produce. Loads all three registered tasks so a
+    regression in any one arm's call site is caught."""
+    import mjlab_microduck.tasks  # noqa: F401
+    from mjlab.tasks.registry import load_env_cfg
+    from mjlab_microduck.tasks.hop import HOP_ARM_SUFFIX, HOP_ARMS
 
-    label, k, _travel, _pad = next(a for a in HOP_ARMS if a[0] == "k2500")
-    assert k == 2500.0
-
-    cfg = make_hop_variant(make_microduck_velocity_env_cfg(), h_add=H_ADD, stiffness=k)
-    assert cfg.rewards["hop_energy_monitor"].params["stiffness"] == 2500.0
+    for label, k, _travel, _pad in HOP_ARMS:
+        tid = f"Mjlab-Hop-Flat-Sprung-{HOP_ARM_SUFFIX[label]}-MicroDuck"
+        cfg = load_env_cfg(tid)
+        assert cfg.rewards["hop_energy_monitor"].params["stiffness"] == k, tid
