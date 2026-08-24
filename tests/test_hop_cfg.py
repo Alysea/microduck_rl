@@ -188,6 +188,77 @@ def test_registered_hop_cfgs_carry_the_shifted_height_target():
     )
 
 
+def test_rigid_stand_height_is_pinned_to_the_measured_locked_arm_geometry():
+    """Pin RIGID_STAND_HEIGHT against a real measurement of the Locked arm.
+
+    MEASURED 2026-08-24 on the registered `Mjlab-Hop-Flat-Sprung-Locked-MicroDuck`
+    arm (stiffness 3900, travel 0.0, pad 70 g, h_add 0.030). Method: compile that
+    arm's spec_fn, add a floor plane, set HOME_FRAME on every hinge with the
+    position actuators pointed at it, PIN THE BASE TO VERTICAL TRAVEL ONLY (it
+    topples in ~1 s without a balance policy, so an unpinned settle measures
+    tipping, not height) and settle 3000 steps — the horizon this campaign's
+    existing settle probes use.
+
+        settled root z (Locked, WEARS the pad)  = 0.13949 m
+        minus H_ADD                            = 0.030   m
+        => rigid stand height                  = 0.10949 m
+
+    The previous value, 0.120, was the robot_walk.xml SPAWN height (qpos0[2]),
+    not a standing height: the sag-free KINEMATIC height below is only 0.1171
+    rigid, so the robot could not stand that tall in HOME_FRAME even with
+    infinitely stiff actuators. With std = 0.008 in `hop_body_height`, that
+    10.5 mm error was most of the reward's dynamic range.
+
+    Two assertions, deliberately independent:
+      1. the constant still matches the settle measurement (trips if someone
+         edits it without re-measuring);
+      2. the compiled Locked arm's sag-free kinematic height still matches what
+         was measured (trips if H_ADD, ANKLE_TO_SOLE, the pad box or any leg link
+         changes — at which point re-run
+         `.superpowers/sdd/2026-08-24-sprung-hop/measure_stand_height.py`).
+    """
+    import re
+
+    import mujoco
+    import numpy as np
+
+    import mjlab_microduck.tasks  # noqa: F401
+    from mjlab.tasks.registry import load_env_cfg
+    from mjlab_microduck.robot.microduck_constants import HOME_FRAME
+
+    assert RIGID_STAND_HEIGHT == pytest.approx(0.10949, abs=0.002)
+
+    robot = load_env_cfg("Mjlab-Hop-Flat-Sprung-Locked-MicroDuck").scene.entities["robot"]
+    m = robot.spec_fn().compile()
+    d = mujoco.MjData(m)
+    for i in range(m.njnt):
+        nm = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, i)
+        if nm is None or m.jnt_type[i] != mujoco.mjtJoint.mjJNT_HINGE:
+            continue
+        for pat, val in HOME_FRAME.joint_pos.items():
+            if re.search(pat.strip("^$").replace(".*", ""), nm):
+                d.qpos[m.jnt_qposadr[i]] = val
+                break
+    d.qpos[:3] = 0.0
+    d.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+    mujoco.mj_forward(m, d)
+
+    # Lowest corner of either contact pad, with the base frame at z = 0.
+    corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], float)
+    lowest = min(
+        (d.geom_xpos[g] + (corners * m.geom_size[g]) @ d.geom_xmat[g].reshape(3, 3).T)[:, 2].min()
+        for g in (
+            mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"{s}_foot_collision")
+            for s in ("left", "right")
+        )
+    )
+    kinematic_rigid = -lowest - H_ADD
+    assert kinematic_rigid == pytest.approx(0.11710, abs=0.002)
+    assert RIGID_STAND_HEIGHT < kinematic_rigid, (
+        "the robot cannot stand taller in HOME_FRAME than its own kinematics allow"
+    )
+
+
 def test_registered_hop_cfgs_carry_their_own_arm_stiffness():
     """End-to-end, through the registered task -- not the transform in
     isolation. The registration loop must thread stiffness=_k into

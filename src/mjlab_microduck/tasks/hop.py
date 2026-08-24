@@ -37,7 +37,26 @@ HOP_PERIOD = 1.0
 # Rigid standing trunk height, and the height gain the reward asks for on top.
 # The ported reward hardcoded 0.135 = 0.12 + 0.015 for the RIGID robot; these
 # split that into its two parts so h_add can be added correctly.
-RIGID_STAND_HEIGHT = 0.120
+#
+# MEASURED, 2026-08-24, NOT the ported 0.120. The old value turned out to be the
+# robot_walk.xml SPAWN height (model qpos0[2] == 0.120) rather than a settled
+# standing height -- the robot cannot actually stand that tall in HOME_FRAME.
+#
+# Method (see the test with the same number in tests/test_hop_cfg.py): compile
+# the registered LOCKED arm, drop it on a floor plane in HOME_FRAME with the base
+# pinned to vertical travel only (it topples in ~1 s otherwise, and an unpinned
+# settle measures tipping), settle 3000 steps -- the horizon both of this
+# campaign's existing settle probes use -- and read the root z. That reads
+# 0.1395 m, and the Locked arm WEARS the pad, so the rigid height is
+# 0.1395 - H_ADD(0.030) = 0.1095. That is 10.5 mm below the ported 0.120.
+#
+# Bracketing, because the settle creeps (the hip_roll actuators splay slowly
+# against the pin): the sag-free KINEMATIC height -- HOME_FRAME, upright, lowest
+# pad corner exactly on the floor -- is 0.1171 rigid, and an 80 s settle reaches
+# 0.1035. So the true value is inside [0.1035, 0.1171] on any reading, and the
+# old 0.120 sat ABOVE even the sag-free ceiling. Corroboration: the velocity
+# env's `com_height_target` band for the rigid robot is 0.11-0.14.
+RIGID_STAND_HEIGHT = 0.1095
 HOP_HEIGHT_GAIN = 0.015
 
 HOP_HEIGHT_STD = 0.008
