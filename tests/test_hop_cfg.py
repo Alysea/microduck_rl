@@ -8,6 +8,7 @@ from mjlab_microduck.tasks.hop import (
     HOP_HEIGHT_GAIN,
     HOP_PERIOD,
     RIGID_STAND_HEIGHT,
+    SENSOR_NAME,
     hop_target_height,
     make_hop_variant,
 )
@@ -91,6 +92,37 @@ def test_forward_locomotion_rewards_removed(hop_cfg):
     overwritten the twist command those terms read."""
     for name in ("track_linear_velocity", "track_angular_velocity"):
         assert name not in hop_cfg.rewards
+
+
+def test_walking_air_time_reward_removed(hop_cfg):
+    """`air_time` (mjlab's feet_air_time, weight 5.0) pays a PER-FOOT indicator
+    over 0.10-0.25 s of flight, i.e. it pays continuously for alternating
+    single-foot stepping. Integrated over a cycle, marching in place earns
+    ~3.0/step against ~1.0/step for a 1.0 s hop, and at most ~1.1/step is
+    available from all three hop terms combined — so leaving it in makes a bob in
+    place strictly outscore hopping, on all three arms equally, and the campaign
+    would conclude "compliance does not help" from three runs that never hopped.
+
+    Its command gate (||cmd[:2]|| + |cmd[2]| > 0.01) is also permanently latched
+    on: the phase command's magnitude is identically 1.0."""
+    assert "air_time" not in hop_cfg.rewards
+
+
+def test_air_time_is_present_in_the_walking_env_this_is_removed_from():
+    """Guard the guard: if mjlab renamed or dropped the term upstream, the
+    assertion above would pass vacuously and stop protecting anything."""
+    assert "air_time" in make_microduck_velocity_env_cfg().rewards
+
+
+def test_hop_body_height_is_gated_on_the_contact_sensor(hop_cfg):
+    """The height reward must be gated on both feet airborne, or it pays ~0.57 of
+    peak for straightening the legs while planted. The gate reads the same sensor
+    as hop_both_feet_airborne, so the two terms cannot disagree about what a hop
+    is; make_hop_variant threads it explicitly rather than leaning on the default."""
+    height = hop_cfg.rewards["hop_body_height"]
+    airborne = hop_cfg.rewards["hop_both_feet_airborne"]
+    assert height.params["sensor_name"] == SENSOR_NAME
+    assert height.params["sensor_name"] == airborne.params["sensor_name"]
 
 
 def test_action_rate_curriculum_untouched(hop_cfg):

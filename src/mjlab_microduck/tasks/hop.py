@@ -15,7 +15,8 @@ Four changes:
 
 1. Replace the twist command with the CYCLIC phase command already on develop.
 2. Retarget the ported height reward for the robot's actual standing height.
-3. Drop forward-locomotion rewards — this is a hop in place.
+3. Drop the forward-locomotion rewards (this is a hop in place) AND the walking
+   `air_time` reward, which outscores hopping with a march in place.
 4. Register the three hop rewards and the energy monitor.
 """
 
@@ -50,6 +51,30 @@ ENERGY_MONITOR_WEIGHT = 1.0
 # Forward-locomotion rewards read the twist command, which the phase command
 # overwrites with [cos, sin, 0]. Left in place they would reward running away.
 _LOCOMOTION_REWARDS = ("track_linear_velocity", "track_angular_velocity")
+
+# Removed for a DIFFERENT reason than the locomotion rewards above, hence its own
+# list: `air_time` does not reward running away, it rewards WALKING IN PLACE, and
+# it pays more for that than the hop rewards pay for hopping.
+#
+# `air_time` is mjlab's `feet_air_time` at weight 5.0. It sums a PER-FOOT
+# indicator over the window 0.10 s < air_time < 0.25 s, so it pays continuously
+# for alternating single-foot flight. Integrated over one cycle: in-place
+# alternating stepping with ~0.25 s swings earns ~3.0/step, whereas a 1.0 s hop
+# with 0.2 s of two-foot flight earns ~1.0/step -- against at most ~1.1/step
+# available from all three hop terms combined. Marching in place therefore
+# strictly outscores hopping, identically on all three arms, and the campaign
+# would conclude "compliance does not help" from three runs that never hopped.
+#
+# It is also permanently latched ON: its gate is ||cmd[:2]|| + |cmd[2]| > 0.01,
+# and the phase command [cos(2*pi*phi), sin(2*pi*phi), 0] has magnitude
+# identically 1.0. There is no commanded speed left for it to gate on.
+#
+# NOT swapped for `feet_air_time_capped`: capping fixes double-payment for
+# two-foot flight, but the defeat here comes from the continuous SINGLE-foot
+# incentive, which capping leaves intact. And the hop task already has its own
+# airborne reward, `hop_both_feet_airborne` at weight 3.0 -- which pays only when
+# BOTH feet are off the ground, i.e. for the behaviour we actually want.
+_WALKING_GAIT_REWARDS = ("air_time",)
 
 # LANDING SURVIVAL: the spec asks for a landing-survival term. It is met by the
 # terms already present rather than by a new one -- the velocity env's `upright`
@@ -128,6 +153,11 @@ def make_hop_variant(
     for name in _LOCOMOTION_REWARDS:
         cfg.rewards.pop(name, None)
 
+    # ...and the walking gait reward, which pays more for marching in place than
+    # the hop rewards pay for hopping. See _WALKING_GAIT_REWARDS above.
+    for name in _WALKING_GAIT_REWARDS:
+        cfg.rewards.pop(name, None)
+
     # 4. Hop rewards. All three gate internally on sin(2*pi*phase) > 0.
     cfg.rewards["hop_both_feet_airborne"] = RewardTermCfg(
         func=microduck_mdp.hop_both_feet_airborne,
@@ -146,6 +176,10 @@ def make_hop_variant(
             "command_name": "twist",
             "target_height": hop_target_height(h_add),
             "std": HOP_HEIGHT_STD,
+            # Threaded explicitly: this term is gated on BOTH FEET AIRBORNE
+            # (otherwise it pays for a ground-level bob), and that gate reads the
+            # same contact sensor as hop_both_feet_airborne above.
+            "sensor_name": SENSOR_NAME,
         },
     )
 
