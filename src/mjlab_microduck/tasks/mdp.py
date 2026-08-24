@@ -6342,3 +6342,77 @@ def spring_compression_monitor(
         ).float().mean()
 
     return zeros
+
+
+def hop_both_feet_airborne(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+) -> torch.Tensor:
+    """Reward both feet simultaneously airborne during the LAUNCH half-cycle.
+
+    Ported from the abandoned `jump` branch. Gated on sin(2*pi*phase) > 0 so
+    flight during the recovery half earns nothing — without that gate the policy
+    is rewarded for simply never landing.
+    """
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    if sensor_name not in env.scene.sensors:
+        return zeros
+    found = env.scene.sensors[sensor_name].data.found
+    if found is None or found.shape[1] < 2:
+        return zeros
+    found = torch.nan_to_num(found[:, :2].float(), nan=1.0)   # NaN -> "in contact"
+    both_airborne = ((found[:, 0] <= 0) & (found[:, 1] <= 0)).float()
+
+    cmd = env.command_manager.get_command(command_name)
+    launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
+    return launch * both_airborne
+
+
+def hop_upward_velocity(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    command_name: str = "twist",
+    max_vel: float = 0.5,
+) -> torch.Tensor:
+    """Reward upward base velocity during the launch half-cycle.
+
+    Gives a gradient toward liftoff BEFORE the feet actually leave the ground,
+    which `hop_both_feet_airborne` alone cannot provide (it is all-or-nothing).
+    Clamped to [0, 1] so it saturates and never rewards falling.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    vel_z = torch.nan_to_num(
+        asset.data.root_link_lin_vel_w[:, 2].float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    upward = torch.clamp(vel_z / max_vel, min=0.0, max=1.0)
+
+    cmd = env.command_manager.get_command(command_name)
+    launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
+    return launch * upward
+
+
+def hop_body_height(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    command_name: str = "twist",
+    target_height: float = 0.135,
+    std: float = 0.008,
+) -> torch.Tensor:
+    """Gaussian reward for base height reaching the hop target during launch.
+
+    NOTE: `target_height` is NOT a safe default here. The ported value of 0.135
+    is the RIGID robot's ~0.12 m standing height plus 0.015 m of gain. The sprung
+    robot stands H_ADD (0.030 m) taller, so a caller that leaves this at the
+    default is asking the sprung robot to CROUCH. `make_hop_variant` computes it
+    from the robot's actual standing height; see tasks/hop.py.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    height = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2].float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    height_reward = torch.exp(-(((height - target_height) / std) ** 2))
+
+    cmd = env.command_manager.get_command(command_name)
+    launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
+    return launch * height_reward
