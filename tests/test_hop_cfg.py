@@ -1,0 +1,88 @@
+"""Config-level assertions for the hop variant transform."""
+
+import pytest
+
+from mjlab_microduck.robot.sprung_foot import H_ADD
+from mjlab_microduck.tasks import mdp as microduck_mdp
+from mjlab_microduck.tasks.hop import (
+    HOP_HEIGHT_GAIN,
+    HOP_PERIOD,
+    RIGID_STAND_HEIGHT,
+    hop_target_height,
+    make_hop_variant,
+)
+from mjlab_microduck.tasks.microduck_velocity_env_cfg import (
+    make_microduck_velocity_env_cfg,
+)
+
+
+@pytest.fixture
+def hop_cfg():
+    return make_hop_variant(make_microduck_velocity_env_cfg(), h_add=H_ADD)
+
+
+def test_command_is_the_cyclic_phase_command(hop_cfg):
+    term = hop_cfg.commands["twist"]
+    assert term.class_type is microduck_mdp.GroundPickPhaseCommand
+    assert term.period == pytest.approx(HOP_PERIOD)
+
+
+def test_height_target_is_shifted_by_h_add(hop_cfg):
+    """The ported reward hardcodes 0.135 for the RIGID robot. The sprung robot
+    stands H_ADD taller, so an unshifted target asks it to CROUCH."""
+    expected = RIGID_STAND_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
+    assert hop_cfg.rewards["hop_body_height"].params["target_height"] == pytest.approx(expected)
+    assert hop_target_height(H_ADD) == pytest.approx(expected)
+
+
+def test_rigid_variant_target_is_not_shifted():
+    rigid = make_hop_variant(make_microduck_velocity_env_cfg(), h_add=0.0)
+    expected = RIGID_STAND_HEIGHT + HOP_HEIGHT_GAIN
+    assert rigid.rewards["hop_body_height"].params["target_height"] == pytest.approx(expected)
+
+
+def test_all_three_hop_rewards_registered_with_positive_weight(hop_cfg):
+    for name, func in (
+        ("hop_both_feet_airborne", microduck_mdp.hop_both_feet_airborne),
+        ("hop_upward_velocity", microduck_mdp.hop_upward_velocity),
+        ("hop_body_height", microduck_mdp.hop_body_height),
+    ):
+        term = hop_cfg.rewards[name]
+        assert term.func is func
+        assert term.weight > 0.0
+
+
+def test_energy_monitor_registered_with_non_zero_weight(hop_cfg):
+    # RewardManager.compute skips weight==0.0 terms before calling them.
+    term = hop_cfg.rewards["hop_energy_monitor"]
+    assert term.func is microduck_mdp.hop_energy_monitor
+    assert term.weight != 0.0
+
+
+def test_energy_monitor_stiffness_threads_through_the_variant():
+    """make_hop_variant's default (3900.0) is only correct for the k3900 arm.
+    Task 4 also registers a k2500 arm; without this parameter threading through,
+    hop_energy_monitor would report that arm's stored spring energy 56% high."""
+    cfg = make_hop_variant(make_microduck_velocity_env_cfg(), h_add=H_ADD, stiffness=2500.0)
+    assert cfg.rewards["hop_energy_monitor"].params["stiffness"] == 2500.0
+
+
+def test_forward_locomotion_rewards_removed(hop_cfg):
+    """This is a hop in place. Leaving velocity tracking in would reward the
+    policy for running away instead of hopping, and the phase command has
+    overwritten the twist command those terms read."""
+    for name in ("track_linear_velocity", "track_angular_velocity"):
+        assert name not in hop_cfg.rewards
+
+
+def test_action_rate_curriculum_untouched(hop_cfg):
+    rigid = make_microduck_velocity_env_cfg()
+    expected = [dict(s) for s in rigid.curriculum["action_rate_weight"].params["weight_stages"]]
+    actual = [dict(s) for s in hop_cfg.curriculum["action_rate_weight"].params["weight_stages"]]
+    assert actual == expected
+
+
+def test_hop_period_is_above_the_spring_mass_period():
+    """At k=3900 and 0.877 kg the spring-mass period is ~94 ms. A hop period at
+    or below that would drive the spring faster than it can cycle."""
+    assert HOP_PERIOD > 0.094
