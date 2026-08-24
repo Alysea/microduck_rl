@@ -107,6 +107,23 @@ SPRING_PRELOAD = 0.00074   # m of precompression at rest
 SPRING_FRICTIONLOSS = 0.0
 SPRING_ARMATURE = 0.0
 
+# Joint-limit solver settings for the mechanical end-stop.
+#
+# MuJoCo's default limit ([0.02, 1] with dt=0.002, i.e. a 10*dt time constant) is
+# soft enough that a hard landing squishes straight through it: a drop-rig probe
+# drove k=1500 to 149% of its 12 mm travel from a 100 mm drop. A stop that
+# stores-and-returns instead of dissipating systematically overstates rebound,
+# which matters because bottoming is common in hop and jump regimes.
+#
+# 0.004 is the solver's stability floor (2*timestep). Tuned empirically, not
+# guessed: it cuts worst-case penetration from 149% to 109% of travel, and the
+# stiff arms stay well inside range. MuJoCo cannot make this stop truly rigid at
+# a 2 ms timestep, so a residual ~9% overshoot remains under the worst impacts.
+# Read a high `spring_bottomed_fraction` as "this arm bottoms out" rather than
+# trusting its rebound magnitude to the millimetre.
+SPRING_SOLREF_LIMIT = (0.004, 1.0)          # (timeconst, dampratio)
+SPRING_SOLIMP_LIMIT = (0.9, 0.99, 0.001, 0.5, 2.0)   # dmax 0.95 -> 0.99
+
 SPRING_JOINTS = ("passive_left_foot_spring", "passive_right_foot_spring")
 
 # The `<default class="collision">` block in robot_walk.xml (group=3). The pad's
@@ -195,6 +212,9 @@ def make_sprung_foot_spec_fn(
                 # element 0 is used by the compiler.
                 joint.stiffness = np.array([stiffness, 0.0, 0.0])
                 joint.damping = np.array([resolved_damping, 0.0, 0.0])
+                # Stiffen the mechanical end-stop; see the constants above.
+                joint.solref_limit = np.array(SPRING_SOLREF_LIMIT)
+                joint.solimp_limit = np.array(SPRING_SOLIMP_LIMIT)
                 # MuJoCo's spring force is -stiffness * (qpos - springref).
                 # Our convention is q=0 extended, q>0 compressed, so a NEGATIVE
                 # springref puts a compression-resisting force at q=0: the

@@ -265,3 +265,17 @@ def test_explicit_damping_overrides_the_ratio():
     m = make_sprung_foot_spec_fn(stiffness=3900.0, damping=7.5)().compile()
     jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, SPRING_JOINTS[0])
     assert m.dof_damping[m.jnt_dofadr[jid]] == pytest.approx(7.5)
+
+
+def test_spring_joint_limit_is_stiffened(model):
+    """The mechanical end-stop must be stiffer than MuJoCo's default.
+
+    The default ([0.02, 1] at dt=0.002) let a 100 mm drop drive a 1500 N/m
+    spring to 149% of its 12 mm travel — a stop that stores and returns energy
+    instead of dissipating it overstates rebound, and bottoming is common in
+    hop/jump regimes. 0.004 is the solver's stability floor (2*timestep).
+    """
+    for j in SPRING_JOINTS:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+        assert model.jnt_solref[jid][0] == pytest.approx(0.004)
+        assert model.jnt_solimp[jid][1] == pytest.approx(0.99)
