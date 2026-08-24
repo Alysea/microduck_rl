@@ -137,6 +137,56 @@ def test_body_height_is_gated_by_the_launch_phase():
     assert float(out[0]) == 0.0
 
 
+def test_body_height_is_zero_at_the_target_with_both_feet_in_contact():
+    """The airborne gate. HOME_FRAME is a parallelogram crouch, so simply
+    STRAIGHTENING THE LEGS raises the trunk ~9 mm with both feet still planted.
+    Ungated, that ground-level bob — extend while sin > 0, crouch while sin < 0,
+    never leave the ground — collects most of the peak reward and is entirely
+    spring-irrelevant, which is exactly the confound this experiment exists to
+    avoid. Same height as the passing case below; only the contact differs."""
+    env = _Env(found=[[1.0, 1.0]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
+    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
+    assert float(out[0]) == 0.0
+
+
+def test_body_height_is_paid_at_the_same_height_when_both_feet_are_airborne():
+    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
+    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
+    assert abs(float(out[0]) - 1.0) < 1e-6
+
+
+def test_body_height_is_zero_with_only_one_foot_airborne():
+    """A single-foot lift is a step, not a hop."""
+    env = _Env(found=[[0.0, 1.0]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
+    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
+    assert float(out[0]) == 0.0
+
+
+def test_body_height_and_airborne_reward_read_the_same_predicate():
+    """The gate must be the SAME predicate hop_both_feet_airborne pays for, or
+    the policy can be paid for an apex the other term does not call a hop.
+    Sweep every contact combination and require the two to agree on zero/non-zero."""
+    for found in ([[0.0, 0.0]], [[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]):
+        env = _Env(found=found, cmd=[[0.0, 1.0, 0.0]], z=[0.165])
+        airborne = float(hop_both_feet_airborne(env, sensor_name=_SENSOR, command_name=_CMD)[0])
+        height = float(hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)[0])
+        assert (airborne > 0.0) == (height > 0.0), found
+
+
+def test_body_height_treats_a_nan_contact_read_as_in_contact():
+    """Never pay for flight we cannot actually see."""
+    env = _Env(found=[[float("nan"), float("nan")]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
+    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
+    assert float(out[0]) == 0.0
+
+
+def test_body_height_is_zero_without_the_contact_sensor():
+    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
+    env.scene.sensors = {}
+    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
+    assert float(out[0]) == 0.0
+
+
 def test_all_three_terms_are_nan_safe():
     env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]],
                vz=[float("nan")], z=[float("nan")])

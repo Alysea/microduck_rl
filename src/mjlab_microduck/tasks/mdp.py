@@ -6344,6 +6344,27 @@ def spring_compression_monitor(
     return zeros
 
 
+def _both_feet_airborne(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor | None:
+    """1.0 where BOTH feet are off the ground, else 0.0. Shape (num_envs,).
+
+    Shared by `hop_both_feet_airborne` and `hop_body_height` so the two cannot
+    drift apart — the height reward's gate MUST be the same predicate the
+    airborne reward pays for, or the policy can be paid for a hop that the other
+    term does not consider a hop.
+
+    Returns None when the contact sensor is missing or malformed, so the caller
+    can decide what a sensorless env means for it. NaN contact reads are treated
+    as "in contact": never pay for flight we cannot actually see.
+    """
+    if sensor_name not in env.scene.sensors:
+        return None
+    found = env.scene.sensors[sensor_name].data.found
+    if found is None or found.shape[1] < 2:
+        return None
+    found = torch.nan_to_num(found[:, :2].float(), nan=1.0)   # NaN -> "in contact"
+    return ((found[:, 0] <= 0) & (found[:, 1] <= 0)).float()
+
+
 def hop_both_feet_airborne(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
@@ -6356,13 +6377,9 @@ def hop_both_feet_airborne(
     is rewarded for simply never landing.
     """
     zeros = torch.zeros(env.num_envs, device=env.device)
-    if sensor_name not in env.scene.sensors:
+    both_airborne = _both_feet_airborne(env, sensor_name)
+    if both_airborne is None:
         return zeros
-    found = env.scene.sensors[sensor_name].data.found
-    if found is None or found.shape[1] < 2:
-        return zeros
-    found = torch.nan_to_num(found[:, :2].float(), nan=1.0)   # NaN -> "in contact"
-    both_airborne = ((found[:, 0] <= 0) & (found[:, 1] <= 0)).float()
 
     cmd = env.command_manager.get_command(command_name)
     launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
@@ -6398,15 +6415,35 @@ def hop_body_height(
     command_name: str = "twist",
     target_height: float = 0.135,
     std: float = 0.008,
+    sensor_name: str = "feet_ground_contact",
 ) -> torch.Tensor:
-    """Gaussian reward for base height reaching the hop target during launch.
+    """Gaussian reward for base height reaching the hop target WHILE AIRBORNE.
+
+    The airborne gate is load-bearing, not defensive. HOME_FRAME is a
+    parallelogram crouch (hip_pitch 26.2 deg, knee ~0, ankle -26 deg); simply
+    straightening the legs raises the trunk ~9 mm with BOTH FEET STILL PLANTED.
+    Ungated, that ground-level bob — extend while sin > 0, crouch while sin < 0,
+    never leave the ground — collects a large fraction of the peak reward and is
+    entirely spring-irrelevant, which is exactly the confound this experiment
+    exists to avoid. Gated, the term shapes how HIGH THE HOP GOES rather than how
+    tall the robot stands.
+
+    The gate does not have to bootstrap flight on its own:
+    `hop_both_feet_airborne` (weight 3.0) supplies the gradient to leave the
+    ground, and this term then shapes the apex. Both read the same predicate,
+    `_both_feet_airborne`.
 
     NOTE: `target_height` is NOT a safe default here. The ported value of 0.135
-    is the RIGID robot's ~0.12 m standing height plus 0.015 m of gain. The sprung
-    robot stands H_ADD (0.030 m) taller, so a caller that leaves this at the
-    default is asking the sprung robot to CROUCH. `make_hop_variant` computes it
-    from the robot's actual standing height; see tasks/hop.py.
+    is the RIGID robot's standing height plus 0.015 m of gain. The sprung robot
+    stands H_ADD (0.030 m) taller, so a caller that leaves this at the default is
+    asking the sprung robot to CROUCH. `make_hop_variant` computes it from the
+    robot's measured standing height; see tasks/hop.py.
     """
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    both_airborne = _both_feet_airborne(env, sensor_name)
+    if both_airborne is None:
+        return zeros
+
     asset: Entity = env.scene[asset_cfg.name]
     height = torch.nan_to_num(
         asset.data.root_link_pos_w[:, 2].float(), nan=0.0, posinf=0.0, neginf=0.0
@@ -6415,7 +6452,7 @@ def hop_body_height(
 
     cmd = env.command_manager.get_command(command_name)
     launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
-    return launch * height_reward
+    return launch * both_airborne * height_reward
 
 
 def hop_energy_monitor(
