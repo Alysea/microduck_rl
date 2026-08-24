@@ -52,7 +52,7 @@ Checked against the working tree before this plan was written:
    `(cfg, stiffness, travel=TRAVEL, h_add=H_ADD, pad_mass=PAD_MASS)`.
 6. **The velocity env already carries an `upright` reward** at weight 1.0
    (`microduck_velocity_env_cfg.py:267`), retained by the hop transform.
-5. Spring-mass period at k=3900, m=0.877 kg is `2π√(m/k)` = **94 ms**.
+7. Spring-mass period at k=3900, m=0.877 kg is `2π√(m/k)` = **94 ms**.
 
 ---
 
