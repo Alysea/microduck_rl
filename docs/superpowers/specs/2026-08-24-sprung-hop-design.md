@@ -166,3 +166,61 @@ detail.
 - **The hop period is a guess.** ~94 ms is the spring-mass period at k=3900, but
   the right hop period also depends on flight time and the load segment's
   duration, which the policy partly chooses.
+
+## Amendment, 2026-08-24: the reward ceiling
+
+Recorded after implementation, because it changes one item this spec listed as
+out of scope. The "Out of scope" list above stands except where noted here.
+
+A whole-plan review found the reward as first built **saturated at roughly
+15-20 mm of height gain**, against the 5-33 mm span of the drop-rig evidence
+this spec argues from. Worse, the per-cycle total was **non-monotone** — a local
+peak at 15 mm and decreasing across 12-32 mm — so all three arms could have
+converged to the same height and criterion 1 would have been untestable. Four
+mechanisms caused it, and all four were changed:
+
+1. The height reward is gated on both feet airborne, so it is evaluated only in
+   flight with the legs unloaded, yet its datum was the **settled** standing
+   height. Moved to the sag-free unloaded height (0.1171 rigid). This one was a
+   measurement error, not a tuning choice.
+2. `HOP_HEIGHT_GAIN` 0.015 -> 0.040 and `HOP_HEIGHT_STD` 0.008 -> 0.020, putting
+   the whole 5-33 mm band on the Gaussian's rising limb. At k=3900 full travel
+   stores 0.631 J across both feet; at `zeta = 0.3` a damped oscillator returns
+   37%, lifting 0.877 kg by ~27 mm — so a 40 mm peak sits deliberately just
+   above the sprung expectation.
+3. `max_vel` 0.5 -> 1.0. At 0.5 m/s the upward-velocity term saturated at
+   `v^2/(2g)` = 12.7 mm, below the entire discriminating band.
+4. **This is the scope change:** `com_height_target`'s *upper* edge was raised
+   from 0.14 to 0.20 in the hop variant only. Crossing the old top forfeited the
+   flat `+1` (x1.2 weight) as a step, at 23 mm of gain — inside the band. The
+   Phase-2 `h_add` **translation** that the out-of-scope list protects is
+   untouched; only the rigid upper edge moves, and only for the hop task. It is
+   safe because the maximum sag-free stance root height is 0.16133, already below
+   the old sprung band top of 0.17, so that edge was unreachable while standing
+   on every arm and only ever fired airborne.
+
+Three findings from the same review were **declined** and remain out of scope by
+decision, not oversight: a horizontal-velocity penalty (so a bounding gait stays
+available, and is a differential confound the sprung arms benefit more from); a
+segmented load/launch/flight/land phase profile (the policy gets a raw sine and
+one half-cycle gate, and must discover the catapult unaided); and the 0.5 mm
+`com_height_target` **floor** mismatch, which is long-standing repo behaviour
+that every prior campaign result including the Phase 1 baseline was obtained
+under — fixing it would break that comparability.
+
+Two things to carry into reading the results:
+
+- **The Gaussian is no longer the dominant term.** At 33 mm of gain it
+  contributes 8.3 of a 44.8 per-cycle total, against 24.0 from the airborne term
+  and 9.6 from the CoM band. The reward is effectively air-time-shaped with
+  height as a secondary shaper. Defensible, since flight time is monotone in
+  apex, but it means the 40 mm choice buys less than it appears to.
+- **"Gain" is not pure spring rebound.** About 14.2 mm of sag-free posture
+  headroom survives the datum fix (max stance root 0.16133 vs HOME_FRAME
+  0.14710), so real headroom to the target is ~26 mm, not 40 mm. Identical on all
+  three arms, so it biases nothing — but do not read the logged gain as rebound.
+- The total now peaks near **65 mm**, where the retained `foot_swing_height`
+  penalty (a bowl centred on 20 mm of foot peak, so quadratic in height above
+  that) finally overtakes the air-time terms, which grow as `sqrt(h)`. That term
+  is retained deliberately: arm-identical and under 1% of the per-cycle total
+  inside the band.
