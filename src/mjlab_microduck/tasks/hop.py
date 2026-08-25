@@ -11,15 +11,20 @@ rebounding 33 mm, while quasi-static actuator loading only just reaches the
 49.7 N needed for full travel (52.4 N available, knee-limited) before BAM
 back-EMF derates it at launch speed. Each landing charges the next launch.
 
-Five changes:
+Six changes:
 
 1. Replace the twist command with the CYCLIC phase command already on develop.
 2. Retarget the ported height reward for the robot's actual standing height.
 3. Drop the forward-locomotion rewards (this is a hop in place) AND the walking
    `air_time` reward, which outscores hopping with a march in place.
-4. Register the three hop rewards and the energy monitor.
+4. Register the three hop rewards, the LOAD-PHASE reward and the energy monitor.
 5. Raise the `com_height_target` band's UPPER edge, which otherwise puts a step
    penalty inside the height range the experiment needs explored.
+6. Silence `com_height_target` during the launch half — it was the single largest
+   reward for standing perfectly still, which is what the first sweep learned.
+
+Steps 4 (the load reward) and 6, together with the 4x on the hop weights, are the
+rebalance that followed that null. See the budget comment beside the weights.
 """
 
 import dataclasses
@@ -109,7 +114,7 @@ UNLOADED_RIGID_HEIGHT = 0.1171
 #
 # The tradeoff, deliberately accepted: at zero gain the term is exp(-4) = 0.018,
 # so it gives almost no gradient until the robot is already leaving the ground.
-# `hop_both_feet_airborne` (weight 3.0, binary) is the DISCOVERY term; this one
+# `hop_both_feet_airborne` (weight AIRBORNE_WEIGHT, binary) is the DISCOVERY term; this one
 # only shapes how high once airborne.
 HOP_HEIGHT_GAIN = 0.040
 HOP_HEIGHT_STD = 0.020
@@ -132,9 +137,57 @@ HOP_COM_HEIGHT_MAX = 0.20
 
 SENSOR_NAME = "feet_ground_contact"
 
-AIRBORNE_WEIGHT = 3.0
-UPWARD_VELOCITY_WEIGHT = 2.0
-BODY_HEIGHT_WEIGHT = 2.0
+# THE REWARD BUDGET. Do not "tidy" these back down -- the 4x is the whole fix
+# for the first Phase 4 sweep's null, and the 1/pi below is where it comes from.
+#
+# All three hop terms gate on `launch = clamp(sin(2*pi*phi), 0)`, whose mean over
+# a cycle is exactly 1/pi = 0.318. So a term's per-step ceiling is not its weight,
+# it is weight * 0.318 -- and it only reaches that if the shaped factor it
+# multiplies is pinned at 1.0 the whole launch half, which no real hop achieves.
+#
+# At the ORIGINAL weights (3.0 / 2.0 / 2.0):
+#
+#   term                      weight   ceiling/step
+#   hop_both_feet_airborne      3.0       0.955
+#   hop_upward_velocity         2.0       0.637
+#   hop_body_height             2.0       ~0.3    (Gaussian, never pinned at 1)
+#   ------------------------------------------------
+#   physically impossible perfect hopper  ~1.9
+#
+# Standing perfectly still pays `com_height_target` 1.2 + `upright` 1.0 = 2.2 per
+# step, at lower `action_rate_l2` cost and with near-zero fall risk. A PERFECT HOP
+# LOST TO STANDING STILL before any risk was counted. The first sweep -- three
+# arms, 8000 iterations each -- did not fail to find hopping; it correctly found
+# that hopping was worse, and all three converged to standing (both feet airborne
+# 0.07-0.3% of the time).
+#
+# 4x on all three restores the inequality: (12 + 8 + 8) * 1/pi = 8.9/step of hop
+# ceiling against 2.2/step of standing. `tests/test_hop_cfg.py` pins that ratio at
+# >= 2x, computed from the registered weights.
+AIRBORNE_WEIGHT = 12.0
+UPWARD_VELOCITY_WEIGHT = 8.0
+BODY_HEIGHT_WEIGHT = 8.0
+
+# The other half of the fix: the load phase. All three terms above gate on the
+# LAUNCH half (sin > 0), so nothing rewarded the load half at all -- see
+# `microduck_mdp.hop_load_force` for why that blocks the whole mechanism.
+# Held well below the launch terms on purpose: this is the enabling countermovement,
+# not the objective. Its ceiling is 4.0 * 1/pi = 1.27/step.
+LOAD_FORCE_WEIGHT = 4.0
+
+# Robot weight in newtons, the datum `hop_load_force` normalises against:
+# 0.877 kg (737 g robot + 2 x 70 g boot, worn by ALL THREE arms including Locked)
+# x 9.81 m/s^2. Named rather than left as a literal because the same 0.877 kg
+# appears in the spring-mass period and energy notes above.
+BODY_WEIGHT_N = 8.60
+
+# Multiple of body weight at which `hop_load_force` saturates. 2.0 means the term
+# reads 0 at a plain stand and 1.0 once the feet push with twice body weight.
+# Threaded explicitly rather than left on the function default, for the same
+# reason `sensor_name` and `stiffness` are: this campaign has been burned by
+# defaults that were only correct for one arm.
+LOAD_FORCE_MAX_RATIO = 2.0
+
 ENERGY_MONITOR_WEIGHT = 1.0
 
 # Forward-locomotion rewards read the twist command, which the phase command
@@ -150,8 +203,11 @@ _LOCOMOTION_REWARDS = ("track_linear_velocity", "track_angular_velocity")
 # for alternating single-foot flight. Integrated over one cycle: in-place
 # alternating stepping with ~0.25 s swings earns ~3.0/step, whereas a 1.0 s hop
 # with 0.2 s of two-foot flight earns ~1.0/step -- against at most ~1.1/step
-# available from all three hop terms combined. Marching in place therefore
-# strictly outscores hopping, identically on all three arms, and the campaign
+# available from all three hop terms combined AT THE ORIGINAL 3.0/2.0/2.0 weights
+# (see the budget comment beside them; the 4x raises that ceiling to ~8.9/step,
+# which does not make `air_time` safe to keep -- it still pays for the wrong
+# behaviour, it just no longer wins outright). Marching in place therefore
+# strictly outscored hopping, identically on all three arms, and the campaign
 # would conclude "compliance does not help" from three runs that never hopped.
 #
 # It is also permanently latched ON: its gate is ||cmd[:2]|| + |cmd[2]| > 0.01,
@@ -161,8 +217,8 @@ _LOCOMOTION_REWARDS = ("track_linear_velocity", "track_angular_velocity")
 # NOT swapped for `feet_air_time_capped`: capping fixes double-payment for
 # two-foot flight, but the defeat here comes from the continuous SINGLE-foot
 # incentive, which capping leaves intact. And the hop task already has its own
-# airborne reward, `hop_both_feet_airborne` at weight 3.0 -- which pays only when
-# BOTH feet are off the ground, i.e. for the behaviour we actually want.
+# airborne reward, `hop_both_feet_airborne` at AIRBORNE_WEIGHT -- which pays only
+# when BOTH feet are off the ground, i.e. for the behaviour we actually want.
 _WALKING_GAIT_REWARDS = ("air_time",)
 
 # NOT removed, deliberately: `foot_swing_height` (weight -0.25, relative-squared
@@ -289,6 +345,19 @@ def make_hop_variant(
         },
     )
 
+    # The load half. The three terms above all gate on sin > 0; this one gates on
+    # sin < 0, and is what pays for the countermovement that charges the spring.
+    cfg.rewards["hop_load_force"] = RewardTermCfg(
+        func=microduck_mdp.hop_load_force,
+        weight=LOAD_FORCE_WEIGHT,
+        params={
+            "sensor_name": SENSOR_NAME,
+            "command_name": "twist",
+            "body_weight_n": BODY_WEIGHT_N,
+            "max_ratio": LOAD_FORCE_MAX_RATIO,
+        },
+    )
+
     # Energy instrument. Returns zeros, so the weight only has to be non-zero
     # for RewardManager.compute to call it at all.
     cfg.rewards["hop_energy_monitor"] = RewardTermCfg(
@@ -324,6 +393,23 @@ def make_hop_variant(
     #    this, it shifts both edges by h_add and yields [0.14, 0.23] for the
     #    sprung arms -- comfortably above the 0.1871 target apex.
     cfg.rewards["com_height_target"].params["target_height_max"] = HOP_COM_HEIGHT_MAX
+
+    # 6. ...and stop paying it at all during the LAUNCH half.
+    #
+    #    Even with the ceiling lifted, the term's flat +1-in-band (x1.2) was the
+    #    single largest reward for standing perfectly still, which is what all
+    #    three arms of the first sweep learned. During launch we want the robot
+    #    LEAVING the band, so swap the func for the recovery-gated wrapper.
+    #
+    #    MUTATE IN PLACE, do not rebuild the term. `make_sprung_variant` runs
+    #    AFTER this transform and looks the term up by the key
+    #    "com_height_target", then shifts `target_height_min`/`target_height_max`
+    #    by h_add. Renaming the key or dropping either param silently breaks the
+    #    band shift on EVERY sprung arm -- which is why the wrapper takes those
+    #    two params through unchanged and only adds `command_name`.
+    com = cfg.rewards["com_height_target"]
+    com.func = microduck_mdp.com_height_target_recovery_only
+    com.params["command_name"] = "twist"
 
     return cfg
 

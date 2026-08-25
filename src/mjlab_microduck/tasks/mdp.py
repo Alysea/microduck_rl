@@ -6429,8 +6429,9 @@ def hop_body_height(
     tall the robot stands.
 
     The gate does not have to bootstrap flight on its own:
-    `hop_both_feet_airborne` (weight 3.0) supplies the gradient to leave the
-    ground, and this term then shapes the apex. Both read the same predicate,
+    `hop_both_feet_airborne` (the largest-weighted hop term) supplies the
+    gradient to leave the ground, and this term then shapes the apex. Both read
+    the same predicate,
     `_both_feet_airborne`.
 
     NOTE: `target_height` is NOT a safe default here. The ported value of 0.135
@@ -6510,3 +6511,104 @@ def hop_energy_monitor(
         log["Metrics/hop_spring_energy_mean"] = energy.mean()
         log["Metrics/hop_spring_energy_peak"] = energy.max()
     return zeros
+
+
+def hop_load_force(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    body_weight_n: float = 8.60,
+    max_ratio: float = 2.0,
+) -> torch.Tensor:
+    """Reward pressing INTO the ground during the LOAD half-cycle.
+
+    The missing half of the hop reward. All three of `hop_both_feet_airborne`,
+    `hop_upward_velocity` and `hop_body_height` gate on `sin(2*pi*phi) > 0` — the
+    LAUNCH half — so nothing at all paid for the load half, and the load half is
+    the only way out of the campaign's central circularity: spring compression is
+    x = F/k, so under body weight alone x is static sag (0.48 mm at k=3900,
+    ~0.45 mJ, worth 0.1 mm of lift). Real storage needs impact velocity — 1.20 m/s,
+    a 73 mm fall — so the spring needs a hop to charge and the hop needs a charged
+    spring. An actuator COUNTERMOVEMENT (crouch, press down, release) is what
+    breaks that, and this is the term that pays for it.
+
+    Deliberately a FORCE reward, NOT a spring-compression reward. Both arms can
+    press down; only the sprung arms convert that press into stored energy. A
+    compression reward would give the Locked control no signal at all — it has no
+    spring joint — and destroy the controlled comparison the experiment rests on.
+
+    Shape::
+
+        reward = clamp(-sin(2*pi*phi), 0)
+                 * clamp((F_total / body_weight_n - 1) / (max_ratio - 1), 0, 1)
+
+    so it is zero at exactly body weight (merely standing earns nothing) and
+    saturates at `max_ratio` x body weight.
+
+    Force source: the SAME field mjlab's `soft_landing` reads to log
+    `Metrics/landing_force_mean` — `ContactSensor.data.force`, [B, N, 3], with N
+    the two foot geoms. `feet_ground_contact` is configured `reduce="netforce"`,
+    which mjlab documents as summing all contacts into the GLOBAL frame, so
+    index 2 is the true vertical component. `soft_landing` takes the 3-vector's
+    norm; this term takes |z| instead, because the semantics here are vertical
+    ground reaction force and a norm would fold in horizontal friction shear —
+    a foot scrubbing sideways would score as loading. The absolute value is not
+    defensive rounding: a probe (0.5 kg box settled on a plane, primary=geom /
+    secondary=body, reduce=netforce) reads z = -4.905 N against a 4.905 N weight,
+    i.e. MuJoCo reports this net force pointing DOWN for a foot bearing load.
+    Taking |z| makes the term independent of that convention.
+    """
+    zeros = torch.zeros(env.num_envs, device=env.device)
+    if sensor_name not in env.scene.sensors:
+        return zeros
+    forces = env.scene.sensors[sensor_name].data.force
+    if forces is None or forces.dim() != 3 or forces.shape[-1] != 3:
+        return zeros
+
+    # |vertical component|, summed over both feet. NaN -> 0: never invent load
+    # we cannot actually see.
+    f_z = torch.nan_to_num(forces[..., 2].float(), nan=0.0, posinf=0.0, neginf=0.0)
+    f_total = f_z.abs().sum(dim=1)
+
+    excess = (f_total / body_weight_n - 1.0) / (max_ratio - 1.0)
+    load = torch.clamp(excess, min=0.0, max=1.0)
+
+    cmd = env.command_manager.get_command(command_name)
+    # Recovery/load half: sin(2*pi*phi) < 0, i.e. clamp(-cmd[:, 1], 0).
+    load_gate = torch.clamp(-torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
+    return load_gate * load
+
+
+def com_height_target_recovery_only(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    target_height_min: float = 0.1,
+    target_height_max: float = 0.15,
+) -> torch.Tensor:
+    """`com_height_target`, silenced during the LAUNCH half of the hop cycle.
+
+    `com_height_target` pays a flat +1 for the CoM being anywhere inside its band
+    (x1.2 weight), which made it the single largest reward for standing perfectly
+    still — the behaviour all three arms of the first Phase 4 sweep converged to.
+    During the launch half we want the robot LEAVING that band, so gate the whole
+    term (reward AND its out-of-band quadratic penalty) on the RECOVERY half:
+
+        clamp(-sin(2*pi*phi), 0) = clamp(-cmd[:, 1], 0)
+
+    It therefore still pays for holding a sane stance height through load and
+    landing, and says nothing at all about launch and flight.
+
+    `upright` is deliberately NOT given the same treatment: it genuinely pays for
+    not tipping, and suppressing it at takeoff would encourage tipping at exactly
+    the worst moment.
+    """
+    base = com_height_target(
+        env,
+        asset_cfg=asset_cfg,
+        target_height_min=target_height_min,
+        target_height_max=target_height_max,
+    )
+    cmd = env.command_manager.get_command(command_name)
+    recovery = torch.clamp(-torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
+    return recovery * base

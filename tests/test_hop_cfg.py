@@ -4,17 +4,24 @@ import math
 
 import pytest
 
-from mjlab_microduck.robot.sprung_foot import H_ADD
+from mjlab_microduck.robot.sprung_foot import H_ADD, PAD_MASS
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.hop import (
+    AIRBORNE_WEIGHT,
+    BODY_HEIGHT_WEIGHT,
+    BODY_WEIGHT_N,
     HOP_ARM_SUFFIX,
+    HOP_COM_HEIGHT_MAX,
     HOP_HEIGHT_GAIN,
     HOP_HEIGHT_STD,
     HOP_MAX_LAUNCH_VEL,
     HOP_PERIOD,
+    LOAD_FORCE_MAX_RATIO,
+    LOAD_FORCE_WEIGHT,
     RIGID_STAND_HEIGHT,
     SENSOR_NAME,
     UNLOADED_RIGID_HEIGHT,
+    UPWARD_VELOCITY_WEIGHT,
     hop_target_height,
     make_hop_variant,
 )
@@ -506,3 +513,201 @@ def test_height_gaussian_pays_from_a_standing_start():
         f"({HOP_HEIGHT_GAIN}) -- the Gaussian can be narrowed back into a cliff "
         "without failing the discrimination ratio test above"
     )
+
+
+# ---------------------------------------------------------------------------
+# The reward BUDGET. The first Phase 4 sweep -- three arms, 8000 iterations each
+# -- returned a null: all three converged to standing perfectly still, both feet
+# airborne 0.07-0.3% of the time. The cause was arithmetic, not tuning, and the
+# tests below are the ones that would have caught it before the GPU time was
+# spent.
+# ---------------------------------------------------------------------------
+
+# Mean of the launch gate clamp(sin(2*pi*phi), 0) over one cycle. This factor --
+# not the weight -- is what a hop term is actually worth per step, and it is the
+# whole reason the weights are what they are.
+_LAUNCH_GATE_MEAN = 1.0 / math.pi
+
+
+def test_hop_budget_beats_standing_still():
+    """The inequality the first Phase 4 sweep violated.
+
+    `launch_weight = clamp(sin(2*pi*phi), 0)` averages 1/pi = 0.318 over a cycle,
+    so each hop term's per-step ceiling is `weight * 0.318`. At the original
+    3.0/2.0/2.0 that was 0.955 + 0.637 + ~0.3 = ~1.9/step for a PHYSICALLY
+    IMPOSSIBLE perfect hopper -- a robot pinned at peak reward on all three terms
+    for the entire launch half. Standing perfectly still pays `com_height_target`
+    1.2 + `upright` 1.0 = 2.2/step, at lower `action_rate_l2` cost and near-zero
+    fall risk.
+
+    A perfect hop lost to standing before any risk was counted. The policy did
+    not fail to find hopping; it correctly found that hopping was worse, and all
+    three arms learned to stand.
+
+    Both sides are computed from the REGISTERED weights on a REGISTERED task, not
+    from hardcoded numbers -- the failure mode this guards is precisely a set of
+    weights that look reasonable term by term and lose in aggregate, so the test
+    has to do the aggregation itself. Checked on every arm.
+    """
+    for label in HOP_ARM_SUFFIX:
+        cfg = _registered(label)
+        tid = _hop_task_id(label)
+        rewards = cfg.rewards
+
+        # Hop side: the three launch-gated terms at their per-step ceiling.
+        hop_ceiling = _LAUNCH_GATE_MEAN * sum(
+            rewards[name].weight
+            for name in (
+                "hop_both_feet_airborne",
+                "hop_upward_velocity",
+                "hop_body_height",
+            )
+        )
+
+        # Standing side: both are flat-+1-shaped terms, evaluated at their
+        # maximum, and both are paid EVERY step by a robot that does nothing.
+        standing = rewards["com_height_target"].weight * 1.0 + rewards["upright"].weight * 1.0
+
+        assert hop_ceiling >= 2.0 * standing, (
+            f"{tid}: a perfect hopper's ceiling is {hop_ceiling:.2f}/step against "
+            f"{standing:.2f}/step for standing perfectly still -- only "
+            f"{hop_ceiling / standing:.2f}x. The first Phase 4 sweep ran at "
+            f"{1.9 / 2.2:.2f}x and all three arms learned to stand."
+        )
+
+
+def test_hop_budget_terms_all_exist_on_both_sides():
+    """Guard the guard. The budget test sums named terms; if one were renamed or
+    dropped the sum would silently shrink (hop side) or grow (standing side) and
+    the inequality could pass for the wrong reason."""
+    for label in HOP_ARM_SUFFIX:
+        rewards = _registered(label).rewards
+        for name in (
+            "hop_both_feet_airborne",
+            "hop_upward_velocity",
+            "hop_body_height",
+            "com_height_target",
+            "upright",
+        ):
+            assert name in rewards, f"{_hop_task_id(label)}: {name} missing"
+            assert rewards[name].weight > 0.0, f"{_hop_task_id(label)}: {name} weight <= 0"
+
+
+def test_registered_hop_weights_are_the_rebalanced_ones():
+    """Pin the 4x through the registered tasks. The budget test above is written
+    as a relationship so it survives retuning; this one catches a silent revert of
+    the specific numbers the sweep will be relaunched with."""
+    for label in HOP_ARM_SUFFIX:
+        rewards = _registered(label).rewards
+        tid = _hop_task_id(label)
+        assert rewards["hop_both_feet_airborne"].weight == pytest.approx(AIRBORNE_WEIGHT), tid
+        assert rewards["hop_upward_velocity"].weight == pytest.approx(UPWARD_VELOCITY_WEIGHT), tid
+        assert rewards["hop_body_height"].weight == pytest.approx(BODY_HEIGHT_WEIGHT), tid
+    assert (AIRBORNE_WEIGHT, UPWARD_VELOCITY_WEIGHT, BODY_HEIGHT_WEIGHT) == (12.0, 8.0, 8.0)
+
+
+def test_action_rate_weight_is_untouched_by_the_rebalance():
+    """Explicitly out of scope: the hop weights went up 4x, the action-rate cost
+    did not move. Raising both would cancel the rebalance."""
+    rigid = make_microduck_velocity_env_cfg()
+    for label in HOP_ARM_SUFFIX:
+        assert _registered(label).rewards["action_rate_l2"].weight == pytest.approx(
+            rigid.rewards["action_rate_l2"].weight
+        ), _hop_task_id(label)
+
+
+# --- the load-phase term ----------------------------------------------------
+
+
+def test_load_force_registered_on_every_arm():
+    """Nothing rewarded the load half: all three hop terms gate on sin > 0.
+    Without an actuator countermovement the spring cannot be charged (static sag
+    under body weight alone is 0.48 mm at k=3900, ~0.45 mJ, worth 0.1 mm of
+    lift), so the spring needs a hop to charge and the hop needs a charged
+    spring. This term is what breaks that circularity."""
+    for label in HOP_ARM_SUFFIX:
+        term = _registered(label).rewards["hop_load_force"]
+        tid = _hop_task_id(label)
+        assert term.func is microduck_mdp.hop_load_force, tid
+        assert term.weight == pytest.approx(LOAD_FORCE_WEIGHT), tid
+        assert term.params["sensor_name"] == SENSOR_NAME, tid
+        assert term.params["command_name"] == "twist", tid
+        assert term.params["body_weight_n"] == pytest.approx(BODY_WEIGHT_N), tid
+        assert term.params["max_ratio"] == pytest.approx(LOAD_FORCE_MAX_RATIO), tid
+
+
+def test_load_force_is_identical_on_the_locked_control_arm():
+    """It is a FORCE reward, not a compression reward, precisely so the Locked
+    control gets the same signal. Both arms can press down; only the sprung arms
+    convert that press into stored energy. A compression reward would read
+    identically zero on Locked -- it has no spring joint -- and destroy the
+    controlled comparison the whole experiment rests on."""
+    locked = _registered("locked").rewards["hop_load_force"]
+    sprung = _registered("k3900").rewards["hop_load_force"]
+    assert locked.func is sprung.func
+    assert locked.weight == sprung.weight
+    assert locked.params == sprung.params
+
+
+def test_body_weight_constant_matches_the_measured_mass():
+    """0.877 kg (737 g robot + 2 x 70 g boot, worn by all three arms) x 9.81."""
+    assert BODY_WEIGHT_N == pytest.approx(0.877 * 9.81, abs=0.005)
+    assert PAD_MASS == pytest.approx(0.070)
+
+
+def test_load_force_stays_below_the_launch_terms():
+    """The countermovement is the enabler, not the objective. If pressing down
+    paid more than leaving the ground, the policy's best move would be to squat
+    hard and never jump -- a new way to reach the same null."""
+    for label in HOP_ARM_SUFFIX:
+        rewards = _registered(label).rewards
+        load_ceiling = _LAUNCH_GATE_MEAN * rewards["hop_load_force"].weight
+        launch_ceiling = _LAUNCH_GATE_MEAN * sum(
+            rewards[n].weight
+            for n in ("hop_both_feet_airborne", "hop_upward_velocity", "hop_body_height")
+        )
+        assert load_ceiling < launch_ceiling, _hop_task_id(label)
+
+
+# --- the launch-half silencing of com_height_target --------------------------
+
+
+def test_com_height_target_is_silenced_during_launch():
+    """`com_height_target`'s flat +1-in-band (x1.2) was the single largest reward
+    for standing perfectly still. During the launch half we want the robot LEAVING
+    the band, so the registered term must be the recovery-gated wrapper."""
+    for label in HOP_ARM_SUFFIX:
+        term = _registered(label).rewards["com_height_target"]
+        tid = _hop_task_id(label)
+        assert term.func is microduck_mdp.com_height_target_recovery_only, tid
+        assert term.params["command_name"] == "twist", tid
+
+
+def test_com_height_target_swap_preserves_the_sprung_band_shift():
+    """The swap MUST keep the term's key and its two band params, because
+    `make_sprung_variant` runs AFTER `make_hop_variant`, looks the term up by the
+    key "com_height_target", and shifts `target_height_min`/`target_height_max` by
+    h_add in place. Renaming the key or dropping either param would break the band
+    on every sprung arm silently -- no error, just a robot penalised for its own
+    geometry."""
+    base = make_microduck_velocity_env_cfg().rewards["com_height_target"].params
+    for label in HOP_ARM_SUFFIX:
+        params = _registered(label).rewards["com_height_target"].params
+        tid = _hop_task_id(label)
+        # Both edges present, and both carry the h_add shift applied afterwards.
+        assert params["target_height_min"] == pytest.approx(
+            base["target_height_min"] + H_ADD
+        ), tid
+        assert params["target_height_max"] == pytest.approx(HOP_COM_HEIGHT_MAX + H_ADD), tid
+
+
+def test_upright_is_deliberately_not_gated():
+    """`upright` genuinely pays for not tipping. Suppressing it during launch
+    would encourage tipping at exactly the moment of takeoff, so it keeps the
+    velocity env's func and weight."""
+    rigid = make_microduck_velocity_env_cfg().rewards["upright"]
+    for label in HOP_ARM_SUFFIX:
+        term = _registered(label).rewards["upright"]
+        tid = _hop_task_id(label)
+        assert term.func is rigid.func, tid
+        assert term.weight == pytest.approx(rigid.weight), tid
