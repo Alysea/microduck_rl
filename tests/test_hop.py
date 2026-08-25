@@ -1,5 +1,7 @@
 """Unit tests for the ported hop reward terms (duck-typed fakes)."""
 
+import math
+
 import torch
 
 from mjlab_microduck.tasks.mdp import (
@@ -102,6 +104,65 @@ def test_airborne_not_rewarded_during_the_recovery_half_cycle():
     env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, -1.0, 0.0]])
     out = hop_both_feet_airborne(env, sensor_name=_SENSOR, command_name=_CMD)
     assert float(out[0]) == 0.0
+
+
+# The anti-flutter height gate. Sprung-arm numbers throughout: the robot stands
+# at UNLOADED_RIGID_HEIGHT + H_ADD = 0.1171 + 0.030 = 0.1471, and the gate sits
+# 5 mm above that at 0.1521.
+_SPRUNG_STAND = 0.1471
+_SPRUNG_MIN_HEIGHT = 0.1521
+
+
+def test_airborne_not_rewarded_for_foot_flutter_at_standing_height():
+    """THE EXPLOIT THIS GATE CLOSES, and the test that fails if it is removed.
+
+    Exactly two collision geoms exist on this robot -- the two foot pads; every
+    other geom is contype=0 -- so "both feet airborne" is a statement about two
+    70 g pads and says NOTHING about the 877 g CoM. A policy that retracts both
+    feet ~20 mm at 8-10 Hz with the trunk perfectly still satisfies the contact
+    predicate at ~50% duty inside the launch half, scoring 12*(1/pi)*0.5 =
+    1.9/step -- equal to a genuine 33 mm hop's airborne payout, for a total near
+    5.5/step, with a HIGHER `pose` reward and no fall risk. `foot_swing_height`'s
+    target is 0.02 m, exactly the flutter amplitude, so it is free;
+    `foot_clearance` reads xy velocity only, also free.
+
+    Feet off the ground, mid-launch, body at its ordinary standing height."""
+    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[_SPRUNG_STAND])
+    out = hop_both_feet_airborne(
+        env, sensor_name=_SENSOR, command_name=_CMD, min_height=_SPRUNG_MIN_HEIGHT
+    )
+    assert float(out[0]) == 0.0
+
+
+def test_airborne_rewarded_once_the_body_actually_rises():
+    """Same contacts, same phase as the flutter case above -- only the body
+    height differs. This is the pair that makes the gate meaningful."""
+    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[_SPRUNG_STAND + 0.033])
+    out = hop_both_feet_airborne(
+        env, sensor_name=_SENSOR, command_name=_CMD, min_height=_SPRUNG_MIN_HEIGHT
+    )
+    assert abs(float(out[0]) - 1.0) < 1e-6
+
+
+def test_airborne_height_gate_is_not_cleared_by_unloading_alone():
+    """The threshold references the UNLOADED height, not the settled one. In
+    flight the legs carry no load and the root rises ~7.6 mm of actuator sag for
+    free, so a settled-referenced threshold (0.1395 + 5 mm = 0.1445 on the sprung
+    arm) would be cleared by merely unloading -- re-admitting the flutter exploit
+    through the datum. At the unloaded-referenced threshold it is not."""
+    settled_based = 0.1395 + 0.005
+    assert _SPRUNG_MIN_HEIGHT > settled_based
+    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[_SPRUNG_STAND])
+    assert float(
+        hop_both_feet_airborne(
+            env, sensor_name=_SENSOR, command_name=_CMD, min_height=settled_based
+        )[0]
+    ) == 1.0, "fixture check: the settled-referenced threshold IS cleared by a plain stand"
+    assert float(
+        hop_both_feet_airborne(
+            env, sensor_name=_SENSOR, command_name=_CMD, min_height=_SPRUNG_MIN_HEIGHT
+        )[0]
+    ) == 0.0
 
 
 # --- hop_upward_velocity ----------------------------------------------------
@@ -330,63 +391,133 @@ def _force(total_n, feet=2):
     return [[[0.0, 0.0, per] for _ in range(feet)]]
 
 
-def test_load_force_pays_nothing_during_the_launch_half():
-    """The gate. sin > 0 is launch -- pressing into the ground there is the
-    opposite of what we want, and paying for it would reinstate a reward for
-    simply standing on the ground under load for half the cycle."""
-    env = _Env(cmd=[[0.0, 1.0, 0.0]], force=_force(10 * _BW))
+def _phase(phi):
+    """The phase command the env actually emits: [cos(2*pi*phi), sin(2*pi*phi), 0]."""
+    return [[math.cos(2 * math.pi * phi), math.sin(2 * math.pi * phi), 0.0]]
+
+
+# `hop_load_force` gates on the COSINE channel, clamp(cos(2*pi*phi), 0), which
+# spans phi in [0.75, 1.0) u [0.0, 0.25] -- the countermovement-into-launch
+# window bracketing takeoff at phi = 0. NOT the sin < 0 "load half", which peaks
+# at phi = 0.75, a quarter cycle before the launch gate peaks at phi = 0.25.
+
+_TAKEOFF = 0.0   # cos = +1, gate wide open
+_MID_LAUNCH = 0.25   # cos = 0, gate shut (launch gate's own peak)
+_MID_FLIGHT = 0.5    # cos = -1, gate shut
+_SINE_LOAD_PEAK = 0.75   # cos = 0, gate shut -- the OLD gate's peak
+
+
+def test_load_force_pays_at_takeoff():
+    """phi = 0 is the countermovement-into-launch instant: press here."""
+    env = _Env(cmd=_phase(_TAKEOFF), force=_force(3.5 * _BW))
+    out = hop_load_force(
+        env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=6.0
+    )
+    # (3.5 - 1) / (6.0 - 1) = 0.5, times a gate of cos(0) = 1.0.
+    assert abs(float(out[0]) - 0.5) < 1e-5
+
+
+def test_load_force_pays_nothing_at_mid_launch():
+    """phi = 0.25 is peak flight intent. Pressing into the ground there is the
+    opposite of what we want."""
+    env = _Env(cmd=_phase(_MID_LAUNCH), force=_force(10 * _BW))
+    out = hop_load_force(env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
+    assert abs(float(out[0])) < 1e-6
+
+
+def test_load_force_pays_nothing_at_the_old_sine_gate_peak():
+    """THE RETIMING. `clamp(-sin(2*pi*phi), 0)` -- the literal "load half" --
+    peaks at phi = 0.75, a QUARTER CYCLE BEFORE the launch gate peaks at 0.25. A
+    correctly timed countermovement presses over phi ~ 0.07-0.17, immediately
+    before takeoff, which sits in the LAUNCH half where a sine gate reads zero;
+    and while the robot is genuinely crouching, GRF drops BELOW body weight, so a
+    sine gate reads zero there too. What it actually paid for was a second,
+    hop-irrelevant press centred on phi = 0.75: a stamp, or a 2 Hz
+    double-bounce. This test is the one that fails if the gate is reverted."""
+    env = _Env(cmd=_phase(_SINE_LOAD_PEAK), force=_force(10 * _BW))
+    out = hop_load_force(env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
+    assert abs(float(out[0])) < 1e-6
+
+
+def test_load_force_pays_nothing_at_mid_flight():
+    env = _Env(cmd=_phase(_MID_FLIGHT), force=_force(10 * _BW))
     out = hop_load_force(env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
     assert float(out[0]) == 0.0
 
 
-def test_load_force_pays_during_the_load_half():
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], force=_force(1.5 * _BW))
-    out = hop_load_force(
-        env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=2.0
-    )
-    # (1.5 - 1) / (2.0 - 1) = 0.5, times a load gate of 1.0.
-    assert abs(float(out[0]) - 0.5) < 1e-5
+def test_load_force_gate_brackets_takeoff_symmetrically():
+    """The window is the quarter cycle either side of phi = 0: the tail of the
+    load half AND the head of the launch half. Both must pay, equally."""
+    f = dict(sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=6.0)
+    before = float(hop_load_force(_Env(cmd=_phase(0.875), force=_force(6 * _BW)), **f)[0])
+    after = float(hop_load_force(_Env(cmd=_phase(0.125), force=_force(6 * _BW)), **f)[0])
+    assert before > 0.0
+    assert abs(before - after) < 1e-5
+    # cos(2*pi*0.125) = 0.7071, times a saturated load factor of 1.0.
+    assert abs(before - math.cos(2 * math.pi * 0.125)) < 1e-5
 
 
 def test_load_force_is_zero_at_exactly_body_weight():
     """Merely standing must earn nothing -- standing still is the failure mode
     this whole rebalance exists to defeat."""
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], force=_force(_BW))
+    env = _Env(cmd=_phase(_TAKEOFF), force=_force(_BW))
     out = hop_load_force(env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
     assert abs(float(out[0])) < 1e-6
 
 
 def test_load_force_is_zero_when_unloaded():
-    """Airborne, or hanging: below body weight is still nothing, not negative."""
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], force=_force(0.0))
+    """Airborne, or hanging: below body weight is still nothing, not negative.
+    This is also why the launch-half quarter of the gate window costs nothing --
+    in flight there is no ground reaction to reward."""
+    env = _Env(cmd=_phase(_TAKEOFF), force=_force(0.0))
     out = hop_load_force(env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
     assert float(out[0]) == 0.0
 
 
 def test_load_force_saturates_at_max_ratio_body_weight():
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], force=_force(2.0 * _BW))
+    env = _Env(cmd=_phase(_TAKEOFF), force=_force(6.0 * _BW))
     out = hop_load_force(
-        env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=2.0
+        env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=6.0
     )
     assert abs(float(out[0]) - 1.0) < 1e-5
 
 
 def test_load_force_does_not_exceed_one_above_saturation():
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], force=_force(20.0 * _BW))
+    env = _Env(cmd=_phase(_TAKEOFF), force=_force(20.0 * _BW))
     out = hop_load_force(
-        env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=2.0
+        env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=6.0
     )
     assert abs(float(out[0]) - 1.0) < 1e-5
 
 
+def test_load_force_has_live_gradient_across_the_springs_working_range():
+    """Why max_ratio is 6.0 and not 2.0. At k = 3900 N/m each mm of pad travel
+    costs 3.9 N, so saturating at 2 x body weight (8.6 N/foot) meant saturating
+    at 2.2 mm of the pad's 12 mm travel -- zero gradient across ~82% of the
+    range, which is precisely the range that stores energy and precisely where
+    the three arms differ."""
+    f = dict(sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=6.0)
+
+    def at_travel_mm(mm):
+        newtons_per_foot = 3900.0 * mm / 1000.0
+        env = _Env(cmd=_phase(_TAKEOFF), force=_force(2 * newtons_per_foot))
+        return float(hop_load_force(env, **f)[0])
+
+    samples = [at_travel_mm(mm) for mm in (2, 3, 4, 5, 6)]
+    assert samples == sorted(samples)
+    assert samples[0] < samples[-1], "no gradient across 2-6 mm of travel"
+    # Still short of saturation at half travel, so the top of the range is live.
+    assert at_travel_mm(6) < 1.0
+
+
 def test_load_force_sums_over_both_feet():
-    """A one-footed press at body weight is not a two-footed press at body
-    weight; the term reads TOTAL vertical GRF, so both feet contribute."""
-    both = _Env(cmd=[[0.0, -1.0, 0.0]], force=[[[0.0, 0.0, -_BW], [0.0, 0.0, -_BW]]])
-    one = _Env(cmd=[[0.0, -1.0, 0.0]], force=[[[0.0, 0.0, -_BW], [0.0, 0.0, 0.0]]])
-    f = dict(sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=2.0)
+    """A one-footed press is not a two-footed press; the term reads TOTAL
+    vertical GRF, so both feet contribute."""
+    f = dict(sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=6.0)
+    both = _Env(cmd=_phase(_TAKEOFF), force=[[[0.0, 0.0, -3 * _BW], [0.0, 0.0, -3 * _BW]]])
+    one = _Env(cmd=_phase(_TAKEOFF), force=[[[0.0, 0.0, -3 * _BW], [0.0, 0.0, 0.0]]])
     assert abs(float(hop_load_force(both, **f)[0]) - 1.0) < 1e-5
-    assert abs(float(hop_load_force(one, **f)[0])) < 1e-6
+    assert abs(float(hop_load_force(one, **f)[0]) - 0.4) < 1e-5
 
 
 def test_load_force_ignores_horizontal_shear():
@@ -394,24 +525,49 @@ def test_load_force_ignores_horizontal_shear():
     logs Metrics/landing_force_mean off this same field) takes the norm, which is
     right for an impact magnitude but wrong here: a foot scrubbing sideways would
     otherwise score as loading."""
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], force=[[[50.0, 50.0, -_BW / 2], [0.0, 0.0, -_BW / 2]]])
+    env = _Env(
+        cmd=_phase(_TAKEOFF), force=[[[50.0, 50.0, -_BW / 2], [0.0, 0.0, -_BW / 2]]]
+    )
     out = hop_load_force(env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
     assert abs(float(out[0])) < 1e-6
 
 
+def test_load_force_is_indifferent_to_the_sign_of_fz():
+    """PIN THE SIGN CONVENTION, which |Fz| otherwise hides.
+
+    Probed on this exact sensor shape (0.5 kg box settled on a plane,
+    primary=geom / secondary=body, reduce="netforce"): a foot BEARING 4.905 N
+    reads z = -4.905 N. MuJoCo reports this net force pointing DOWN for a loaded
+    foot. Raw `forces[..., 2]` would therefore be negative through the entire
+    load phase and the reward would read identically zero -- a silent null.
+
+    Because the implementation takes |Fz|, no other test can tell the two
+    conventions apart, so a future edit that switched to raw `forces[..., 2]`
+    AND flipped these fixtures to positive z would pass the whole suite green
+    while being that silent null. Assert the symmetry directly instead: the
+    reward must be IDENTICAL for +Fz and -Fz, and non-zero for both."""
+    f = dict(sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW, max_ratio=6.0)
+    negative = _Env(cmd=_phase(_TAKEOFF), force=[[[0.0, 0.0, -2 * _BW], [0.0, 0.0, -2 * _BW]]])
+    positive = _Env(cmd=_phase(_TAKEOFF), force=[[[0.0, 0.0, 2 * _BW], [0.0, 0.0, 2 * _BW]]])
+    neg = float(hop_load_force(negative, **f)[0])
+    pos = float(hop_load_force(positive, **f)[0])
+    assert neg > 0.0, "the measured convention (negative z under load) must pay"
+    assert abs(neg - pos) < 1e-6, "the term must not depend on MuJoCo's sign convention"
+
+
 def test_load_force_is_nan_safe():
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], force=_force(float("nan")))
+    env = _Env(cmd=_phase(_TAKEOFF), force=_force(float("nan")))
     out = hop_load_force(env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
     assert torch.isfinite(out).all()
     assert float(out[0]) == 0.0
 
-    nan_cmd = _Env(cmd=[[0.0, float("nan"), 0.0]], force=_force(5 * _BW))
+    nan_cmd = _Env(cmd=[[float("nan"), 0.0, 0.0]], force=_force(5 * _BW))
     out = hop_load_force(nan_cmd, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
     assert torch.isfinite(out).all()
 
 
 def test_load_force_is_zero_without_the_contact_sensor():
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], force=_force(5 * _BW))
+    env = _Env(cmd=_phase(_TAKEOFF), force=_force(5 * _BW))
     env.scene.sensors = {}
     out = hop_load_force(env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
     assert out.shape == (1,)
@@ -421,7 +577,7 @@ def test_load_force_is_zero_without_the_contact_sensor():
 def test_load_force_is_zero_when_the_sensor_carries_no_force_field():
     """A sensor configured without fields=("force",) reports None. Fail silent
     rather than crash a 8000-iteration run, but never invent a load."""
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], force=None)
+    env = _Env(cmd=_phase(_TAKEOFF), force=None)
     out = hop_load_force(env, sensor_name=_SENSOR, command_name=_CMD, body_weight_n=_BW)
     assert float(out[0]) == 0.0
 

@@ -7,6 +7,7 @@ import pytest
 from mjlab_microduck.robot.sprung_foot import H_ADD, PAD_MASS
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.hop import (
+    AIRBORNE_HEIGHT_MARGIN,
     AIRBORNE_WEIGHT,
     BODY_HEIGHT_WEIGHT,
     BODY_WEIGHT_N,
@@ -22,6 +23,7 @@ from mjlab_microduck.tasks.hop import (
     SENSOR_NAME,
     UNLOADED_RIGID_HEIGHT,
     UPWARD_VELOCITY_WEIGHT,
+    hop_airborne_min_height,
     hop_target_height,
     make_hop_variant,
 )
@@ -530,24 +532,41 @@ _LAUNCH_GATE_MEAN = 1.0 / math.pi
 
 
 def test_hop_budget_beats_standing_still():
-    """The inequality the first Phase 4 sweep violated.
+    """WEIGHT-ARITHMETIC REGRESSION GUARD. Not a model of realised behaviour.
 
-    `launch_weight = clamp(sin(2*pi*phi), 0)` averages 1/pi = 0.318 over a cycle,
-    so each hop term's per-step ceiling is `weight * 0.318`. At the original
-    3.0/2.0/2.0 that was 0.955 + 0.637 + ~0.3 = ~1.9/step for a PHYSICALLY
-    IMPOSSIBLE perfect hopper -- a robot pinned at peak reward on all three terms
-    for the entire launch half. Standing perfectly still pays `com_height_target`
-    1.2 + `upright` 1.0 = 2.2/step, at lower `action_rate_l2` cost and near-zero
-    fall risk.
+    Read that literally: neither side of this inequality is what a trained policy
+    actually earns, and the test must not be cited as if it were.
 
-    A perfect hop lost to standing before any risk was counted. The policy did
-    not fail to find hopping; it correctly found that hopping was worse, and all
-    three arms learned to stand.
+      * The hop side assumes all three shaped factors pinned at 1.0 for the
+        ENTIRE launch half. A real 33 mm hop earns roughly 2.86/step, not 8.91 --
+        flight is ~16% of the cycle rather than 50%, and `hop_body_height` is
+        both airborne-gated AND Gaussian, so it is never pinned at 1.
+      * The standing side is an upper bound too, though a much tighter one: all
+        three terms in it really are paid every step by a robot doing nothing.
 
-    Both sides are computed from the REGISTERED weights on a REGISTERED task, not
-    from hardcoded numbers -- the failure mode this guards is precisely a set of
-    weights that look reasonable term by term and lose in aggregate, so the test
-    has to do the aggregation itself. Checked on every arm.
+    What it DOES catch, and the only thing it is for, is the class of failure
+    that produced the first Phase 4 sweep's null: weights that look reasonable
+    term by term and lose in aggregate. `clamp(sin(2*pi*phi), 0)` averages
+    1/pi = 0.318 over a cycle, so a hop term's per-step ceiling is `weight *
+    0.318`, not `weight`. At the original 3.0/2.0/2.0 that was
+    0.955 + 0.637 + ~0.3 = ~1.9/step for a PHYSICALLY IMPOSSIBLE perfect hopper,
+    against `com_height_target` 1.2 + `upright` 1.0 = 2.2/step for standing
+    perfectly still, at lower `action_rate_l2` cost and near-zero fall risk. A
+    perfect hop lost to standing before any risk was counted. The policy did not
+    fail to find hopping; it correctly found hopping was worse, and all three
+    arms -- Locked, k2500, k3900, 8000 iterations each -- learned to stand.
+
+    Both sides are computed from the REGISTERED weights on a REGISTERED task, so
+    the test does the aggregation itself rather than trusting a hardcoded total.
+
+    Two corrections to the standing side, both made after review:
+
+      * `com_height_target` is no longer flat: it is now recovery-gated through
+        `com_height_target_recovery_only`, so its per-step maximum is
+        `weight * 1/pi`, exactly like a hop term -- not `weight`.
+      * `pose` (`variable_posture`, weight 2.0) belongs here. It is the
+        SECOND-LARGEST standing payout, larger than `upright`, and it is one a
+        hop substantially forfeits. Omitting it flattered the hop side.
     """
     for label in HOP_ARM_SUFFIX:
         cfg = _registered(label)
@@ -564,9 +583,14 @@ def test_hop_budget_beats_standing_still():
             )
         )
 
-        # Standing side: both are flat-+1-shaped terms, evaluated at their
-        # maximum, and both are paid EVERY step by a robot that does nothing.
-        standing = rewards["com_height_target"].weight * 1.0 + rewards["upright"].weight * 1.0
+        # Standing side. `upright` and `pose` are flat-+1-shaped and ungated, so
+        # they pay their full weight every step. `com_height_target` is now
+        # recovery-gated, so it pays weight * 1/pi like a hop term.
+        standing = (
+            rewards["com_height_target"].weight * _LAUNCH_GATE_MEAN
+            + rewards["upright"].weight * 1.0
+            + rewards["pose"].weight * 1.0
+        )
 
         assert hop_ceiling >= 2.0 * standing, (
             f"{tid}: a perfect hopper's ceiling is {hop_ceiling:.2f}/step against "
@@ -588,9 +612,24 @@ def test_hop_budget_terms_all_exist_on_both_sides():
             "hop_body_height",
             "com_height_target",
             "upright",
+            "pose",
         ):
             assert name in rewards, f"{_hop_task_id(label)}: {name} missing"
             assert rewards[name].weight > 0.0, f"{_hop_task_id(label)}: {name} weight <= 0"
+
+
+def test_budget_standing_side_tracks_the_com_height_gating():
+    """The standing side must apply 1/pi to `com_height_target` if and only if
+    that term is actually gated. If a future change reverts the func swap back to
+    the flat `com_height_target`, the budget test would keep discounting a term
+    that is once again paid every step -- understating standing by 0.82/step and
+    passing for the wrong reason. Tie the two together explicitly."""
+    for label in HOP_ARM_SUFFIX:
+        term = _registered(label).rewards["com_height_target"]
+        assert term.func is microduck_mdp.com_height_target_recovery_only, (
+            f"{_hop_task_id(label)}: com_height_target is not recovery-gated, so "
+            "test_hop_budget_beats_standing_still must stop applying 1/pi to it"
+        )
 
 
 def test_registered_hop_weights_are_the_rebalanced_ones():
@@ -636,6 +675,30 @@ def test_load_force_registered_on_every_arm():
         assert term.params["max_ratio"] == pytest.approx(LOAD_FORCE_MAX_RATIO), tid
 
 
+def test_load_force_max_ratio_spans_the_springs_working_range():
+    """At k = 3900 N/m each mm of pad travel costs 3.9 N, so `max_ratio` fixes
+    how much of the pad's 12 mm travel the reward has any gradient across:
+
+        travel_mm = max_ratio * BODY_WEIGHT_N / (2 * k) * 1000
+
+    At the original 2.0 that was 2.2 mm -- 18% of travel, leaving ~82% of the
+    spring's working range flat, which is exactly the range that stores energy
+    and exactly where the three arms differ. Written as a relationship against
+    TRAVEL so it cannot regress silently if the spring or the mass changes."""
+    from mjlab_microduck.robot.sprung_foot import TRAVEL
+
+    k = 3900.0
+    saturating_travel = LOAD_FORCE_MAX_RATIO * BODY_WEIGHT_N / (2 * k)
+    assert saturating_travel >= 0.4 * TRAVEL, (
+        f"hop_load_force saturates at {saturating_travel * 1e3:.1f} mm of the pad's "
+        f"{TRAVEL * 1e3:.0f} mm travel -- under 40% of the range, so most of the "
+        "spring's working band gets no gradient"
+    )
+    # ...and not so high the knee-limited actuators (52.4 N/foot available)
+    # could never reach it, which would flatten the top of the range instead.
+    assert saturating_travel <= 0.75 * TRAVEL
+
+
 def test_load_force_is_identical_on_the_locked_control_arm():
     """It is a FORCE reward, not a compression reward, precisely so the Locked
     control gets the same signal. Both arms can press down; only the sprung arms
@@ -667,6 +730,66 @@ def test_load_force_stays_below_the_launch_terms():
             for n in ("hop_both_feet_airborne", "hop_upward_velocity", "hop_body_height")
         )
         assert load_ceiling < launch_ceiling, _hop_task_id(label)
+
+
+# --- the anti-flutter height gate on hop_both_feet_airborne ------------------
+
+
+def test_airborne_height_gate_registered_on_every_arm():
+    """Without it, `hop_both_feet_airborne` at weight 12.0 is farmable by FOOT
+    FLUTTER. Only two collision geoms exist on the whole robot (the two pads;
+    every other geom is contype=0), so the contact predicate says nothing about
+    the 877 g body: retracting both 70 g feet ~20 mm at 8-10 Hz satisfies it at
+    ~50% duty inside the launch half for 12*(1/pi)*0.5 = 1.9/step, matching a
+    genuine 33 mm hop's airborne payout with a HIGHER `pose` reward and no fall
+    risk. `foot_swing_height`'s target (0.02 m) is exactly the flutter
+    amplitude, so it is free, and `foot_clearance` reads xy velocity only."""
+    for label in HOP_ARM_SUFFIX:
+        params = _registered(label).rewards["hop_both_feet_airborne"].params
+        tid = _hop_task_id(label)
+        assert "min_height" in params, f"{tid}: airborne term has no height gate"
+        assert params["min_height"] == pytest.approx(hop_airborne_min_height(H_ADD)), tid
+
+
+def test_airborne_gate_references_the_unloaded_height_not_the_settled_one():
+    """The same datum error as `hop_body_height`'s, in a gate instead of a
+    target. In flight the legs unload and the root rises ~7.6 mm of actuator sag
+    for free, so a settled-referenced threshold would be cleared by MERELY
+    UNLOADING -- re-admitting the flutter exploit through the datum. Assert the
+    datum directly, and separately assert it is not the settled alternative."""
+    assert hop_airborne_min_height(H_ADD) == pytest.approx(
+        UNLOADED_RIGID_HEIGHT + H_ADD + AIRBORNE_HEIGHT_MARGIN
+    )
+    settled_based = RIGID_STAND_HEIGHT + H_ADD + AIRBORNE_HEIGHT_MARGIN
+    assert hop_airborne_min_height(H_ADD) > settled_based
+    assert hop_airborne_min_height(H_ADD) - settled_based == pytest.approx(0.0076, abs=1e-4)
+
+
+def test_airborne_gate_sits_between_a_stand_and_the_hop_target():
+    """Both bounds matter. Below the standing height it gates nothing; at or
+    above the hop apex it would make the term unreachable and destroy the dense
+    discovery signal the whole rebalance depends on."""
+    stand = UNLOADED_RIGID_HEIGHT + H_ADD
+    gate = hop_airborne_min_height(H_ADD)
+    assert gate > stand, "the gate must not be cleared by simply standing"
+    assert gate < hop_target_height(H_ADD), (
+        "the gate must sit well below the hop target, or the airborne reward is "
+        "unreachable until the robot is already hopping well"
+    )
+    # And it must stay a small fraction of the gain being shaped, so it prices
+    # out flutter without also shaping height (that is hop_body_height's job).
+    assert AIRBORNE_HEIGHT_MARGIN <= 0.25 * HOP_HEIGHT_GAIN
+
+
+def test_upward_velocity_stays_ungated_as_the_discovery_gradient():
+    """`hop_upward_velocity` deliberately keeps NO height or contact gate. It is
+    the dense signal that bootstraps liftoff from a standing start; gating it
+    the way the airborne term is gated would leave nothing to climb from zero."""
+    for label in HOP_ARM_SUFFIX:
+        params = _registered(label).rewards["hop_upward_velocity"].params
+        tid = _hop_task_id(label)
+        assert "min_height" not in params, tid
+        assert "sensor_name" not in params, tid
 
 
 # --- the launch-half silencing of com_height_target --------------------------

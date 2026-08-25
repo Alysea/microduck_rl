@@ -181,12 +181,34 @@ LOAD_FORCE_WEIGHT = 4.0
 # appears in the spring-mass period and energy notes above.
 BODY_WEIGHT_N = 8.60
 
-# Multiple of body weight at which `hop_load_force` saturates. 2.0 means the term
-# reads 0 at a plain stand and 1.0 once the feet push with twice body weight.
+# Multiple of body weight at which `hop_load_force` saturates: the term reads 0
+# at a plain stand and 1.0 once the feet push with this many body weights.
+#
+# Sized against the SPRING'S TRAVEL, not picked round. At k = 3900 N/m each
+# millimetre of pad travel costs 3.9 N, and this file's header records that FULL
+# 12 mm travel needs 49.7 N per foot. So a ratio r saturates at
+# r * 8.60 / 2 newtons per foot, i.e. r * 8.60 / (2 * 3900) metres of travel:
+#
+#   r = 2.0  ->  8.6 N/foot  ->  2.2 mm  ->  18% of travel   (REJECTED)
+#   r = 6.0  -> 25.8 N/foot  ->  6.6 mm  ->  55% of travel
+#
+# At r = 2.0 the term had zero gradient across ~82% of the spring's working
+# range -- precisely the range that stores energy, and precisely where the three
+# arms differ. 6.0 puts the saturation point near half travel, leaving live
+# gradient right through the discriminating band without asking for a press the
+# knee-limited actuators (52.4 N available) cannot deliver.
+#
 # Threaded explicitly rather than left on the function default, for the same
 # reason `sensor_name` and `stiffness` are: this campaign has been burned by
 # defaults that were only correct for one arm.
-LOAD_FORCE_MAX_RATIO = 2.0
+LOAD_FORCE_MAX_RATIO = 6.0
+
+# Metres of root height ABOVE the unloaded standing height that
+# `hop_both_feet_airborne` requires before it pays. Small on purpose: this gate
+# exists to make foot flutter unprofitable, not to shape hop height (that is
+# `hop_body_height`'s job), so it should bite just above the noise floor of a
+# stand and nowhere near the 40 mm HOP_HEIGHT_GAIN target.
+AIRBORNE_HEIGHT_MARGIN = 0.005
 
 ENERGY_MONITOR_WEIGHT = 1.0
 
@@ -253,6 +275,23 @@ def hop_target_height(h_add: float) -> float:
     CROUCH rather than hop -- the same class of bug as the CoM band shift.
     """
     return UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN + h_add
+
+
+def hop_airborne_min_height(h_add: float) -> float:
+    """Root height `hop_both_feet_airborne` must clear before it pays anything.
+
+    Built on ``UNLOADED_RIGID_HEIGHT``, NOT ``RIGID_STAND_HEIGHT``, and the
+    distinction is load-bearing rather than pedantic. In flight the legs carry no
+    load, so the root rises ~7.6 mm of actuator sag FOR FREE relative to the
+    settled height. A threshold referenced to the settled value would therefore
+    be cleared by merely unloading the legs -- which is precisely the flutter
+    exploit this gate exists to close, re-admitted through the datum.
+
+    Shifted by ``h_add`` for the same reason ``hop_target_height`` is: the sprung
+    robot stands that much taller, so an unshifted threshold would be below its
+    standing height and gate nothing at all.
+    """
+    return UNLOADED_RIGID_HEIGHT + h_add + AIRBORNE_HEIGHT_MARGIN
 
 
 def make_hop_variant(
@@ -324,7 +363,16 @@ def make_hop_variant(
     cfg.rewards["hop_both_feet_airborne"] = RewardTermCfg(
         func=microduck_mdp.hop_both_feet_airborne,
         weight=AIRBORNE_WEIGHT,
-        params={"sensor_name": SENSOR_NAME, "command_name": "twist"},
+        params={
+            "sensor_name": SENSOR_NAME,
+            "command_name": "twist",
+            # Anti-flutter. Only two collision geoms exist on this robot (the
+            # two pads), so "both feet airborne" alone says nothing about the
+            # 877 g body: retracting both 70 g feet 20 mm at 8-10 Hz farms this
+            # term at a real hop's rate with the trunk motionless. Threaded like
+            # `target_height` because the function cannot know h_add.
+            "min_height": hop_airborne_min_height(h_add),
+        },
     )
     cfg.rewards["hop_upward_velocity"] = RewardTermCfg(
         func=microduck_mdp.hop_upward_velocity,

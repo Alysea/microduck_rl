@@ -6369,21 +6369,55 @@ def hop_both_feet_airborne(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
     command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    min_height: float = 0.1221,
 ) -> torch.Tensor:
-    """Reward both feet simultaneously airborne during the LAUNCH half-cycle.
+    """Reward both feet simultaneously airborne, HIGH, during the LAUNCH half.
 
     Ported from the abandoned `jump` branch. Gated on sin(2*pi*phase) > 0 so
     flight during the recovery half earns nothing — without that gate the policy
     is rewarded for simply never landing.
+
+    THE HEIGHT GATE IS NOT DEFENSIVE. Without it this term is farmable by
+    FOOT FLUTTER, and at its post-rebalance weight that exploit is competitive
+    with a real hop. Exactly two collision geoms exist on the whole robot — the
+    two foot pads; every other geom is contype=0 — so "both feet airborne" is a
+    statement about the two 70 g pads and says NOTHING about the 877 g CoM. A
+    policy that retracts both feet ~20 mm at 8-10 Hz, trunk perfectly still,
+    scores this term at ~50% duty inside the launch half, i.e. 12*(1/pi)*0.5 =
+    1.9/step -- equal to a genuine 33 mm hop's airborne payout, for a total near
+    5.5/step, with a HIGHER `pose` reward and no fall risk. The neighbouring
+    penalties do not catch it either: `foot_swing_height`'s target is 0.02 m,
+    exactly the flutter amplitude, so it is free, and `foot_clearance` reads xy
+    velocity only, also free.
+
+    Requiring the ROOT above `min_height` makes the term unfarmable without
+    actually moving the body.
+
+    NOTE: `min_height` is NOT a safe default, for the same reason
+    `hop_body_height`'s `target_height` is not. The default here is the RIGID
+    robot's value; the sprung robot stands h_add taller and a caller that leaves
+    it would gate on a threshold the robot clears while merely standing.
+    `make_hop_variant` computes it via `hop.hop_airborne_min_height(h_add)`.
+
+    The threshold must reference the UNLOADED height, not the settled one: in
+    flight the legs carry no load and the root rises ~7.6 mm of actuator sag for
+    free, so a settled-referenced threshold is satisfied by merely unloading.
     """
     zeros = torch.zeros(env.num_envs, device=env.device)
     both_airborne = _both_feet_airborne(env, sensor_name)
     if both_airborne is None:
         return zeros
 
+    asset: Entity = env.scene[asset_cfg.name]
+    height = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2].float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    tall_enough = (height > min_height).float()
+
     cmd = env.command_manager.get_command(command_name)
     launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
-    return launch * both_airborne
+    return launch * both_airborne * tall_enough
 
 
 def hop_upward_velocity(
@@ -6539,11 +6573,27 @@ def hop_load_force(
 
     Shape::
 
-        reward = clamp(-sin(2*pi*phi), 0)
+        reward = clamp(cos(2*pi*phi), 0)
                  * clamp((F_total / body_weight_n - 1) / (max_ratio - 1), 0, 1)
 
     so it is zero at exactly body weight (merely standing earns nothing) and
     saturates at `max_ratio` x body weight.
+
+    THE GATE IS THE COSINE CHANNEL, NOT THE SINE HALF, and the timing is the
+    whole point. `clamp(-sin(2*pi*phi), 0)` -- the literal "load half" -- peaks
+    at phi = 0.75, a QUARTER CYCLE BEFORE the launch gate peaks at phi = 0.25.
+    A correctly timed countermovement presses over phi ~ 0.07-0.17, immediately
+    before takeoff, which is inside the LAUNCH half where a sine-gated load term
+    reads exactly zero; and while the robot is actually crouching, GRF drops
+    BELOW body weight, so the term reads zero there too. A sine gate therefore
+    pays for a second, hop-irrelevant press centred on phi = 0.75 -- a stamp, or
+    a 2 Hz double-bounce.
+
+    `clamp(cos(2*pi*phi), 0)` spans phi in [0.75, 1.0) u [0.0, 0.25]: the last
+    quarter of the load half plus the first quarter of the launch half,
+    bracketing the takeoff instant at phi = 0. That is the
+    countermovement-into-launch window. Flight contributes nothing on its own
+    because GRF is zero in the air.
 
     Force source: the SAME field mjlab's `soft_landing` reads to log
     `Metrics/landing_force_mean` — `ContactSensor.data.force`, [B, N, 3], with N
@@ -6574,8 +6624,10 @@ def hop_load_force(
     load = torch.clamp(excess, min=0.0, max=1.0)
 
     cmd = env.command_manager.get_command(command_name)
-    # Recovery/load half: sin(2*pi*phi) < 0, i.e. clamp(-cmd[:, 1], 0).
-    load_gate = torch.clamp(-torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
+    # The countermovement-into-launch window, bracketing takeoff at phi = 0:
+    # cos(2*pi*phi) > 0, i.e. clamp(cmd[:, 0], 0). See the docstring on why this
+    # is NOT the sin < 0 "load half".
+    load_gate = torch.clamp(torch.nan_to_num(cmd[:, 0], nan=0.0), min=0.0)
     return load_gate * load
 
 
