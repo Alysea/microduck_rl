@@ -2,6 +2,7 @@
 
 import math
 
+import pytest
 import torch
 
 from mjlab_microduck.tasks.mdp import (
@@ -251,6 +252,141 @@ def test_min_rise_admits_a_locked_arm_hop_and_rejects_a_tuck():
 
     assert rise_scores(0.001) == 0.0, "a 1 mm dip/tuck must not pay"
     assert rise_scores(0.005) == 1.0, "the Locked arm's ~5 mm hop must pay"
+
+
+def test_rise_is_measured_from_the_last_stance_sample_not_the_first_airborne_one():
+    """THE SAMPLING FIX, and the test that distinguishes the two designs.
+
+    Rewards update once per CONTROL step -- sim timestep 0.005 x decimation 4 =
+    20 ms -- so takeoff falls uniformly inside a 20 ms window and the first
+    airborne SAMPLE has already flown for up to 20 ms. Measuring from that
+    sample discards whatever rise happened first.
+
+    Sampled across takeoff phase 0/5/10/15/20 ms, a true 5 mm Locked-arm hop
+    read from the first airborne sample measures 4.68 / 3.32 / 2.34 / 1.36 /
+    0.38 mm. Against MIN_RISE = 0.003 the mean-phase margin is MINUS 0.66 mm and
+    only 33% of takeoff phases clear the gate -- so the Locked CONTROL ARM loses
+    two thirds of its airborne reward while genuinely hopping, silently zeroing
+    the control and making every sprung-vs-Locked number meaningless.
+
+    The fixture is built so the two designs disagree: stance at 0.147, the first
+    airborne sample ALREADY at 0.150 (it flew during part of that step), apex at
+    0.152. From the stance datum the rise is 5 mm and clears MIN_RISE; from the
+    first airborne sample it is 2 mm and does not.
+    """
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)               # stance, 0.147
+    term(env.step(found=_AIRBORNE, z=[0.150]), sensor_name=_SENSOR, command_name=_CMD)
+    out = term(env.step(z=[0.152]), sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out[0]) == 1.0, (
+        "a 5 mm hop whose takeoff fell mid-control-step must still clear MIN_RISE"
+    )
+
+
+def test_measured_rise_equals_the_stance_referenced_value():
+    """The same fixture, asserted on the VALUE rather than on the gate.
+
+    A Gaussian with std 1 mm centred on 5 mm reads ~1.0 for the stance-referenced
+    rise (5 mm) and ~1e-4 for the first-airborne-sample rise (2 mm), so this pins
+    which datum was used rather than merely that some rise was measured.
+    """
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+    term = _height_term(env)
+    p = dict(target_rise=0.005, std=0.001)
+    term(env, command_name=_CMD, **p)
+    term(env.step(found=_AIRBORNE, z=[0.150]), command_name=_CMD, **p)
+    out = float(term(env.step(z=[0.152]), command_name=_CMD, **p)[0])
+    assert out > 0.99, f"measured rise is not the stance-referenced 5 mm (scored {out:.5f})"
+
+
+def test_a_tuck_is_still_rejected_under_the_stance_datum():
+    """The stance datum must not re-open the exploit it was not meant to touch.
+
+    A tuck's last in-contact height EQUALS its airborne height -- the trunk does
+    not move -- so its rise stays ~0 and MIN_RISE still rejects it. This is why
+    MIN_RISE could stay at 0.003 instead of being lowered to 0.0003 to admit the
+    worst-case Locked hop, which would have been indistinguishable from no gate.
+    """
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.155])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)
+    out1 = term(env.step(found=_AIRBORNE), sensor_name=_SENSOR, command_name=_CMD)
+    out2 = term(env.step(z=[0.1555]), sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out1[0]) == 0.0
+    assert float(out2[0]) == 0.0
+
+
+def test_a_nan_on_the_takeoff_step_cannot_manufacture_a_rise():
+    """NaN must fail SAFE. `nan_to_num` maps a NaN height to 0.0; latched as the
+    takeoff datum that reads the NEXT step as ~0.147 m of rise and pays this term
+    its full weight of 12.0 during a physics blow-up. The old absolute-height
+    gate failed safe here (0 > min_height is False), so the rise frame must not
+    regress it. Bounded by the `nan_state` termination, but this reward must not
+    be the thing that pays out.
+
+    Step 3 holds the SAME height as stance -- a tuck -- so any non-zero reward is
+    manufactured by the NaN rather than earned.
+    """
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)
+    nan_step = term(
+        env.step(found=_AIRBORNE, z=[float("nan")]), sensor_name=_SENSOR, command_name=_CMD
+    )
+    after = term(env.step(z=[0.147]), sensor_name=_SENSOR, command_name=_CMD)
+    assert torch.isfinite(nan_step).all() and float(nan_step[0]) == 0.0
+    assert float(after[0]) == 0.0, "a NaN step manufactured a rise from a stale datum"
+
+
+def test_a_nan_step_does_not_consume_the_takeoff_transition():
+    """Holding `_was_airborne` across a non-finite step is what makes the guard
+    above work: if the NaN step consumed the transition, `took_off` would be
+    False forever after and `_z_takeoff` would stay stale. The retry must latch
+    the correct datum, so a real hop after a NaN blip still scores."""
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)
+    term(env.step(found=_AIRBORNE, z=[float("nan")]), sensor_name=_SENSOR, command_name=_CMD)
+    term(env.step(z=[0.147]), sensor_name=_SENSOR, command_name=_CMD)
+    out = term(env.step(z=[0.180]), sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out[0]) == 1.0
+    assert float(term._z_takeoff[0]) == pytest.approx(0.147, abs=1e-5)
+
+
+def test_no_stance_datum_yet_pays_nothing_rather_than_fabricating_a_rise():
+    """An env whose first observed step is already airborne has no stance datum.
+    It falls back to the current height, giving rise 0 -- silent, not a hop."""
+    env = _Env(found=_AIRBORNE, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    assert float(term(env, sensor_name=_SENSOR, command_name=_CMD)[0]) == 0.0
+    assert float(term(env.step(z=[0.180]), sensor_name=_SENSOR, command_name=_CMD)[0]) == 1.0
+
+
+def test_a_nan_first_step_with_no_stance_datum_cannot_fabricate_a_rise():
+    """The NaN case that actually pins the guard, found by enumerating them.
+
+    The obvious NaN fixture -- stance, then NaN, then a tuck -- does NOT
+    distinguish the guard, because the stance datum rescues it: the latch fires
+    on the NaN step but uses `z_stance`, which is correct. The case that bites is
+    a NaN on a step with NO stance sample yet, where the fallback datum is the
+    nan_to_num'd 0.0. If the takeoff transition is consumed there, `_z_takeoff`
+    stays 0.0 and the next step reads ~0.147 m of rise -- full weight 12.0 paid
+    during a physics blow-up.
+
+    Holding `_was_airborne` across non-finite steps makes the transition retry
+    and latch a real height instead. Step 3 holds the same height as step 2, so
+    any non-zero reward is manufactured.
+    """
+    env = _Env(found=_AIRBORNE, cmd=_LAUNCH, z=[float("nan")])
+    term = _airborne_term(env)
+    first = term(env, sensor_name=_SENSOR, command_name=_CMD)
+    second = term(env.step(z=[0.147]), sensor_name=_SENSOR, command_name=_CMD)
+    third = term(env.step(z=[0.147]), sensor_name=_SENSOR, command_name=_CMD)
+    assert torch.isfinite(first).all() and float(first[0]) == 0.0
+    assert float(second[0]) == 0.0, "the NaN step consumed the takeoff transition"
+    assert float(third[0]) == 0.0
+    assert float(term._z_takeoff[0]) == pytest.approx(0.147, abs=1e-5)
 
 
 def test_airborne_treats_a_nan_contact_read_as_in_contact():

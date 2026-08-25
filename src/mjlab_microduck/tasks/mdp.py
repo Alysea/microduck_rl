@@ -6418,7 +6418,16 @@ class _HopRiseTracker:
     def __init__(self, cfg, env: ManagerBasedRlEnv) -> None:
         del cfg  # Params are passed per-call, as in mjlab's own class terms.
         self._z_takeoff = torch.zeros(env.num_envs, device=env.device)
+        # Last base height observed WHILE IN CONTACT -- the takeoff datum.
+        self._z_stance = torch.zeros(env.num_envs, device=env.device)
         self._was_airborne = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.bool
+        )
+        # False until a contact step has been seen, so an env whose very first
+        # observed step is already airborne has no stance datum to use. It then
+        # falls back to the current height, which yields rise 0 -- silent, not
+        # a fabricated hop.
+        self._have_stance = torch.zeros(
             env.num_envs, device=env.device, dtype=torch.bool
         )
 
@@ -6427,7 +6436,9 @@ class _HopRiseTracker:
         if env_ids is None:
             env_ids = slice(None)
         self._z_takeoff[env_ids] = 0.0
+        self._z_stance[env_ids] = 0.0
         self._was_airborne[env_ids] = False
+        self._have_stance[env_ids] = False
 
     def _both_airborne_and_rise(
         self, env: ManagerBasedRlEnv, sensor_name: str, asset_cfg: SceneEntityCfg
@@ -6437,6 +6448,35 @@ class _HopRiseTracker:
         Latches ``z_takeoff`` on the TRANSITION into both-feet-airborne and holds
         it for the whole flight; regaining contact clears it, so a second hop in
         the same episode measures from its own takeoff.
+
+        THE DATUM IS THE LAST IN-CONTACT HEIGHT, NOT THE FIRST AIRBORNE ONE, and
+        the difference is worth far more than it looks. Rewards update once per
+        CONTROL step -- sim timestep 0.005 x decimation 4 = 20 ms -- so the
+        moment of takeoff falls uniformly somewhere inside a 20 ms window, and
+        the first airborne SAMPLE has already flown for up to 20 ms. Measuring
+        from that sample discards whatever rise happened first.
+
+        Sampled across takeoff phase 0/5/10/15/20 ms, a true 5 mm Locked-arm hop
+        measured from the first airborne sample reads 4.68 / 3.32 / 2.34 / 1.36 /
+        0.38 mm. Against MIN_RISE = 0.003 the mean-phase margin is MINUS 0.66 mm
+        and only 33% of takeoff phases clear the gate at all -- so the Locked
+        CONTROL ARM would lose two thirds of its airborne reward while genuinely
+        hopping. That does not add noise; it silently zeroes the control and
+        makes every sprung-vs-Locked number in the campaign meaningless. The same
+        aliasing swings k3900's measured rise over 18.9-33.0 mm on takeoff phase
+        alone, moving the height Gaussian 0.36 -> 0.885: a 2.5x reward swing from
+        sampling. From the stance datum the same simulation gives Locked
+        4.68-4.98 mm (always clears) and k3900 32.7-33.0 mm (alias gone).
+
+        Lowering MIN_RISE instead was rejected: it would have to drop to 0.0003
+        to admit the worst-case Locked hop, which is indistinguishable from no
+        gate and re-opens the tall-tuck exploit at weight 12.
+
+        The residual, accepted deliberately: the datum can be up to 20 ms before
+        takeoff, so it credits the trunk's rise during the final stance step.
+        That is genuine upward motion of the body -- and it is exactly what a
+        tuck does not have. A tuck's last in-contact height equals its airborne
+        height, so its rise stays ~0 and the gate still rejects it.
         """
         both_airborne = _both_feet_airborne(env, sensor_name)
         if both_airborne is None:
@@ -6444,9 +6484,19 @@ class _HopRiseTracker:
 
         airborne = both_airborne > 0.5
         asset: Entity = env.scene[asset_cfg.name]
-        z = torch.nan_to_num(
-            asset.data.root_link_pos_w[:, 2].float(), nan=0.0, posinf=0.0, neginf=0.0
-        )
+        raw_z = asset.data.root_link_pos_w[:, 2].float()
+        # A NaN height must never be allowed to LATCH. nan_to_num alone maps it
+        # to 0.0, which as a takeoff datum reads the next step as ~0.147 m of
+        # rise and pays this term its full weight during a physics blow-up --
+        # failing OPEN, where the old absolute gate failed safe. Bounded by the
+        # `nan_state` termination, but this reward must not be what pays out.
+        finite = torch.isfinite(raw_z)
+        z = torch.nan_to_num(raw_z, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Stance datum: the last height read while at least one foot was down.
+        in_contact = (~airborne) & finite
+        self._z_stance = torch.where(in_contact, z, self._z_stance)
+        self._have_stance = self._have_stance | in_contact
 
         # Re-arm on every ground->air transition. Landing needs NO explicit
         # clear: `_was_airborne` goes False on contact, so the next takeoff
@@ -6456,11 +6506,35 @@ class _HopRiseTracker:
         # any behaviour: `_z_takeoff` is read only inside the `airborne` branch
         # below, and it is always rewritten before that branch is next taken.
         took_off = airborne & ~self._was_airborne
-        self._z_takeoff = torch.where(took_off, z, self._z_takeoff)
-        self._was_airborne = airborne
+        datum = torch.where(self._have_stance, self._z_stance, z)
+        self._z_takeoff = torch.where(took_off, datum, self._z_takeoff)
+
+        # THE NaN GUARD, and it is this line rather than the obvious one.
+        #
+        # Commit the airborne flag only on steps where z was actually readable.
+        # Otherwise a single NaN step CONSUMES the takeoff transition --
+        # `took_off` false now, and false again next step because
+        # `_was_airborne` is already True -- leaving `_z_takeoff` at its stale
+        # value, which for a fresh env is 0.0. The next step then reads
+        # rise ~ 0.147 m and pays this term its full weight of 12.0 during a
+        # physics blow-up: failing OPEN, where the old absolute-height gate
+        # failed safe. Holding the flag makes the transition retry on the next
+        # finite step and latch the correct datum.
+        #
+        # The obvious guard -- `& finite` on `took_off` above -- was written
+        # first and removed as dead code. Enumerating all four combinations of
+        # {finite-guard, this hold} against four NaN scenarios (tuck-after-NaN
+        # with and without a prior stance sample, real-hop-after-NaN, and NaN on
+        # the very first step) shows guard-on/hold-on and guard-OFF/hold-on both
+        # correct on all four, while every hold-off combination fabricates a
+        # 0.147 m rise. The hold is load-bearing; the guard could not change any
+        # outcome, so no test could distinguish it.
+        self._was_airborne = torch.where(finite, airborne, self._was_airborne)
 
         rise = torch.where(
-            airborne, torch.clamp(z - self._z_takeoff, min=0.0), torch.zeros_like(z)
+            airborne & finite,
+            torch.clamp(z - self._z_takeoff, min=0.0),
+            torch.zeros_like(z),
         )
         return both_airborne, rise
 

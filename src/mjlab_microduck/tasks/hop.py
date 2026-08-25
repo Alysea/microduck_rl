@@ -163,25 +163,31 @@ SENSOR_NAME = "feet_ground_contact"
 # it is weight * 0.318 -- and it only reaches that if the shaped factor it
 # multiplies is pinned at 1.0 the whole launch half, which no real hop achieves.
 #
-# At the ORIGINAL weights (3.0 / 2.0 / 2.0):
+# AT THE CURRENT WEIGHTS:
 #
 #   term                      weight   ceiling/step
-#   hop_both_feet_airborne      3.0       0.955
-#   hop_upward_velocity         2.0       0.637
-#   hop_body_height             2.0       ~0.3    (Gaussian, never pinned at 1)
+#   hop_both_feet_airborne     12.0       3.820
+#   hop_upward_velocity         8.0       2.546
+#   hop_body_height             8.0       ~1.2    (Gaussian, never pinned at 1)
 #   ------------------------------------------------
-#   physically impossible perfect hopper  ~1.9
+#   naive ceiling, all pinned at 1.0      8.91    <- what the budget test uses
+#   with the Gaussian's realistic share   ~7.6
 #
-# Standing perfectly still pays `com_height_target` 1.2 + `upright` 1.0 = 2.2 per
-# step, at lower `action_rate_l2` cost and with near-zero fall risk. A PERFECT HOP
-# LOST TO STANDING STILL before any risk was counted. The first sweep -- three
-# arms, 8000 iterations each -- did not fail to find hopping; it correctly found
-# that hopping was worse, and all three converged to standing (both feet airborne
-# 0.07-0.3% of the time).
+# Against standing perfectly still, which now pays `com_height_target`
+# 1.2 * 1/pi = 0.382 (it is recovery-gated -- see make_hop_variant step 6) plus
+# `upright` 1.0 plus `pose` 2.0 = 3.38/step. Ratio 2.64x.
 #
-# 4x on all three restores the inequality: (12 + 8 + 8) * 1/pi = 8.9/step of hop
-# ceiling against 2.2/step of standing. `tests/test_hop_cfg.py` pins that ratio at
-# >= 2x, computed from the registered weights.
+# HOW IT LOOKED BEFORE THE 4x, which is why these numbers are what they are: at
+# 3.0 / 2.0 / 2.0 the same three terms ceilinged at 0.955 + 0.637 + ~0.3 = ~1.9,
+# against 2.2/step for standing (com_height_target was then ungated and paid its
+# full 1.2), at lower `action_rate_l2` cost and with near-zero fall risk. A
+# PERFECT HOP LOST TO STANDING STILL before any risk was counted. The first sweep
+# -- three arms, 8000 iterations each -- did not fail to find hopping; it
+# correctly found that hopping was worse, and all three converged to standing
+# (both feet airborne 0.07-0.3% of the time).
+#
+# `tests/test_hop_cfg.py::test_hop_budget_beats_standing_still` pins the ratio at
+# >= 2x, computed from the registered weights rather than from this table.
 AIRBORNE_WEIGHT = 12.0
 UPWARD_VELOCITY_WEIGHT = 8.0
 BODY_HEIGHT_WEIGHT = 8.0
