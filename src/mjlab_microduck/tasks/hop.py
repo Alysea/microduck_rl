@@ -1,6 +1,6 @@
 """Hop task variant — a phase-commanded periodic hop in place.
 
-``make_hop_variant(cfg, h_add)`` converts a velocity env cfg into a hop task, in
+``make_hop_variant(cfg)`` converts a velocity env cfg into a hop task, in
 the same shape as ``tasks/run.py`` and ``tasks/backlash.py``. Composed as
 ``make_sprung_variant(make_hop_variant(cfg), ...)`` so the sprung machinery is
 reused unchanged.
@@ -14,7 +14,8 @@ back-EMF derates it at launch speed. Each landing charges the next launch.
 Six changes:
 
 1. Replace the twist command with the CYCLIC phase command already on develop.
-2. Retarget the ported height reward for the robot's actual standing height.
+2. Retarget the ported height reward onto RISE ABOVE TAKEOFF HEIGHT, which
+   removes the standing-height datum from the reward path entirely.
 3. Drop the forward-locomotion rewards (this is a hop in place) AND the walking
    `air_time` reward, which outscores hopping with a march in place.
 4. Register the three hop rewards, the LOAD-PHASE reward and the energy monitor.
@@ -41,58 +42,62 @@ from mjlab_microduck.tasks import mdp as microduck_mdp
 # spring oscillation. Provisional -- sweep only if the first result is ambiguous.
 HOP_PERIOD = 1.0
 
-# Rigid standing trunk height, and the height gain the reward asks for on top.
-# The ported reward hardcoded 0.135 = 0.12 + 0.015 for the RIGID robot; these
-# split that into its two parts so h_add can be added correctly.
+# NO STANDING-HEIGHT DATUM IS ON THE REWARD PATH ANY MORE, and that is the
+# single most important thing to know about this file's history.
 #
-# MEASURED, 2026-08-24, NOT the ported 0.120. The old value turned out to be the
-# robot_walk.xml SPAWN height (model qpos0[2] == 0.120) rather than a settled
-# standing height -- the robot cannot actually stand that tall in HOME_FRAME.
+# Both airborne-gated hop rewards now measure RISE ABOVE TAKEOFF HEIGHT (see
+# `microduck_mdp._HopRiseTracker`). Absolute base height was tried, and it failed
+# three times over: it needed a standing-height datum that was wrong twice
+# (0.120 was the robot_walk.xml SPAWN height, not a standing height; then the
+# SETTLED height double-counted 7.6 mm of actuator sag against a flight-only
+# reward), and even with the datum right it stayed farmable -- first by foot
+# flutter, then by a tall-tuck that no threshold can exclude. Rise is measured
+# against the robot's own body milliseconds earlier, so no datum, no h_add and
+# no posture correction enters the reward at all.
 #
-# Method (see the test with the same number in tests/test_hop_cfg.py): compile
-# the registered LOCKED arm, drop it on a floor plane in HOME_FRAME with the base
-# pinned to vertical travel only (it topples in ~1 s otherwise, and an unpinned
-# settle measures tipping), settle 3000 steps -- the horizon both of this
-# campaign's existing settle probes use -- and read the root z. That reads
-# 0.1395 m, and the Locked arm WEARS the pad, so the rigid height is
-# 0.1395 - H_ADD(0.030) = 0.1095. That is 10.5 mm below the ported 0.120.
+# THE MEASUREMENTS ARE KEPT because they still justify the CoM band and are the
+# reason the frame changed:
 #
-# Bracketing, because the settle creeps (the hip_roll actuators splay slowly
-# against the pin): the sag-free KINEMATIC height -- HOME_FRAME, upright, lowest
-# pad corner exactly on the floor -- is 0.1171 rigid, and an 80 s settle reaches
-# 0.1035. So the true value is inside [0.1035, 0.1171] on any reading, and the
-# old 0.120 sat ABOVE even the sag-free ceiling. Corroboration: the velocity
-# env's `com_height_target` band for the rigid robot is 0.11-0.14.
-RIGID_STAND_HEIGHT = 0.1095
+#   settled rigid stand height   0.1095   (MEASURED 2026-08-24; the registered
+#       LOCKED arm compiled onto a floor plane in HOME_FRAME, base pinned to
+#       vertical travel only -- it topples in ~1 s otherwise and an unpinned
+#       settle measures tipping -- settled 3000 steps, root z 0.1395, minus
+#       H_ADD 0.030. An 80 s settle creeps to 0.1035, so the settled value is
+#       inside [0.1035, 0.1171] on any reading.)
+#
+#   sag-free kinematic height    0.1171   (UNLOADED_RIGID_HEIGHT below: upright,
+#       HOME_FRAME, lowest pad corner exactly on the floor, h_add removed.)
+#
+#   max sag-free stance height   0.16133  (grid search over symmetric
+#       hip_pitch/knee/ankle poses, pad kept flat, vs HOME_FRAME's 0.14710.)
+#
+# That last pair is what killed absolute height: ~14.2 mm of POSTURE HEADROOM.
+# The robot can stand tall at root ~0.155 and then tuck; a 51 ms tuck dips the
+# trunk only ~4 mm, so it sits above any threshold set within 14.2 mm of stance
+# for the whole tuck -- ~0.20/step of `pose` spent to unlock ~1.8/step of
+# airborne reward, scoring 5.1/step against a genuine 33 mm hop's 5.4. And the
+# threshold could not simply be raised past it: anything above 14.2 mm would
+# also gate out the Locked arm's expected ~5 mm hop and destroy the controlled
+# comparison that IS the experiment.
 
 # The SAG-FREE KINEMATIC height (HOME_FRAME, upright, lowest pad corner exactly
-# on the floor), rigid, i.e. with h_add removed. Same measurement as the upper
-# bracket quoted above, and pinned by the same test in tests/test_hop_cfg.py.
+# on the floor), rigid, i.e. with h_add removed. Pinned against the compiled
+# Locked arm by a test in tests/test_hop_cfg.py.
 #
-# This -- not RIGID_STAND_HEIGHT -- is the correct reference for the hop height
-# reward, because `hop_body_height` is GATED ON BOTH FEET AIRBORNE: it is only
-# ever evaluated in flight, with the legs carrying no load and therefore no
-# actuator sag. RIGID_STAND_HEIGHT is the SETTLED height, 7.6 mm lower, measured
-# with the full 877 g pressing the hip/knee/ankle position actuators off their
-# targets. Referencing the settled value from a flight-only reward hands the
-# robot 7.6 mm of free "gain" for merely unloading its legs -- a measurement
-# error in the reward, not a tuning choice. RIGID_STAND_HEIGHT stays as the
-# documented settled value (it is what the CoM band and stance behaviour are
-# about); it is simply not the datum for an airborne apex.
-#
-# This fixes a measurement error, but it does not exhaust the robot's posture
-# headroom: a grid search over symmetric hip_pitch/knee/ankle poses (pad kept
-# flat) found a maximum sag-free stance root height of 0.16133 -- vs
-# HOME_FRAME's 0.14710 -- so about 14.2 mm of headroom survives this fix,
-# roughly TWICE the 7.6 mm it removed. That headroom is identical on all three
-# arms, so it biases none of them relative to each other, but it means the real
-# room between UNLOADED_RIGID_HEIGHT and the hop target's HOP_COM_HEIGHT_MAX
-# (0.1871 sprung) is ~26 mm, not the ~40 mm a reader might infer from treating
-# this datum fix as pure spring rebound.
+# NOT a reward datum -- nothing in the reward path reads it. It survives as the
+# STANCE reference that justifies `HOP_COM_HEIGHT_MAX`: the CoM band is about
+# standing behaviour, so it still needs to know how tall the robot stands.
 UNLOADED_RIGID_HEIGHT = 0.1171
 
-# Height gain above the unloaded reference that the Gaussian peaks at, and its
-# width. Both were raised from 0.015 / 0.008: the old pair saturated the reward
+# RISE above takeoff height that the Gaussian peaks at, and its width.
+#
+# These two transfer UNCHANGED from the absolute-height formulation, and they
+# are more correct in the rise frame, not less: both were always chosen as a
+# GAIN ABOVE STANDING, which is exactly what rise measures directly. Under the
+# old formulation that gain had to be reconstructed by adding a standing-height
+# datum to an absolute target, and the datum was wrong twice.
+#
+# Both were raised from 0.015 / 0.008: the old pair saturated the reward
 # at roughly 15-20 mm of gain, while the drop-rig evidence this campaign is built
 # on spans 5 mm (Locked) to 33 mm (k3900), so all three arms sat at the ceiling
 # and the arm-to-arm comparison -- which IS the experiment -- measured nothing.
@@ -106,18 +111,31 @@ UNLOADED_RIGID_HEIGHT = 0.1171
 # whole 5-33 mm discriminating band on the RISING limb of the Gaussian instead of
 # straddling its peak (where 27 mm and 53 mm would score alike).
 #
-# Why std = 20 mm. `hop_body_height` uses exp(-((h - target)/std)**2), so with
-# target +40 mm and std 20 mm the term reads: 5 mm gain -> 0.047, 27 mm -> 0.655,
+# Why std = 20 mm. `hop_body_height` uses exp(-((rise - target)/std)**2), so with
+# target +40 mm and std 20 mm the term reads: 5 mm rise -> 0.047, 27 mm -> 0.655,
 # 33 mm -> 0.885. Monotone increasing across the band, ~19x discrimination
 # between a Locked-like 5 mm and a sprung-like 33 mm. Under the old std = 0.008
 # all three of those read ~0.000 -- indistinguishable, which was the bug.
 #
-# The tradeoff, deliberately accepted: at zero gain the term is exp(-4) = 0.018,
+# The tradeoff, deliberately accepted: at zero rise the term is exp(-4) = 0.018,
 # so it gives almost no gradient until the robot is already leaving the ground.
-# `hop_both_feet_airborne` (weight AIRBORNE_WEIGHT, binary) is the DISCOVERY term; this one
-# only shapes how high once airborne.
+# `hop_upward_velocity` -- ungated, dense -- is the DISCOVERY term; this one only
+# shapes how high once airborne.
 HOP_HEIGHT_GAIN = 0.040
 HOP_HEIGHT_STD = 0.020
+
+# Rise above takeoff height that `hop_both_feet_airborne` demands before it pays.
+#
+# Deliberately tiny. This gate exists to price out a TUCK -- both pads retracted
+# with the trunk left where it was, which rises ~0 by construction -- not to
+# shape hop height, which is HOP_HEIGHT_GAIN's job. 3 mm clears the ~4 mm of
+# trunk dip a 51 ms tuck produces while still admitting the Locked control arm's
+# expected ~5 mm hop, so the arm-to-arm comparison survives the gate. That
+# lower bound is the binding constraint: a gate at, say, 10 mm would score the
+# Locked arm at zero airborne reward and make the controlled comparison
+# meaningless, which is precisely why the earlier absolute-height threshold
+# could not simply be raised past the 14.2 mm posture headroom.
+MIN_RISE = 0.003
 
 # Upward base velocity at which `hop_upward_velocity` saturates (it clamps
 # vel_z/max_vel to [0, 1]). A ballistic launch at v rises v**2/(2*g), so the old
@@ -203,13 +221,6 @@ BODY_WEIGHT_N = 8.60
 # defaults that were only correct for one arm.
 LOAD_FORCE_MAX_RATIO = 6.0
 
-# Metres of root height ABOVE the unloaded standing height that
-# `hop_both_feet_airborne` requires before it pays. Small on purpose: this gate
-# exists to make foot flutter unprofitable, not to shape hop height (that is
-# `hop_body_height`'s job), so it should bite just above the noise floor of a
-# stand and nowhere near the 40 mm HOP_HEIGHT_GAIN target.
-AIRBORNE_HEIGHT_MARGIN = 0.005
-
 ENERGY_MONITOR_WEIGHT = 1.0
 
 # Forward-locomotion rewards read the twist command, which the phase command
@@ -264,46 +275,23 @@ _WALKING_GAIT_REWARDS = ("air_time",)
 # and make the hop rewards harder to balance against it.
 
 
-def hop_target_height(h_add: float) -> float:
-    """Target base height for the hop apex, shifted by the boot's added height.
-
-    Built on ``UNLOADED_RIGID_HEIGHT``, not ``RIGID_STAND_HEIGHT``: the reward
-    that consumes this is gated on both feet airborne, so it is only evaluated in
-    flight with the legs unloaded. See the constant's comment.
-
-    The sprung robot stands ``h_add`` taller, so an unshifted target asks it to
-    CROUCH rather than hop -- the same class of bug as the CoM band shift.
-    """
-    return UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN + h_add
-
-
-def hop_airborne_min_height(h_add: float) -> float:
-    """Root height `hop_both_feet_airborne` must clear before it pays anything.
-
-    Built on ``UNLOADED_RIGID_HEIGHT``, NOT ``RIGID_STAND_HEIGHT``, and the
-    distinction is load-bearing rather than pedantic. In flight the legs carry no
-    load, so the root rises ~7.6 mm of actuator sag FOR FREE relative to the
-    settled height. A threshold referenced to the settled value would therefore
-    be cleared by merely unloading the legs -- which is precisely the flutter
-    exploit this gate exists to close, re-admitted through the datum.
-
-    Shifted by ``h_add`` for the same reason ``hop_target_height`` is: the sprung
-    robot stands that much taller, so an unshifted threshold would be below its
-    standing height and gate nothing at all.
-    """
-    return UNLOADED_RIGID_HEIGHT + h_add + AIRBORNE_HEIGHT_MARGIN
-
-
 def make_hop_variant(
     cfg: ManagerBasedRlEnvCfg,
-    h_add: float = 0.0,
     stiffness: float = 3900.0,
 ) -> ManagerBasedRlEnvCfg:
     """Convert a velocity env cfg into the periodic hop task.
 
+    NOTE: this transform TAKES NO ``h_add``, and that absence is a result rather
+    than an oversight. It used to, because both airborne-gated rewards placed an
+    ABSOLUTE base-height target that had to be shifted by the boot's height. They
+    now measure RISE ABOVE TAKEOFF HEIGHT, which is invariant to how tall the
+    robot stands, so the hop rewards no longer care about the boot at all. The
+    only remaining h_add-dependent quantity in the hop arms is the
+    ``com_height_target`` BAND, and ``make_sprung_variant`` already owns that
+    shift. One less pair of values to keep in sync, and one less place to get a
+    datum wrong -- which this campaign did twice.
+
     Args:
-        h_add: metres of height the foot mechanism adds. 0.0 for the rigid
-            robot; pass the sprung model's H_ADD for sprung arms.
         stiffness: N/m spring rate to report through `hop_energy_monitor`. Must
             match the arm's actual spring stiffness -- Task 4 registers a k2500
             arm alongside the k3900 default, and a hardcoded value would report
@@ -366,12 +354,13 @@ def make_hop_variant(
         params={
             "sensor_name": SENSOR_NAME,
             "command_name": "twist",
-            # Anti-flutter. Only two collision geoms exist on this robot (the
-            # two pads), so "both feet airborne" alone says nothing about the
-            # 877 g body: retracting both 70 g feet 20 mm at 8-10 Hz farms this
-            # term at a real hop's rate with the trunk motionless. Threaded like
-            # `target_height` because the function cannot know h_add.
-            "min_height": hop_airborne_min_height(h_add),
+            # Anti-tuck. Only two collision geoms exist on this robot (the two
+            # pads), so "both feet airborne" alone says nothing about the 877 g
+            # body: retracting both 70 g feet farms this term at a real hop's
+            # rate with the trunk motionless. A rise threshold closes that; an
+            # absolute-height threshold does NOT, because the robot can stand
+            # tall first and tuck from there. See microduck_mdp._HopRiseTracker.
+            "min_rise": MIN_RISE,
         },
     )
     cfg.rewards["hop_upward_velocity"] = RewardTermCfg(
@@ -384,7 +373,10 @@ def make_hop_variant(
         weight=BODY_HEIGHT_WEIGHT,
         params={
             "command_name": "twist",
-            "target_height": hop_target_height(h_add),
+            # RISE above takeoff, not an absolute height, so no standing-height
+            # datum and no h_add enter this. The value is unchanged from the
+            # absolute formulation because it was always a GAIN ABOVE STANDING.
+            "target_rise": HOP_HEIGHT_GAIN,
             "std": HOP_HEIGHT_STD,
             # Threaded explicitly: this term is gated on BOTH FEET AIRBORNE
             # (otherwise it pays for a ground-level bob), and that gate reads the
@@ -439,7 +431,13 @@ def make_hop_variant(
     #    Phase-2 `h_add` translation in make_sprung_variant is untouched (that
     #    "CoM band shift" is the out-of-scope item in the spec): running after
     #    this, it shifts both edges by h_add and yields [0.14, 0.23] for the
-    #    sprung arms -- comfortably above the 0.1871 target apex.
+    #    sprung arms -- comfortably above the apex the hop reward asks for, which
+    #    is UNLOADED_RIGID_HEIGHT + H_ADD + HOP_HEIGHT_GAIN = 0.1871 for a hop
+    #    launched from a nominal stance. (The reward itself no longer names that
+    #    number -- it shapes RISE -- but the CoM band still has to clear the
+    #    absolute height a successful hop reaches, so the arithmetic belongs
+    #    here. Posture headroom can add up to ~14 mm on top; the band's 0.23 top
+    #    covers that too.)
     cfg.rewards["com_height_target"].params["target_height_max"] = HOP_COM_HEIGHT_MAX
 
     # 6. ...and stop paying it at all during the LAUNCH half.
@@ -465,7 +463,10 @@ def make_hop_variant(
 from copy import deepcopy
 from dataclasses import replace
 
-from mjlab_microduck.robot.sprung_foot import H_ADD, PAD_MASS, TRAVEL
+# H_ADD dropped from this import: make_hop_variant no longer takes one. The hop
+# rewards measure rise above takeoff, so the boot's height is irrelevant to them;
+# its one remaining consumer is the CoM band, owned by make_sprung_variant.
+from mjlab_microduck.robot.sprung_foot import PAD_MASS, TRAVEL
 from mjlab_microduck.tasks.run import MicroduckRunRlCfg
 
 # (label, stiffness N/m, travel m, pad mass kg).

@@ -7,7 +7,6 @@ import pytest
 from mjlab_microduck.robot.sprung_foot import H_ADD, PAD_MASS
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.hop import (
-    AIRBORNE_HEIGHT_MARGIN,
     AIRBORNE_WEIGHT,
     BODY_HEIGHT_WEIGHT,
     BODY_WEIGHT_N,
@@ -19,12 +18,10 @@ from mjlab_microduck.tasks.hop import (
     HOP_PERIOD,
     LOAD_FORCE_MAX_RATIO,
     LOAD_FORCE_WEIGHT,
-    RIGID_STAND_HEIGHT,
+    MIN_RISE,
     SENSOR_NAME,
     UNLOADED_RIGID_HEIGHT,
     UPWARD_VELOCITY_WEIGHT,
-    hop_airborne_min_height,
-    hop_target_height,
     make_hop_variant,
 )
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import (
@@ -34,7 +31,7 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import (
 
 @pytest.fixture
 def hop_cfg():
-    return make_hop_variant(make_microduck_velocity_env_cfg(), h_add=H_ADD)
+    return make_hop_variant(make_microduck_velocity_env_cfg())
 
 
 def test_command_is_the_cyclic_phase_command(hop_cfg):
@@ -43,18 +40,31 @@ def test_command_is_the_cyclic_phase_command(hop_cfg):
     assert term.period == pytest.approx(HOP_PERIOD)
 
 
-def test_height_target_is_shifted_by_h_add(hop_cfg):
-    """The ported reward hardcodes 0.135 for the RIGID robot. The sprung robot
-    stands H_ADD taller, so an unshifted target asks it to CROUCH."""
-    expected = UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
-    assert hop_cfg.rewards["hop_body_height"].params["target_height"] == pytest.approx(expected)
-    assert hop_target_height(H_ADD) == pytest.approx(expected)
+def test_height_target_is_a_rise_and_carries_no_standing_height_datum(hop_cfg):
+    """The target is the GAIN itself, with no standing height added to it.
+
+    This replaces two tests that asserted the old absolute target was shifted by
+    h_add. That shift existed only because the target was an absolute base
+    height, and it was the source of two datum errors (the spawn height, then
+    the settled-vs-unloaded sag). Measured as rise above takeoff, there is
+    nothing to shift: the sprung robot stands 30 mm taller and its takeoff
+    height is 30 mm higher, so the rise it must achieve is identical.
+    """
+    params = hop_cfg.rewards["hop_body_height"].params
+    assert params["target_rise"] == pytest.approx(HOP_HEIGHT_GAIN)
+    assert "target_height" not in params, "the absolute-height target is gone"
+    # The datum is genuinely absent, not merely renamed: the target must not
+    # contain a standing height on any arm.
+    assert params["target_rise"] < UNLOADED_RIGID_HEIGHT
 
 
-def test_rigid_variant_target_is_not_shifted():
-    rigid = make_hop_variant(make_microduck_velocity_env_cfg(), h_add=0.0)
-    expected = UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN
-    assert rigid.rewards["hop_body_height"].params["target_height"] == pytest.approx(expected)
+def test_make_hop_variant_no_longer_takes_h_add():
+    """The hop rewards are invariant to how tall the boot makes the robot, so
+    the transform has no use for h_add and must not silently accept one -- a
+    caller passing it would reasonably expect it to do something."""
+    import inspect
+
+    assert "h_add" not in inspect.signature(make_hop_variant).parameters
 
 
 def test_all_three_hop_rewards_registered_with_positive_weight(hop_cfg):
@@ -79,7 +89,7 @@ def test_energy_monitor_stiffness_threads_through_the_variant():
     """make_hop_variant's default (3900.0) is only correct for the k3900 arm.
     Task 4 also registers a k2500 arm; without this parameter threading through,
     hop_energy_monitor would report that arm's stored spring energy 56% high."""
-    cfg = make_hop_variant(make_microduck_velocity_env_cfg(), h_add=H_ADD, stiffness=2500.0)
+    cfg = make_hop_variant(make_microduck_velocity_env_cfg(), stiffness=2500.0)
     assert cfg.rewards["hop_energy_monitor"].params["stiffness"] == 2500.0
 
 
@@ -91,7 +101,7 @@ def test_command_construction_preserves_base_fields():
     that ignores its velocity-sampling ranges. Assert the carry-over directly."""
     rigid = make_microduck_velocity_env_cfg()
     original = rigid.commands["twist"]
-    hop_cfg = make_hop_variant(rigid, h_add=H_ADD)
+    hop_cfg = make_hop_variant(rigid)
     rebuilt = hop_cfg.commands["twist"]
 
     assert rebuilt.ranges == original.ranges
@@ -192,45 +202,33 @@ def test_hop_arms_have_distinct_wandb_identities():
     assert len(names) == 3
 
 
-def test_registered_hop_cfgs_carry_the_shifted_height_target():
+def test_registered_hop_cfgs_carry_the_rise_target():
     """End-to-end: the registered task, not just the transform in isolation."""
     import mjlab_microduck.tasks  # noqa: F401
     from mjlab.tasks.registry import load_env_cfg
 
     cfg = load_env_cfg("Mjlab-Hop-Flat-Sprung-K3900-MicroDuck")
-    assert cfg.rewards["hop_body_height"].params["target_height"] == pytest.approx(
-        hop_target_height(H_ADD)
+    assert cfg.rewards["hop_body_height"].params["target_rise"] == pytest.approx(
+        HOP_HEIGHT_GAIN
     )
 
 
-def test_rigid_stand_height_is_pinned_to_the_measured_locked_arm_geometry():
-    """Pin RIGID_STAND_HEIGHT against a real measurement of the Locked arm.
+def test_unloaded_rigid_height_is_pinned_to_the_compiled_locked_arm_geometry():
+    """Pin UNLOADED_RIGID_HEIGHT to the Locked arm's actual kinematics.
 
-    MEASURED 2026-08-24 on the registered `Mjlab-Hop-Flat-Sprung-Locked-MicroDuck`
-    arm (stiffness 3900, travel 0.0, pad 70 g, h_add 0.030). Method: compile that
-    arm's spec_fn, add a floor plane, set HOME_FRAME on every hinge with the
-    position actuators pointed at it, PIN THE BASE TO VERTICAL TRAVEL ONLY (it
-    topples in ~1 s without a balance policy, so an unpinned settle measures
-    tipping, not height) and settle 3000 steps — the horizon this campaign's
-    existing settle probes use.
+    NOT a reward datum any more -- both hop height rewards measure RISE ABOVE
+    TAKEOFF, so no standing height enters them. It survives because the CoM band
+    still does care how tall the robot stands: `HOP_COM_HEIGHT_MAX` has to clear
+    the absolute height a successful hop reaches, and that is computed from this
+    constant in `test_com_band_ceiling_is_above_the_hop_apex`.
 
-        settled root z (Locked, WEARS the pad)  = 0.13949 m
-        minus H_ADD                            = 0.030   m
-        => rigid stand height                  = 0.10949 m
+    The companion RIGID_STAND_HEIGHT (settled, 0.1095) was DELETED along with the
+    absolute-height rewards: with no reward reading a standing height, nothing
+    referenced it, and a constant pinned only by the test that pins it is a
+    tautology. Its measurement is preserved in `hop.py`'s header comment.
 
-    The previous value, 0.120, was the robot_walk.xml SPAWN height (qpos0[2]),
-    not a standing height: the sag-free KINEMATIC height below is only 0.1171
-    rigid, so the robot could not stand that tall in HOME_FRAME even with
-    infinitely stiff actuators. With std = 0.008 in `hop_body_height`, that
-    10.5 mm error was most of the reward's dynamic range.
-
-    Two assertions, deliberately independent:
-      1. the constant still matches the settle measurement (trips if someone
-         edits it without re-measuring);
-      2. the compiled Locked arm's sag-free kinematic height still matches what
-         was measured (trips if H_ADD, ANKLE_TO_SOLE, the pad box or any leg link
-         changes — at which point re-run
-         `.superpowers/sdd/2026-08-24-sprung-hop/measure_stand_height.py`).
+    Trips if H_ADD, ANKLE_TO_SOLE, the pad box or any leg link changes — at which
+    point re-run `.superpowers/sdd/2026-08-24-sprung-hop/measure_stand_height.py`.
     """
     import re
 
@@ -240,8 +238,6 @@ def test_rigid_stand_height_is_pinned_to_the_measured_locked_arm_geometry():
     import mjlab_microduck.tasks  # noqa: F401
     from mjlab.tasks.registry import load_env_cfg
     from mjlab_microduck.robot.microduck_constants import HOME_FRAME
-
-    assert RIGID_STAND_HEIGHT == pytest.approx(0.10949, abs=0.002)
 
     robot = load_env_cfg("Mjlab-Hop-Flat-Sprung-Locked-MicroDuck").scene.entities["robot"]
     m = robot.spec_fn().compile()
@@ -269,13 +265,9 @@ def test_rigid_stand_height_is_pinned_to_the_measured_locked_arm_geometry():
     )
     kinematic_rigid = -lowest - H_ADD
     assert kinematic_rigid == pytest.approx(0.11710, abs=0.002)
-    # UNLOADED_RIGID_HEIGHT *is* this sag-free kinematic height -- it is the datum
-    # the airborne-gated hop height reward is built on, so pin it to the geometry
-    # rather than to a copied literal.
+    # UNLOADED_RIGID_HEIGHT *is* this sag-free kinematic height, so pin it to the
+    # geometry rather than to a copied literal.
     assert UNLOADED_RIGID_HEIGHT == pytest.approx(kinematic_rigid, abs=0.002)
-    assert RIGID_STAND_HEIGHT < kinematic_rigid, (
-        "the robot cannot stand taller in HOME_FRAME than its own kinematics allow"
-    )
 
 
 def test_registered_hop_cfgs_carry_their_own_arm_stiffness():
@@ -321,65 +313,32 @@ def _registered(label: str):
     return load_env_cfg(_hop_task_id(label))
 
 
-def test_height_target_references_the_unloaded_not_the_settled_height():
-    """`hop_body_height` is gated on BOTH FEET AIRBORNE, so it is only ever
-    evaluated in flight with the legs unloaded. Referencing RIGID_STAND_HEIGHT
-    (the SETTLED height, measured with the full 877 g sagging the position
-    actuators off their targets) hands the robot the sag for free: it scores
-    "gain" for merely unloading its legs, without leaving the ground any higher.
-    That is a measurement error in the reward, not a tuning choice.
-
-    Both halves matter: the exact value, and the size of the error the old datum
-    introduced.
-    """
-    assert hop_target_height(0.0) == pytest.approx(UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN)
-    assert hop_target_height(H_ADD) == pytest.approx(
-        UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
-    )
-
-    settled_based = RIGID_STAND_HEIGHT + HOP_HEIGHT_GAIN
-    free_gain = hop_target_height(0.0) - settled_based
-    assert free_gain == pytest.approx(0.0076, abs=1e-4), (
-        "the settled reference under-shoots the flight datum by the actuator sag; "
-        "that 7.6 mm was free reward for unloading the legs"
-    )
-
-
-def test_registered_arms_carry_the_widened_height_gaussian():
+def test_registered_arms_carry_the_widened_rise_gaussian():
     """End-to-end through the registered tasks, not the transform in isolation.
 
     The old (gain 0.015, std 0.008) pair put the entire 5-33 mm evidence band at
     ~0.000 reward. Assert the registered params, and assert the peak still sits
     ABOVE the ~27 mm energetic ceiling estimated for k=3900 so the whole band
     stays on the Gaussian's RISING limb instead of straddling its peak.
+
+    Two whole tests were DELETED here rather than ported, because measuring rise
+    made them tautologies: `test_height_target_references_the_unloaded_not_the_
+    settled_height` existed only to pick between two standing-height datums, and
+    the datum-revert guard below it defended a subtraction that no longer
+    happens. There is no datum left to get wrong -- which was the point.
     """
     for label in HOP_ARM_SUFFIX:
         cfg = _registered(label)
         params = cfg.rewards["hop_body_height"].params
         tid = _hop_task_id(label)
-        assert params["target_height"] == pytest.approx(hop_target_height(H_ADD)), tid
+        assert params["target_rise"] == pytest.approx(HOP_HEIGHT_GAIN), tid
         assert params["std"] == pytest.approx(HOP_HEIGHT_STD), tid
-        # Datum guard, independent of HOP_HEIGHT_GAIN's value.
-        #
-        # The assertion this replaced (`gain > 0.033` where
-        # `gain = target_height - (UNLOADED_RIGID_HEIGHT + H_ADD)`) is identically
-        # `HOP_HEIGHT_GAIN > 0.033` by construction, so it asserted only "the
-        # constant exceeds a hardcoded 0.033" -- and it caught the
-        # RIGID_STAND_HEIGHT-vs-UNLOADED_RIGID_HEIGHT datum revert only by
-        # coincidence: 0.040 - 0.0076 = 0.0324 happens to land 0.6 mm under that
-        # threshold. Someone who raises HOP_HEIGHT_GAIN to 0.045 while reverting
-        # the datum back to RIGID_STAND_HEIGHT (double-counting the leg sag
-        # again) would pass the whole suite.
-        #
-        # Assert the datum directly instead, and separately assert it is NOT the
-        # settled-height alternative -- the second assertion is the one that
-        # survives any future change to the gain.
-        assert params["target_height"] == pytest.approx(
-            UNLOADED_RIGID_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
-        ), tid
-        assert params["target_height"] != pytest.approx(
-            RIGID_STAND_HEIGHT + HOP_HEIGHT_GAIN + H_ADD
-        ), tid
+        # The peak must sit above the ~27 mm energetic ceiling estimated for
+        # k=3900, so the 5-33 mm evidence band stays on the rising limb.
+        assert params["target_rise"] > 0.033, tid
+        # And it must remain a RISE, not an absolute height: anything at or above
+        # the robot's own standing height is a datum that crept back in.
+        assert params["target_rise"] < UNLOADED_RIGID_HEIGHT, tid
 
 
 def test_upward_velocity_does_not_saturate_below_the_height_target():
@@ -419,8 +378,14 @@ def test_com_band_ceiling_is_above_the_hop_apex():
     Written as a relationship so it cannot silently regress if HOP_HEIGHT_GAIN,
     UNLOADED_RIGID_HEIGHT or H_ADD moves. Checked on a sprung arm AND on the
     Locked control, which wears the same boot and so gets the same shift.
+
+    The apex is computed HERE, not read from the reward, because the reward no
+    longer names an absolute height -- it shapes rise. The CoM band still has to
+    clear the absolute height a successful hop reaches, so this is the one place
+    the standing height and the gain are added together, and it is why
+    UNLOADED_RIGID_HEIGHT survives at all.
     """
-    apex = hop_target_height(H_ADD)
+    apex = UNLOADED_RIGID_HEIGHT + H_ADD + HOP_HEIGHT_GAIN
     for label in ("k3900", "locked"):
         params = _registered(label).rewards["com_height_target"].params
         tid = _hop_task_id(label)
@@ -454,19 +419,19 @@ def test_height_gaussian_discriminates_locked_from_sprung():
     campaign returns an uninformative null after hours of GPU time per arm. Under
     the old (0.015, 0.008) params both read ~1e-8 and the ratio was ~1.0.
 
-    The Gaussian is recomputed here from the REGISTERED params -- exp(-((h -
-    target)/std)**2), matching microduck_mdp.hop_body_height -- rather than from
-    module constants, so a registration that fails to thread them through fails
-    this test too.
+    The Gaussian is recomputed here from the REGISTERED params -- exp(-((rise -
+    target_rise)/std)**2), matching microduck_mdp.hop_body_height -- rather than
+    from module constants, so a registration that fails to thread them through
+    fails this test too.
+
+    Simpler than it used to be: the term's argument IS the gain now, so there is
+    no reference height to reconstruct and no chance of reconstructing it wrong.
     """
     params = _registered("k3900").rewards["hop_body_height"].params
-    target, std = params["target_height"], params["std"]
-    # The reward is evaluated airborne, so gain is measured from the UNLOADED
-    # stand height -- which is exactly `target - HOP_HEIGHT_GAIN`.
-    reference = target - HOP_HEIGHT_GAIN
+    target, std = params["target_rise"], params["std"]
 
     def reward(gain_m: float) -> float:
-        return math.exp(-(((reference + gain_m - target) / std) ** 2))
+        return math.exp(-(((gain_m - target) / std) ** 2))
 
     locked_like = reward(0.005)
     sprung_like = reward(0.033)
@@ -500,11 +465,10 @@ def test_height_gaussian_pays_from_a_standing_start():
          constants rather than as two more hardcoded numbers.
     """
     params = _registered("k3900").rewards["hop_body_height"].params
-    target, std = params["target_height"], params["std"]
-    reference = target - HOP_HEIGHT_GAIN
+    target, std = params["target_rise"], params["std"]
 
     def reward(gain_m: float) -> float:
-        return math.exp(-(((reference + gain_m - target) / std) ** 2))
+        return math.exp(-(((gain_m - target) / std) ** 2))
 
     assert reward(0.005) >= 0.03, (
         f"5 mm of gain scores {reward(0.005):.4f}, below the 0.03 floor -- "
@@ -732,53 +696,100 @@ def test_load_force_stays_below_the_launch_terms():
         assert load_ceiling < launch_ceiling, _hop_task_id(label)
 
 
-# --- the anti-flutter height gate on hop_both_feet_airborne ------------------
+# --- the anti-tuck rise gate on hop_both_feet_airborne -----------------------
 
 
-def test_airborne_height_gate_registered_on_every_arm():
-    """Without it, `hop_both_feet_airborne` at weight 12.0 is farmable by FOOT
-    FLUTTER. Only two collision geoms exist on the whole robot (the two pads;
-    every other geom is contype=0), so the contact predicate says nothing about
-    the 877 g body: retracting both 70 g feet ~20 mm at 8-10 Hz satisfies it at
-    ~50% duty inside the launch half for 12*(1/pi)*0.5 = 1.9/step, matching a
-    genuine 33 mm hop's airborne payout with a HIGHER `pose` reward and no fall
-    risk. `foot_swing_height`'s target (0.02 m) is exactly the flutter
-    amplitude, so it is free, and `foot_clearance` reads xy velocity only."""
+def test_airborne_rise_gate_registered_on_every_arm():
+    """Without it, `hop_both_feet_airborne` at weight 12.0 is farmable by a TUCK.
+    Only two collision geoms exist on the whole robot (the two pads; every other
+    geom is contype=0), so the contact predicate says nothing about the 877 g
+    body: retracting both 70 g feet satisfies it at ~50% duty inside the launch
+    half for 12*(1/pi)*0.5 = 1.9/step, matching a genuine 33 mm hop's airborne
+    payout with a HIGHER `pose` reward and no fall risk. `foot_swing_height`'s
+    target (0.02 m) is exactly the flutter amplitude, so it is free, and
+    `foot_clearance` reads xy velocity only."""
     for label in HOP_ARM_SUFFIX:
         params = _registered(label).rewards["hop_both_feet_airborne"].params
         tid = _hop_task_id(label)
-        assert "min_height" in params, f"{tid}: airborne term has no height gate"
-        assert params["min_height"] == pytest.approx(hop_airborne_min_height(H_ADD)), tid
+        assert "min_rise" in params, f"{tid}: airborne term has no rise gate"
+        assert params["min_rise"] == pytest.approx(MIN_RISE), tid
+        assert "min_height" not in params, f"{tid}: absolute-height gate came back"
 
 
-def test_airborne_gate_references_the_unloaded_height_not_the_settled_one():
-    """The same datum error as `hop_body_height`'s, in a gate instead of a
-    target. In flight the legs unload and the root rises ~7.6 mm of actuator sag
-    for free, so a settled-referenced threshold would be cleared by MERELY
-    UNLOADING -- re-admitting the flutter exploit through the datum. Assert the
-    datum directly, and separately assert it is not the settled alternative."""
-    assert hop_airborne_min_height(H_ADD) == pytest.approx(
-        UNLOADED_RIGID_HEIGHT + H_ADD + AIRBORNE_HEIGHT_MARGIN
-    )
-    settled_based = RIGID_STAND_HEIGHT + H_ADD + AIRBORNE_HEIGHT_MARGIN
-    assert hop_airborne_min_height(H_ADD) > settled_based
-    assert hop_airborne_min_height(H_ADD) - settled_based == pytest.approx(0.0076, abs=1e-4)
+def test_both_airborne_terms_are_stateful_rise_trackers():
+    """Both must inherit the takeoff latch. A stateless reimplementation of
+    either would silently go back to reading absolute height."""
+    for label in HOP_ARM_SUFFIX:
+        rewards = _registered(label).rewards
+        tid = _hop_task_id(label)
+        for name in ("hop_both_feet_airborne", "hop_body_height"):
+            func = rewards[name].func
+            assert isinstance(func, type), f"{tid}: {name} is not a class term"
+            assert issubclass(func, microduck_mdp._HopRiseTracker), f"{tid}: {name}"
+            assert callable(getattr(func, "reset", None)), (
+                f"{tid}: {name} has no reset(), so RewardManager will never clear "
+                "its latch on episode reset"
+            )
 
 
-def test_airborne_gate_sits_between_a_stand_and_the_hop_target():
-    """Both bounds matter. Below the standing height it gates nothing; at or
-    above the hop apex it would make the term unreachable and destroy the dense
-    discovery signal the whole rebalance depends on."""
-    stand = UNLOADED_RIGID_HEIGHT + H_ADD
-    gate = hop_airborne_min_height(H_ADD)
-    assert gate > stand, "the gate must not be cleared by simply standing"
-    assert gate < hop_target_height(H_ADD), (
-        "the gate must sit well below the hop target, or the airborne reward is "
-        "unreachable until the robot is already hopping well"
-    )
+def test_every_hop_terms_params_match_its_signature():
+    """`RewardManager.compute` calls `func(env, **term_cfg.params)`, so a params
+    key the callable does not accept is a TypeError on the FIRST STEP of an 8000
+    iteration run -- after the job has been queued and the GPU allocated.
+
+    This became a live risk when the two airborne terms turned into classes: the
+    params travel to `__call__`, not to `__init__`, and renaming
+    `target_height` -> `target_rise` or `min_height` -> `min_rise` in one place
+    and not the other would not otherwise be caught by anything static.
+
+    Checks the class terms against `__call__` (which is what
+    `ManagerBase._resolve_common_term_cfg` leaves behind after instantiating
+    them) and plain functions against themselves.
+    """
+    import inspect
+
+    for label in HOP_ARM_SUFFIX:
+        rewards = _registered(label).rewards
+        tid = _hop_task_id(label)
+        for name in (
+            "hop_both_feet_airborne",
+            "hop_upward_velocity",
+            "hop_body_height",
+            "hop_load_force",
+            "hop_energy_monitor",
+            "com_height_target",
+        ):
+            term = rewards[name]
+            target = term.func.__call__ if isinstance(term.func, type) else term.func
+            sig = inspect.signature(target)
+            accepted = set(sig.parameters)
+            unknown = set(term.params) - accepted
+            assert not unknown, (
+                f"{tid}: {name} is registered with param(s) {sorted(unknown)} that "
+                f"{target.__qualname__} does not accept -- this would raise TypeError "
+                "on the first step of training"
+            )
+
+
+def test_min_rise_admits_the_locked_arm_but_not_a_tuck():
+    """The gate's two-sided constraint, and the reason an absolute threshold
+    could not simply be raised to fix the tall-tuck.
+
+    Upper bound: it must admit the Locked control arm's expected ~5 mm hop. A
+    gate above that scores Locked at zero airborne reward and makes the
+    arm-to-arm comparison -- which IS the experiment -- meaningless. That is
+    exactly why the previous absolute threshold was stuck: the robot has ~14.2 mm
+    of posture headroom to tuck from, but a 14 mm threshold would have gated out
+    Locked entirely.
+
+    Lower bound: it must exceed the trunk dip a tuck produces (~1 mm over the
+    step, ~4 mm over a 51 ms tuck).
+    """
+    assert MIN_RISE < 0.005, "MIN_RISE must admit the Locked arm's ~5 mm hop"
+    assert MIN_RISE > 0.0, "a zero gate admits a tuck"
     # And it must stay a small fraction of the gain being shaped, so it prices
-    # out flutter without also shaping height (that is hop_body_height's job).
-    assert AIRBORNE_HEIGHT_MARGIN <= 0.25 * HOP_HEIGHT_GAIN
+    # out a tuck without also shaping height (that is hop_body_height's job).
+    assert MIN_RISE <= 0.25 * HOP_HEIGHT_GAIN
 
 
 def test_upward_velocity_stays_ungated_as_the_discovery_gradient():
@@ -788,8 +799,12 @@ def test_upward_velocity_stays_ungated_as_the_discovery_gradient():
     for label in HOP_ARM_SUFFIX:
         params = _registered(label).rewards["hop_upward_velocity"].params
         tid = _hop_task_id(label)
+        assert "min_rise" not in params, tid
         assert "min_height" not in params, tid
         assert "sensor_name" not in params, tid
+        assert not isinstance(
+            _registered(label).rewards["hop_upward_velocity"].func, type
+        ), f"{tid}: hop_upward_velocity must stay a plain stateless function"
 
 
 # --- the launch-half silencing of com_height_target --------------------------

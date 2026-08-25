@@ -164,27 +164,24 @@ for _label, _k, _travel, _pad_mass in SWEEP_ARMS:
 # Metrics/hop_spring_energy_* would read 56% high, and the spec requires
 # reading the spring instruments before any hop-height number.
 #
-# NOTE 2: h_add=H_ADD is likewise passed EXPLICITLY to BOTH transforms below,
-# even though make_sprung_variant defaults to the same H_ADD. The two must agree:
-# make_hop_variant uses it to shift the hop height TARGET, make_sprung_variant
-# uses it to shift the com_height_target BAND, and both describe the same
-# physical fact -- the boot makes the robot stand H_ADD taller. Overriding one
-# and not the other desynchronises the two silently, with no error, so the shared
-# value is written at the call site where it is visibly one value.
+# NOTE 2: make_hop_variant NO LONGER TAKES h_add, and the two-call sync problem
+# this note used to describe is gone with it. It used to need h_add to shift an
+# ABSOLUTE hop-height target, which had to stay in step with the h_add
+# make_sprung_variant uses to shift the com_height_target band -- overriding one
+# and not the other desynchronised them silently, with no error. Both hop height
+# rewards now measure RISE ABOVE TAKEOFF HEIGHT, which is invariant to how tall
+# the robot stands, so h_add has exactly one consumer again: the CoM band, owned
+# by make_sprung_variant. It is still passed explicitly there for visibility.
 for _label, _k, _travel, _pad in HOP_ARMS:
     _tid = f"Mjlab-Hop-Flat-Sprung-{HOP_ARM_SUFFIX[_label]}-MicroDuck"
     register_mjlab_task(
         task_id=_tid,
         env_cfg=make_sprung_variant(
-            make_hop_variant(
-                make_microduck_velocity_env_cfg(), h_add=H_ADD, stiffness=_k
-            ),
+            make_hop_variant(make_microduck_velocity_env_cfg(), stiffness=_k),
             stiffness=_k, travel=_travel, pad_mass=_pad, h_add=H_ADD,
         ),
         play_env_cfg=make_sprung_variant(
-            make_hop_variant(
-                make_microduck_velocity_env_cfg(play=True), h_add=H_ADD, stiffness=_k
-            ),
+            make_hop_variant(make_microduck_velocity_env_cfg(play=True), stiffness=_k),
             stiffness=_k, travel=_travel, pad_mass=_pad, h_add=H_ADD,
         ),
         rl_cfg=hop_rl_cfg(_label),

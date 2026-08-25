@@ -82,87 +82,194 @@ class _Env:
         self.device = "cpu"
         self.extras = {"log": {}}
 
+    def step(self, found=None, z=None, cmd=None):
+        """Advance one step, mutating only the fields the terms read.
+
+        The two airborne-gated hop rewards are STATEFUL -- they latch the base
+        height at the instant of takeoff and score rise above it -- so they
+        cannot be exercised by a single call the way the stateless terms can.
+        """
+        if found is not None:
+            self.scene.sensors[_SENSOR].data.found = torch.tensor(
+                found, dtype=torch.float32
+            )
+        if z is not None:
+            self.scene._asset.data.root_link_pos_w[:, 2] = torch.tensor(
+                z, dtype=torch.float32
+            )
+        if cmd is not None:
+            self.command_manager._cmd = torch.tensor(cmd, dtype=torch.float32)
+        return self
+
+
+# Contact and phase fixtures for the stateful terms.
+_PLANTED = [[1.0, 1.0]]
+_AIRBORNE = [[0.0, 0.0]]
+_LAUNCH = [[0.0, 1.0, 0.0]]     # sin = +1, mid-launch
+_RECOVERY = [[0.0, -1.0, 0.0]]  # sin = -1, mid-recovery
+
+
+def _airborne_term(env):
+    """Instantiate the class term the way ManagerBase._resolve_common_term_cfg does."""
+    return hop_both_feet_airborne(cfg=None, env=env)
+
+
+def _height_term(env):
+    return hop_body_height(cfg=None, env=env)
+
 
 # --- hop_both_feet_airborne -------------------------------------------------
+#
+# Rise, not absolute height. The latch takes the base height at the FIRST
+# airborne sample and holds it for the flight, so a term must be driven over
+# several steps: planted -> airborne (latch) -> airborne higher (rise).
 
-def test_airborne_rewarded_at_peak_launch_phase():
-    # sin(2*pi*phi) = 1 (mid-launch), both feet off the ground
-    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]])
-    out = hop_both_feet_airborne(env, sensor_name=_SENSOR, command_name=_CMD)
+
+def test_airborne_rewarded_when_the_body_actually_rises():
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)              # planted
+    term(env.step(found=_AIRBORNE, z=[0.147]), sensor_name=_SENSOR, command_name=_CMD)
+    out = term(env.step(z=[0.180]), sensor_name=_SENSOR, command_name=_CMD)
     assert abs(float(out[0]) - 1.0) < 1e-6
 
 
 def test_airborne_not_rewarded_when_a_foot_is_down():
-    env = _Env(found=[[1.0, 0.0]], cmd=[[0.0, 1.0, 0.0]])
-    out = hop_both_feet_airborne(env, sensor_name=_SENSOR, command_name=_CMD)
+    env = _Env(found=[[1.0, 0.0]], cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    out = term(env.step(z=[0.180]), sensor_name=_SENSOR, command_name=_CMD)
     assert float(out[0]) == 0.0
 
 
 def test_airborne_not_rewarded_during_the_recovery_half_cycle():
     """sin < 0 is the recovery half — flight there must not be paid for,
     or the policy is rewarded for simply never landing."""
-    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, -1.0, 0.0]])
-    out = hop_both_feet_airborne(env, sensor_name=_SENSOR, command_name=_CMD)
+    env = _Env(found=_AIRBORNE, cmd=_RECOVERY, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)
+    out = term(env.step(z=[0.180]), sensor_name=_SENSOR, command_name=_CMD)
     assert float(out[0]) == 0.0
 
 
-# The anti-flutter height gate. Sprung-arm numbers throughout: the robot stands
-# at UNLOADED_RIGID_HEIGHT + H_ADD = 0.1171 + 0.030 = 0.1471, and the gate sits
-# 5 mm above that at 0.1521.
-_SPRUNG_STAND = 0.1471
-_SPRUNG_MIN_HEIGHT = 0.1521
-
-
-def test_airborne_not_rewarded_for_foot_flutter_at_standing_height():
-    """THE EXPLOIT THIS GATE CLOSES, and the test that fails if it is removed.
+def test_airborne_pays_nothing_for_a_tall_tuck():
+    """THE EXPLOIT THIS FRAME CLOSES, and the reason absolute height was wrong.
 
     Exactly two collision geoms exist on this robot -- the two foot pads; every
     other geom is contype=0 -- so "both feet airborne" is a statement about two
-    70 g pads and says NOTHING about the 877 g CoM. A policy that retracts both
-    feet ~20 mm at 8-10 Hz with the trunk perfectly still satisfies the contact
-    predicate at ~50% duty inside the launch half, scoring 12*(1/pi)*0.5 =
-    1.9/step -- equal to a genuine 33 mm hop's airborne payout, for a total near
-    5.5/step, with a HIGHER `pose` reward and no fall risk. `foot_swing_height`'s
-    target is 0.02 m, exactly the flutter amplitude, so it is free;
-    `foot_clearance` reads xy velocity only, also free.
+    70 g pads and says NOTHING about the 877 g CoM. Retracting both feet with
+    the trunk motionless satisfies the contact predicate outright.
 
-    Feet off the ground, mid-launch, body at its ordinary standing height."""
-    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[_SPRUNG_STAND])
-    out = hop_both_feet_airborne(
-        env, sensor_name=_SENSOR, command_name=_CMD, min_height=_SPRUNG_MIN_HEIGHT
-    )
+    An absolute-height THRESHOLD does not fix that, which is the part that cost
+    us a round: the robot has ~14.2 mm of sag-free posture headroom (max planted
+    stance root 0.16133 vs HOME_FRAME's 0.14710), so it can stand tall at
+    z ~ 0.155 and tuck from there, sitting above any threshold within 14.2 mm of
+    stance for the whole tuck. That bought ~1.8/step of airborne reward for
+    ~0.20/step of `pose`, scoring 5.1/step against a genuine 33 mm hop's 5.4.
+    And the threshold could not be raised past it without also gating out the
+    Locked arm's expected ~5 mm hop, destroying the controlled comparison.
+
+    NOTE THE HEIGHT: 0.155 is ABSOLUTELY HIGH -- higher than the nominal 0.147
+    stance, higher than the old 0.1521 gate -- and it still pays zero, because
+    the body did not RISE. That is the whole point, so it is asserted explicitly.
+    """
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.155])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)                  # tall stance
+    out1 = term(env.step(found=_AIRBORNE), sensor_name=_SENSOR, command_name=_CMD)
+    out2 = term(env, sensor_name=_SENSOR, command_name=_CMD)           # still tucked
+    out3 = term(env.step(z=[0.1545]), sensor_name=_SENSOR, command_name=_CMD)  # dips
+    assert float(out1[0]) == 0.0
+    assert float(out2[0]) == 0.0
+    assert float(out3[0]) == 0.0
+    # ...and it is above the absolute threshold the previous round used.
+    assert 0.155 > 0.1521
+
+
+def test_airborne_rise_is_measured_from_takeoff_not_a_fixed_datum():
+    """Identical rise from two very different takeoff heights must score the
+    same. Under an absolute target the low hop would score less purely for
+    having started lower, which is a posture measurement, not a hop."""
+    results = []
+    for takeoff in (0.120, 0.160):
+        env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[takeoff])
+        term = _airborne_term(env)
+        term(env, sensor_name=_SENSOR, command_name=_CMD)
+        term(env.step(found=_AIRBORNE), sensor_name=_SENSOR, command_name=_CMD)
+        results.append(
+            float(term(env.step(z=[takeoff + 0.020]), sensor_name=_SENSOR,
+                       command_name=_CMD)[0])
+        )
+    assert results[0] == results[1] == 1.0
+
+
+def test_airborne_latch_resets_on_regaining_contact():
+    """A second hop in the same episode must measure from ITS OWN takeoff.
+    Without the reset the first hop's latch would persist and the robot would be
+    paid for standing tall after landing."""
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)
+    term(env.step(found=_AIRBORNE), sensor_name=_SENSOR, command_name=_CMD)
+    assert float(term(env.step(z=[0.180]), sensor_name=_SENSOR, command_name=_CMD)[0]) == 1.0
+
+    # Land at the apex height and stay planted there: the stale latch (0.147)
+    # would otherwise still read 33 mm of rise.
+    term(env.step(found=_PLANTED, z=[0.180]), sensor_name=_SENSOR, command_name=_CMD)
+    out = term(env.step(found=_AIRBORNE), sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out[0]) == 0.0, "the latch must re-arm at the new takeoff height"
+
+
+def test_airborne_latch_resets_on_env_reset():
+    """RewardManager.reset calls func.reset(env_ids=...) on every class term."""
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)
+    term(env.step(found=_AIRBORNE), sensor_name=_SENSOR, command_name=_CMD)
+    term.reset(env_ids=slice(None))
+    assert float(term._z_takeoff[0]) == 0.0
+    assert not bool(term._was_airborne[0])
+    # A fresh episode: still airborne on the first post-reset step, so the latch
+    # re-arms here rather than reporting the pre-reset height as a rise.
+    out = term(env.step(z=[0.180]), sensor_name=_SENSOR, command_name=_CMD)
     assert float(out[0]) == 0.0
 
 
-def test_airborne_rewarded_once_the_body_actually_rises():
-    """Same contacts, same phase as the flutter case above -- only the body
-    height differs. This is the pair that makes the gate meaningful."""
-    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[_SPRUNG_STAND + 0.033])
-    out = hop_both_feet_airborne(
-        env, sensor_name=_SENSOR, command_name=_CMD, min_height=_SPRUNG_MIN_HEIGHT
-    )
-    assert abs(float(out[0]) - 1.0) < 1e-6
+def test_min_rise_admits_a_locked_arm_hop_and_rejects_a_tuck():
+    """The threshold's two-sided constraint. It must reject the ~1 mm a tuck's
+    trunk dip produces AND admit the Locked control arm's expected ~5 mm hop --
+    if it gated out Locked, the arm-to-arm comparison that IS the experiment
+    would be meaningless."""
+    def rise_scores(rise_m):
+        env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+        term = _airborne_term(env)
+        term(env, sensor_name=_SENSOR, command_name=_CMD)
+        term(env.step(found=_AIRBORNE), sensor_name=_SENSOR, command_name=_CMD)
+        return float(
+            term(env.step(z=[0.147 + rise_m]), sensor_name=_SENSOR,
+                 command_name=_CMD, min_rise=0.003)[0]
+        )
+
+    assert rise_scores(0.001) == 0.0, "a 1 mm dip/tuck must not pay"
+    assert rise_scores(0.005) == 1.0, "the Locked arm's ~5 mm hop must pay"
 
 
-def test_airborne_height_gate_is_not_cleared_by_unloading_alone():
-    """The threshold references the UNLOADED height, not the settled one. In
-    flight the legs carry no load and the root rises ~7.6 mm of actuator sag for
-    free, so a settled-referenced threshold (0.1395 + 5 mm = 0.1445 on the sprung
-    arm) would be cleared by merely unloading -- re-admitting the flutter exploit
-    through the datum. At the unloaded-referenced threshold it is not."""
-    settled_based = 0.1395 + 0.005
-    assert _SPRUNG_MIN_HEIGHT > settled_based
-    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[_SPRUNG_STAND])
-    assert float(
-        hop_both_feet_airborne(
-            env, sensor_name=_SENSOR, command_name=_CMD, min_height=settled_based
-        )[0]
-    ) == 1.0, "fixture check: the settled-referenced threshold IS cleared by a plain stand"
-    assert float(
-        hop_both_feet_airborne(
-            env, sensor_name=_SENSOR, command_name=_CMD, min_height=_SPRUNG_MIN_HEIGHT
-        )[0]
-    ) == 0.0
+def test_airborne_treats_a_nan_contact_read_as_in_contact():
+    """Never pay for flight we cannot actually see."""
+    env = _Env(found=_AIRBORNE, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)
+    nan = [[float("nan"), float("nan")]]
+    out = term(env.step(found=nan, z=[0.180]), sensor_name=_SENSOR, command_name=_CMD)
+    assert float(out[0]) == 0.0
+
+
+def test_airborne_is_zero_without_the_contact_sensor():
+    env = _Env(found=_AIRBORNE, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    env.scene.sensors = {}
+    out = term(env, sensor_name=_SENSOR, command_name=_CMD)
+    assert out.shape == (1,)
+    assert float(out[0]) == 0.0
 
 
 # --- hop_upward_velocity ----------------------------------------------------
@@ -195,81 +302,128 @@ def test_upward_velocity_is_gated_by_the_launch_phase():
 
 # --- hop_body_height --------------------------------------------------------
 
-def test_body_height_peaks_at_the_target():
-    env = _Env(cmd=[[0.0, 1.0, 0.0]], z=[0.165])
-    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
-    assert abs(float(out[0]) - 1.0) < 1e-6
+
+def _rise_reward(rise_m, takeoff=0.147, cmd=None, found_at_apex=None, **params):
+    """Drive the height term through planted -> takeoff -> apex, return the reward."""
+    env = _Env(found=_PLANTED, cmd=cmd or _LAUNCH, z=[takeoff])
+    term = _height_term(env)
+    term(env, command_name=_CMD, **params)
+    term(env.step(found=_AIRBORNE), command_name=_CMD, **params)
+    return float(
+        term(
+            env.step(found=found_at_apex, z=[takeoff + rise_m]),
+            command_name=_CMD,
+            **params,
+        )[0]
+    )
 
 
-def test_body_height_falls_off_away_from_the_target():
-    env = _Env(cmd=[[0.0, 1.0, 0.0]], z=[0.145])
-    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
-    assert float(out[0]) < 0.01
+def test_body_height_peaks_at_the_target_rise():
+    assert abs(_rise_reward(0.040, target_rise=0.040, std=0.020) - 1.0) < 1e-5
+
+
+def test_body_height_falls_off_away_from_the_target_rise():
+    assert _rise_reward(0.005, target_rise=0.040, std=0.008) < 0.01
 
 
 def test_body_height_is_gated_by_the_launch_phase():
-    env = _Env(cmd=[[0.0, -1.0, 0.0]], z=[0.165])
-    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
-    assert float(out[0]) == 0.0
+    assert _rise_reward(0.040, cmd=_RECOVERY, target_rise=0.040, std=0.020) == 0.0
 
 
-def test_body_height_is_zero_at_the_target_with_both_feet_in_contact():
+def test_body_height_pays_nothing_for_a_tall_tuck():
+    """The companion to the airborne term's tuck test, and the one that matters
+    more: `hop_body_height` is a GAUSSIAN, so it has no threshold to hide behind.
+    Under absolute height a tall tuck at z = 0.155 sat only 32 mm below the old
+    0.1871 target and collected exp(-(0.032/0.020)^2) = 0.077 -- 0.61/step at
+    weight 8.0 for doing nothing. Measured as rise, a tuck is 0 m and scores
+    exp(-4) = 0.018, the same as any other non-hop."""
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.155])
+    term = _height_term(env)
+    term(env, command_name=_CMD, target_rise=0.040, std=0.020)
+    term(env.step(found=_AIRBORNE), command_name=_CMD, target_rise=0.040, std=0.020)
+    tuck = float(term(env, command_name=_CMD, target_rise=0.040, std=0.020)[0])
+    assert tuck < 0.02, f"a tall tuck scores {tuck:.4f}"
+    # Explicitly: the tuck is ABSOLUTELY higher than the nominal stance and
+    # still scores the floor, because it did not rise.
+    assert 0.155 > 0.147
+
+
+def test_body_height_rise_is_measured_from_takeoff_not_a_fixed_datum():
+    """Identical rise from two different takeoff heights scores identically.
+    This is the property that removes the standing-height datum -- and with it
+    h_add, actuator sag and posture headroom -- from the reward entirely."""
+    low = _rise_reward(0.033, takeoff=0.120, target_rise=0.040, std=0.020)
+    high = _rise_reward(0.033, takeoff=0.160, target_rise=0.040, std=0.020)
+    assert abs(low - high) < 1e-6
+    assert low > 0.8
+
+
+def test_body_height_is_zero_with_both_feet_in_contact():
     """The airborne gate. HOME_FRAME is a parallelogram crouch, so simply
     STRAIGHTENING THE LEGS raises the trunk ~9 mm with both feet still planted.
-    Ungated, that ground-level bob — extend while sin > 0, crouch while sin < 0,
-    never leave the ground — collects most of the peak reward and is entirely
-    spring-irrelevant, which is exactly the confound this experiment exists to
-    avoid. Same height as the passing case below; only the contact differs."""
-    env = _Env(found=[[1.0, 1.0]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
-    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
-    assert float(out[0]) == 0.0
-
-
-def test_body_height_is_paid_at_the_same_height_when_both_feet_are_airborne():
-    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
-    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
-    assert abs(float(out[0]) - 1.0) < 1e-6
+    Ungated, that ground-level bob collects a large share of the peak reward and
+    is entirely spring-irrelevant -- exactly the confound this experiment exists
+    to avoid. Same rise as the passing case; only the contact differs."""
+    assert _rise_reward(
+        0.040, found_at_apex=_PLANTED, target_rise=0.040, std=0.020
+    ) == 0.0
 
 
 def test_body_height_is_zero_with_only_one_foot_airborne():
     """A single-foot lift is a step, not a hop."""
-    env = _Env(found=[[0.0, 1.0]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
-    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
-    assert float(out[0]) == 0.0
+    assert _rise_reward(
+        0.040, found_at_apex=[[0.0, 1.0]], target_rise=0.040, std=0.020
+    ) == 0.0
 
 
-def test_body_height_and_airborne_reward_read_the_same_predicate():
-    """The gate must be the SAME predicate hop_both_feet_airborne pays for, or
-    the policy can be paid for an apex the other term does not call a hop.
-    Sweep every contact combination and require the two to agree on zero/non-zero."""
-    for found in ([[0.0, 0.0]], [[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]):
-        env = _Env(found=found, cmd=[[0.0, 1.0, 0.0]], z=[0.165])
-        airborne = float(hop_both_feet_airborne(env, sensor_name=_SENSOR, command_name=_CMD)[0])
-        height = float(hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)[0])
-        assert (airborne > 0.0) == (height > 0.0), found
+def test_body_height_discriminates_locked_from_sprung_rise():
+    """The property the whole campaign rests on: the drop rig rebounded 5 mm on
+    the Locked arm and 33 mm at k=3900, and the reward must tell them apart."""
+    locked = _rise_reward(0.005, target_rise=0.040, std=0.020)
+    sprung = _rise_reward(0.033, target_rise=0.040, std=0.020)
+    assert sprung > locked
+    assert sprung / locked >= 10.0
 
 
 def test_body_height_treats_a_nan_contact_read_as_in_contact():
     """Never pay for flight we cannot actually see."""
-    env = _Env(found=[[float("nan"), float("nan")]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
-    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
-    assert float(out[0]) == 0.0
+    nan = [[float("nan"), float("nan")]]
+    assert _rise_reward(0.040, found_at_apex=nan, target_rise=0.040, std=0.020) == 0.0
 
 
 def test_body_height_is_zero_without_the_contact_sensor():
-    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]], z=[0.165])
+    env = _Env(found=_AIRBORNE, cmd=_LAUNCH, z=[0.147])
+    term = _height_term(env)
     env.scene.sensors = {}
-    out = hop_body_height(env, command_name=_CMD, target_height=0.165, std=0.008)
+    out = term(env, command_name=_CMD, target_rise=0.040)
     assert float(out[0]) == 0.0
 
 
-def test_all_three_terms_are_nan_safe():
-    env = _Env(found=[[0.0, 0.0]], cmd=[[0.0, 1.0, 0.0]],
-               vz=[float("nan")], z=[float("nan")])
+def test_body_height_and_airborne_reward_read_the_same_contact_predicate():
+    """Both terms must agree about what counts as flight, or the policy can be
+    paid an apex the other term does not call a hop. Sweep every contact
+    combination at a rise well above MIN_RISE and require agreement."""
+    for found in (_AIRBORNE, [[1.0, 0.0]], [[0.0, 1.0]], _PLANTED):
+        env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+        a_term, h_term = _airborne_term(env), _height_term(env)
+        a_term(env, sensor_name=_SENSOR, command_name=_CMD)
+        h_term(env, command_name=_CMD, target_rise=0.040, std=0.020)
+        env.step(found=_AIRBORNE)
+        a_term(env, sensor_name=_SENSOR, command_name=_CMD)
+        h_term(env, command_name=_CMD, target_rise=0.040, std=0.020)
+        env.step(found=found, z=[0.180])
+        a = float(a_term(env, sensor_name=_SENSOR, command_name=_CMD)[0])
+        h = float(h_term(env, command_name=_CMD, target_rise=0.040, std=0.020)[0])
+        assert (a > 0.0) == (h > 0.0), found
+
+
+def test_both_stateful_terms_are_nan_safe():
+    env = _Env(found=_AIRBORNE, cmd=_LAUNCH, z=[float("nan")])
+    a_term, h_term = _airborne_term(env), _height_term(env)
     for out in (
-        hop_both_feet_airborne(env, sensor_name=_SENSOR, command_name=_CMD),
+        a_term(env, sensor_name=_SENSOR, command_name=_CMD),
+        h_term(env, command_name=_CMD, target_rise=0.040),
         hop_upward_velocity(env, command_name=_CMD),
-        hop_body_height(env, command_name=_CMD, target_height=0.165),
     ):
         assert torch.isfinite(out).all()
 

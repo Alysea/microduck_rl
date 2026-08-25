@@ -6365,60 +6365,141 @@ def _both_feet_airborne(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tenso
     return ((found[:, 0] <= 0) & (found[:, 1] <= 0)).float()
 
 
-def hop_both_feet_airborne(
-    env: ManagerBasedRlEnv,
-    sensor_name: str = "feet_ground_contact",
-    command_name: str = "twist",
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-    min_height: float = 0.1221,
-) -> torch.Tensor:
-    """Reward both feet simultaneously airborne, HIGH, during the LAUNCH half.
+class _HopRiseTracker:
+    """Per-env latch of the base height at the INSTANT OF TAKEOFF.
 
-    Ported from the abandoned `jump` branch. Gated on sin(2*pi*phase) > 0 so
-    flight during the recovery half earns nothing — without that gate the policy
-    is rewarded for simply never landing.
+    Shared machinery for the two airborne-gated hop rewards. Both measure RISE
+    ABOVE TAKEOFF HEIGHT, ``z - z_takeoff``, rather than absolute base height.
 
-    THE HEIGHT GATE IS NOT DEFENSIVE. Without it this term is farmable by
-    FOOT FLUTTER, and at its post-rebalance weight that exploit is competitive
-    with a real hop. Exactly two collision geoms exist on the whole robot — the
-    two foot pads; every other geom is contype=0 — so "both feet airborne" is a
-    statement about the two 70 g pads and says NOTHING about the 877 g CoM. A
-    policy that retracts both feet ~20 mm at 8-10 Hz, trunk perfectly still,
-    scores this term at ~50% duty inside the launch half, i.e. 12*(1/pi)*0.5 =
-    1.9/step -- equal to a genuine 33 mm hop's airborne payout, for a total near
-    5.5/step, with a HIGHER `pose` reward and no fall risk. The neighbouring
-    penalties do not catch it either: `foot_swing_height`'s target is 0.02 m,
-    exactly the flutter amplitude, so it is free, and `foot_clearance` reads xy
-    velocity only, also free.
+    WHY THE FRAME CHANGED, and it is not a refinement -- absolute height was
+    simply the wrong quantity. Two exploits and two datum hunts came out of it:
 
-    Requiring the ROOT above `min_height` makes the term unfarmable without
-    actually moving the body.
+      1. FOOT FLUTTER. Exactly two collision geoms exist on this robot (the two
+         pads; every other geom is contype=0), so "both feet airborne" is a
+         statement about two 70 g pads and says nothing about the 877 g CoM.
+         Retracting both feet with the trunk motionless satisfied the predicate.
+      2. TALL-TUCK, which an absolute height THRESHOLD does not fix. The robot
+         has ~14.2 mm of sag-free posture headroom (max planted stance root
+         0.16133 vs HOME_FRAME's 0.14710, from a grid search over symmetric
+         hip_pitch/knee/ankle poses with the pad kept flat). So it can stand
+         tall at root ~0.155, tuck, and already be above any threshold within
+         14.2 mm of stance -- a 51 ms tuck dips the trunk only ~4 mm, clearing
+         the gate for the whole tuck. That cost ~0.20/step in `pose` and
+         unlocked ~1.8/step of airborne reward: 5.1/step for a tall-tuck against
+         5.4/step for a genuine 33 mm hop. Raising the threshold is not
+         available as a fix -- anything above 14.2 mm would also gate out the
+         Locked arm's expected ~5 mm hop and destroy the controlled comparison
+         that IS the experiment.
+      3. It also made us hunt the correct datum twice (settled 0.1095 vs
+         unloaded 0.1171), because "how high is the robot" depends on how much
+         its legs have sagged.
 
-    NOTE: `min_height` is NOT a safe default, for the same reason
-    `hop_body_height`'s `target_height` is not. The default here is the RIGID
-    robot's value; the sprung robot stands h_add taller and a caller that leaves
-    it would gate on a threshold the robot clears while merely standing.
-    `make_hop_variant` computes it via `hop.hop_airborne_min_height(h_add)`.
+    Rise has none of those properties. A tuck leaves the trunk where it was, so
+    rise ~ 0 no matter how tall the robot stood first; a hop's rise IS the hop
+    height; and no standing-height datum enters the reward at all, so h_add,
+    actuator sag and posture headroom all drop out. The measurement is taken
+    against the robot's own body a few milliseconds earlier, which is the only
+    reference that cannot be gamed by posture.
 
-    The threshold must reference the UNLOADED height, not the settled one: in
-    flight the legs carry no load and the root rises ~7.6 mm of actuator sag for
-    free, so a settled-referenced threshold is satisfied by merely unloading.
+    Implemented as a class because it needs per-env state across steps. This is
+    mjlab's own idiom for stateful rewards -- see `feet_swing_height` and
+    `upright` in mjlab/tasks/velocity/mdp/rewards.py. `ManagerBase.
+    _resolve_common_term_cfg` instantiates any class-valued `func` as
+    `func(cfg=term_cfg, env=env)`, and `RewardManager.reset` calls
+    `func.reset(env_ids=env_ids)` on every term whose func has a callable
+    `reset`, so episode resets are handled by the framework.
+
+    CAUTION: `RewardManager.compute` short-circuits on `weight == 0.0` WITHOUT
+    calling the term. A term registered at zero weight would therefore never
+    update its latch and would hold a stale takeoff height. Both consumers are
+    registered at non-zero weight; keep it that way.
     """
-    zeros = torch.zeros(env.num_envs, device=env.device)
-    both_airborne = _both_feet_airborne(env, sensor_name)
-    if both_airborne is None:
-        return zeros
 
-    asset: Entity = env.scene[asset_cfg.name]
-    height = torch.nan_to_num(
-        asset.data.root_link_pos_w[:, 2].float(), nan=0.0, posinf=0.0, neginf=0.0
-    )
-    tall_enough = (height > min_height).float()
+    def __init__(self, cfg, env: ManagerBasedRlEnv) -> None:
+        del cfg  # Params are passed per-call, as in mjlab's own class terms.
+        self._z_takeoff = torch.zeros(env.num_envs, device=env.device)
+        self._was_airborne = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.bool
+        )
 
-    cmd = env.command_manager.get_command(command_name)
-    launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
-    return launch * both_airborne * tall_enough
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        """Clear the latch for the given envs. Called by RewardManager.reset."""
+        if env_ids is None:
+            env_ids = slice(None)
+        self._z_takeoff[env_ids] = 0.0
+        self._was_airborne[env_ids] = False
 
+    def _both_airborne_and_rise(
+        self, env: ManagerBasedRlEnv, sensor_name: str, asset_cfg: SceneEntityCfg
+    ):
+        """Returns ``(both_airborne, rise)``, or ``(None, None)`` with no sensor.
+
+        Latches ``z_takeoff`` on the TRANSITION into both-feet-airborne and holds
+        it for the whole flight; regaining contact clears it, so a second hop in
+        the same episode measures from its own takeoff.
+        """
+        both_airborne = _both_feet_airborne(env, sensor_name)
+        if both_airborne is None:
+            return None, None
+
+        airborne = both_airborne > 0.5
+        asset: Entity = env.scene[asset_cfg.name]
+        z = torch.nan_to_num(
+            asset.data.root_link_pos_w[:, 2].float(), nan=0.0, posinf=0.0, neginf=0.0
+        )
+
+        # Re-arm on every ground->air transition. Landing needs NO explicit
+        # clear: `_was_airborne` goes False on contact, so the next takeoff
+        # satisfies `took_off` and overwrites the latch unconditionally. An
+        # explicit "zero it on contact" line was written here first and then
+        # removed -- reverting it changed no test, because it could not change
+        # any behaviour: `_z_takeoff` is read only inside the `airborne` branch
+        # below, and it is always rewritten before that branch is next taken.
+        took_off = airborne & ~self._was_airborne
+        self._z_takeoff = torch.where(took_off, z, self._z_takeoff)
+        self._was_airborne = airborne
+
+        rise = torch.where(
+            airborne, torch.clamp(z - self._z_takeoff, min=0.0), torch.zeros_like(z)
+        )
+        return both_airborne, rise
+
+
+class hop_both_feet_airborne(_HopRiseTracker):
+    """Reward both feet airborne AND the body actually risen, during LAUNCH.
+
+    Ported from the abandoned `jump` branch, then twice repaired. Gated on
+    sin(2*pi*phase) > 0 so flight during the recovery half earns nothing --
+    without that gate the policy is rewarded for simply never landing.
+
+    THE RISE GATE IS NOT DEFENSIVE. Without it this term is farmable by foot
+    flutter, and an absolute-height gate does not fix that -- see
+    `_HopRiseTracker` for both exploits and why rise is the only frame that
+    closes them. `min_rise` is deliberately tiny: it exists to price out a tuck
+    (which rises ~0), not to shape hop height, which is `hop_body_height`'s job.
+    3 mm clears a tuck while admitting even the Locked arm's expected ~5 mm hop,
+    so the arm-to-arm comparison survives.
+
+    `hop_upward_velocity` deliberately carries NO such gate: it is the dense
+    signal that bootstraps liftoff from a standing start.
+    """
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        sensor_name: str = "feet_ground_contact",
+        command_name: str = "twist",
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+        min_rise: float = 0.003,
+    ) -> torch.Tensor:
+        zeros = torch.zeros(env.num_envs, device=env.device)
+        both_airborne, rise = self._both_airborne_and_rise(env, sensor_name, asset_cfg)
+        if both_airborne is None:
+            return zeros
+
+        cmd = env.command_manager.get_command(command_name)
+        launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
+        return launch * both_airborne * (rise > min_rise).float()
 
 def hop_upward_velocity(
     env: ManagerBasedRlEnv,
@@ -6443,15 +6524,8 @@ def hop_upward_velocity(
     return launch * upward
 
 
-def hop_body_height(
-    env: ManagerBasedRlEnv,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-    command_name: str = "twist",
-    target_height: float = 0.135,
-    std: float = 0.008,
-    sensor_name: str = "feet_ground_contact",
-) -> torch.Tensor:
-    """Gaussian reward for base height reaching the hop target WHILE AIRBORNE.
+class hop_body_height(_HopRiseTracker):
+    """Gaussian reward for how far the base ROSE ABOVE ITS TAKEOFF HEIGHT.
 
     The airborne gate is load-bearing, not defensive. HOME_FRAME is a
     parallelogram crouch (hip_pitch 26.2 deg, knee ~0, ankle -26 deg); simply
@@ -6459,35 +6533,45 @@ def hop_body_height(
     Ungated, that ground-level bob — extend while sin > 0, crouch while sin < 0,
     never leave the ground — collects a large fraction of the peak reward and is
     entirely spring-irrelevant, which is exactly the confound this experiment
-    exists to avoid. Gated, the term shapes how HIGH THE HOP GOES rather than how
-    tall the robot stands.
+    exists to avoid.
 
-    The gate does not have to bootstrap flight on its own:
-    `hop_both_feet_airborne` (the largest-weighted hop term) supplies the
-    gradient to leave the ground, and this term then shapes the apex. Both read
-    the same predicate,
-    `_both_feet_airborne`.
+    Measuring RISE rather than absolute height closes the complementary hole:
+    airborne alone is satisfiable by a tuck, and a tuck from a tall stance beats
+    any absolute threshold. See `_HopRiseTracker`. Rise makes this term read the
+    hop, not the posture -- and it removes the standing-height datum from the
+    reward path entirely, so h_add, actuator sag and posture headroom no longer
+    enter it.
 
-    NOTE: `target_height` is NOT a safe default here. The ported value of 0.135
-    is the RIGID robot's standing height plus 0.015 m of gain. The sprung robot
-    stands H_ADD (0.030 m) taller, so a caller that leaves this at the default is
-    asking the sprung robot to CROUCH. `make_hop_variant` computes it from the
-    robot's measured standing height; see tasks/hop.py.
+    `target_rise` and `std` carry over from the absolute formulation UNCHANGED
+    (0.040 / 0.020), and they are more correct here, not less: both were chosen
+    as a GAIN ABOVE STANDING, which is exactly what rise measures. Previously
+    that gain had to be reconstructed by adding a standing-height datum to the
+    target and hoping the datum was right; twice it was not.
+
+    This term does not have to bootstrap flight on its own:
+    `hop_upward_velocity` supplies the ungated dense gradient to leave the
+    ground, and this one then shapes the apex.
     """
-    zeros = torch.zeros(env.num_envs, device=env.device)
-    both_airborne = _both_feet_airborne(env, sensor_name)
-    if both_airborne is None:
-        return zeros
 
-    asset: Entity = env.scene[asset_cfg.name]
-    height = torch.nan_to_num(
-        asset.data.root_link_pos_w[:, 2].float(), nan=0.0, posinf=0.0, neginf=0.0
-    )
-    height_reward = torch.exp(-(((height - target_height) / std) ** 2))
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+        command_name: str = "twist",
+        target_rise: float = 0.040,
+        std: float = 0.020,
+        sensor_name: str = "feet_ground_contact",
+    ) -> torch.Tensor:
+        zeros = torch.zeros(env.num_envs, device=env.device)
+        both_airborne, rise = self._both_airborne_and_rise(env, sensor_name, asset_cfg)
+        if both_airborne is None:
+            return zeros
 
-    cmd = env.command_manager.get_command(command_name)
-    launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
-    return launch * both_airborne * height_reward
+        rise_reward = torch.exp(-(((rise - target_rise) / std) ** 2))
+
+        cmd = env.command_manager.get_command(command_name)
+        launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
+        return launch * both_airborne * rise_reward
 
 
 def hop_energy_monitor(
