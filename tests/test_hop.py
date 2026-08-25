@@ -121,9 +121,11 @@ def _height_term(env):
 
 # --- hop_both_feet_airborne -------------------------------------------------
 #
-# Rise, not absolute height. The latch takes the base height at the FIRST
-# airborne sample and holds it for the flight, so a term must be driven over
-# several steps: planted -> airborne (latch) -> airborne higher (rise).
+# Rise, not absolute height. The datum is the LAST IN-CONTACT base height --
+# not the first airborne sample, which loses up to 14 mm to the 20 ms control
+# step and cleared MIN_RISE on only 33% of takeoff phases for a 5 mm hop. It is
+# held for the flight, so a term must be driven over several steps:
+# planted (stance datum) -> airborne (latch) -> airborne higher (rise).
 
 
 def test_airborne_rewarded_when_the_body_actually_rises():
