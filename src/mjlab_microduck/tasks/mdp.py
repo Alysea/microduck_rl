@@ -6571,6 +6571,25 @@ class hop_both_feet_airborne(_HopRiseTracker):
         if both_airborne is None:
             return zeros
 
+        # Metrics: the headline hop-height number (rise above takeoff height),
+        # measured directly instead of backed out of a reward ratio. Logged HERE
+        # specifically -- not in `_HopRiseTracker` or `hop_body_height` -- so
+        # exactly one term writes these keys and they cannot race. This rides on
+        # this term's weight being non-zero: RewardManager.compute
+        # short-circuits weight==0.0 terms before ever calling them.
+        log = env.extras.get("log") if hasattr(env, "extras") else None
+        if log is not None:
+            rise_safe = torch.nan_to_num(rise, nan=0.0, posinf=0.0, neginf=0.0)
+            airborne_rise = rise_safe[both_airborne > 0.5]
+            log["Metrics/hop_rise_mean"] = (
+                airborne_rise.mean()
+                if airborne_rise.numel() > 0
+                else torch.zeros((), device=env.device)
+            )
+            log["Metrics/hop_rise_peak"] = (
+                rise_safe.max() if rise_safe.numel() > 0 else torch.zeros((), device=env.device)
+            )
+
         cmd = env.command_manager.get_command(command_name)
         launch = torch.clamp(torch.nan_to_num(cmd[:, 1], nan=0.0), min=0.0)
         return launch * both_airborne * (rise > min_rise).float()

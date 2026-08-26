@@ -410,6 +410,71 @@ def test_airborne_is_zero_without_the_contact_sensor():
     assert float(out[0]) == 0.0
 
 
+# --- Metrics/hop_rise_mean, Metrics/hop_rise_peak ----------------------------
+#
+# The headline hop-height number, measured directly off `_HopRiseTracker`'s
+# rise instead of backed out of a reward ratio (which previously gave ~27 mm
+# as an estimate). Logged from `hop_both_feet_airborne` only -- see the
+# docstring there -- and this rides on that term's weight being non-zero
+# (registered at 12.0), matching the `spring_compression_loaded_mean` pattern
+# of "mean over the subset that currently qualifies", not over all envs.
+
+
+def test_rise_mean_is_over_airborne_envs_only_not_all_envs():
+    """Two envs airborne at different rises, one still planted on the ground.
+    The mean must be the mean of the two airborne rises (9 mm), NOT the
+    three-env mean (6 mm) that dilutes it with the grounded env's zero."""
+    found3 = [[1.0, 1.0]] * 3
+    cmd3 = [[0.0, 1.0, 0.0]] * 3
+    env = _Env(found=found3, cmd=cmd3, z=[0.147, 0.147, 0.147], vz=[0.0, 0.0, 0.0])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)  # stance datum, all 3
+
+    # Envs 0 and 1 take off; env 2 stays planted throughout.
+    term(
+        env.step(found=[[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]]),
+        sensor_name=_SENSOR, command_name=_CMD,
+    )
+    term(
+        env.step(z=[0.152, 0.160, 0.147]),
+        sensor_name=_SENSOR, command_name=_CMD,
+    )  # env0 rises 5 mm, env1 rises 13 mm, env2 unchanged
+
+    log = env.extras["log"]
+    assert abs(float(log["Metrics/hop_rise_mean"]) - 0.009) < 1e-6
+    assert abs(float(log["Metrics/hop_rise_peak"]) - 0.013) < 1e-6
+
+
+def test_rise_metrics_are_zero_and_present_when_no_env_is_airborne():
+    """No env airborne this step: both keys must still exist, reading 0.0
+    explicitly rather than being skipped or emitting NaN."""
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)
+
+    log = env.extras["log"]
+    assert "Metrics/hop_rise_mean" in log
+    assert "Metrics/hop_rise_peak" in log
+    assert float(log["Metrics/hop_rise_mean"]) == 0.0
+    assert float(log["Metrics/hop_rise_peak"]) == 0.0
+
+
+def test_rise_metrics_are_nan_safe():
+    """A NaN base-height read during flight must not leak a NaN into the
+    logged metrics."""
+    env = _Env(found=_PLANTED, cmd=_LAUNCH, z=[0.147])
+    term = _airborne_term(env)
+    term(env, sensor_name=_SENSOR, command_name=_CMD)
+    term(
+        env.step(found=_AIRBORNE, z=[float("nan")]),
+        sensor_name=_SENSOR, command_name=_CMD,
+    )
+
+    log = env.extras["log"]
+    assert torch.isfinite(log["Metrics/hop_rise_mean"])
+    assert torch.isfinite(log["Metrics/hop_rise_peak"])
+
+
 # --- hop_upward_velocity ----------------------------------------------------
 
 def test_upward_velocity_saturates_at_max_vel():
