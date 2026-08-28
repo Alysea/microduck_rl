@@ -27,6 +27,10 @@ from .microduck_flamingo_env_cfg import (
     make_microduck_flamingo_env_cfg,
     MicroduckFlamingoRlCfg,
 )
+from .microduck_flamingo_cycle_env_cfg import (
+    make_microduck_flamingo_cycle_env_cfg,
+    MicroduckFlamingoCycleRlCfg,
+)
 from .microduck_velstand_env_cfg import (
     make_microduck_velstand_env_cfg,
     MicroduckVelStandRlCfg,
@@ -122,6 +126,15 @@ register_mjlab_task(
     env_cfg=make_microduck_flamingo_env_cfg(),
     play_env_cfg=make_microduck_flamingo_env_cfg(play=True),
     rl_cfg=MicroduckFlamingoRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Flamingo cycle — stand → one foot (either side) → stand, controller-driven flag
+register_mjlab_task(
+    task_id="Mjlab-FlamingoCycle-Flat-MicroDuck",
+    env_cfg=make_microduck_flamingo_cycle_env_cfg(),
+    play_env_cfg=make_microduck_flamingo_cycle_env_cfg(play=True),
+    rl_cfg=MicroduckFlamingoCycleRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
