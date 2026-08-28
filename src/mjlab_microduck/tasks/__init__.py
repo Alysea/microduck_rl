@@ -23,6 +23,10 @@ from .microduck_standup_env_cfg import (
     make_microduck_standup_env_cfg,
     MicroduckStandUpRlCfg,
 )
+from .microduck_flamingo_env_cfg import (
+    make_microduck_flamingo_env_cfg,
+    MicroduckFlamingoRlCfg,
+)
 from .microduck_velstand_env_cfg import (
     make_microduck_velstand_env_cfg,
     MicroduckVelStandRlCfg,
@@ -109,6 +113,15 @@ register_mjlab_task(
     env_cfg=make_microduck_standup_env_cfg(),
     play_env_cfg=make_microduck_standup_env_cfg(play=True),
     rl_cfg=MicroduckStandUpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Flamingo — balance on the right foot, spawned in the validated one-foot pose
+register_mjlab_task(
+    task_id="Mjlab-Flamingo-Flat-MicroDuck",
+    env_cfg=make_microduck_flamingo_env_cfg(),
+    play_env_cfg=make_microduck_flamingo_env_cfg(play=True),
+    rl_cfg=MicroduckFlamingoRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

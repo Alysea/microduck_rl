@@ -7186,3 +7186,200 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Flamingo — balance on one foot (2026-08-28)
+# Small, ungated building blocks: the flamingo env runs with an all-zero command
+# (stage 1), so none of the phase-gated kick/ground-pick helpers apply.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def set_flamingo_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    joint_pose: list,
+    base_roll: float,
+    base_pitch: float,
+    z_min: float,
+    z_max: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_noise: float = 0.0,
+    joint_noise_std: float = 0.0,
+    standing_prob: float = 0.0,
+    standing_z_min: float = 0.11,
+    standing_z_max: float = 0.12,
+):
+    """Spawn IN the one-foot pose (trunk rolled/pitched so the stance sole is flat),
+    with joint + tilt noise and a random yaw; optionally a ``standing_prob`` bucket
+    at HOME/upright for the stage-2 transition training. ``joint_pose`` is the
+    14-servo pose (0-4 left leg, 5-8 neck/head, 9-13 right leg). qvel is zeroed."""
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.int)
+    num = len(env_ids)
+    dev = env.device
+
+    is_stand = torch.rand(num, device=dev) < standing_prob
+    yaw = torch.rand(num, device=dev) * 2 * np.pi - np.pi
+    roll = torch.full((num,), float(base_roll), device=dev)
+    pitch = torch.full((num,), float(base_pitch), device=dev)
+    if tilt_noise > 0.0:
+        roll = roll + (torch.rand(num, device=dev) * 2 - 1) * tilt_noise
+        pitch = pitch + (torch.rand(num, device=dev) * 2 - 1) * tilt_noise
+    roll = torch.where(is_stand, torch.zeros_like(roll), roll)
+    pitch = torch.where(is_stand, torch.zeros_like(pitch), pitch)
+    cy, sy = torch.cos(yaw * 0.5), torch.sin(yaw * 0.5)
+    cp, sp = torch.cos(pitch * 0.5), torch.sin(pitch * 0.5)
+    cr, sr = torch.cos(roll * 0.5), torch.sin(roll * 0.5)
+    # ZYX intrinsic Euler (yaw * pitch * roll) → quaternion [w, x, y, z]
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    quat = torch.stack([qw, qx, qy, qz], dim=1)
+
+    z = torch.rand(num, device=dev) * (z_max - z_min) + z_min
+    z_stand = torch.rand(num, device=dev) * (standing_z_max - standing_z_min) + standing_z_min
+    z = torch.where(is_stand, z_stand, z)
+
+    env.sim.data.qpos[env_ids, 2] = z
+    env.sim.data.qpos[env_ids, 3:7] = quat
+    env.sim.data.qvel[env_ids, :6] = 0.0
+
+    asset: Entity = env.scene[asset_cfg.name]
+    servo_ids = _servo_joint_ids(env, asset)
+    cols = torch.tensor([7 + j for j in servo_ids], device=dev, dtype=torch.long)
+    pose = torch.tensor(joint_pose, device=dev, dtype=torch.float32).unsqueeze(0).expand(num, -1).clone()
+    home = asset.data.default_joint_pos[env_ids.long()][:, servo_ids]
+    pose = torch.where(is_stand.unsqueeze(1), home, pose)
+    if joint_noise_std > 0.0:
+        pose = pose + torch.randn_like(pose) * joint_noise_std
+    env.sim.data.qpos[env_ids.unsqueeze(1).long(), cols.unsqueeze(0)] = pose
+    # Zero joint velocities too (qvel columns = 6 + entity joint index).
+    vcols = torch.tensor([6 + j for j in servo_ids], device=dev, dtype=torch.long)
+    env.sim.data.qvel[env_ids.unsqueeze(1).long(), vcols.unsqueeze(0)] = 0.0
+
+
+def _foot_found(env: ManagerBasedRlEnv, sensor_name: str, slot: int) -> torch.Tensor:
+    """Binary contact flag of one foot from the two-foot ``feet_ground_contact``
+    sensor (slot 0 = left, 1 = right — the pattern order in the sensor cfg)."""
+    if sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, device=env.device)
+    found = env.scene.sensors[sensor_name].data.found
+    if found.dim() > 1:
+        found = found[:, slot]
+    return torch.clamp(torch.nan_to_num(found.float(), nan=0.0), 0.0, 1.0)
+
+
+def foot_contact_reward(env: ManagerBasedRlEnv, sensor_name: str, slot: int) -> torch.Tensor:
+    """+1 while the given foot touches the ground (pin the stance foot, anti-hop)."""
+    return _foot_found(env, sensor_name, slot)
+
+
+def foot_contact_penalty(env: ManagerBasedRlEnv, sensor_name: str, slot: int) -> torch.Tensor:
+    """−1 while the given foot touches the ground (self-negating → POSITIVE weight).
+    The swing foot touching down is the SOFT failure: cheap, never terminal."""
+    return -_foot_found(env, sensor_name, slot)
+
+
+def com_over_foot(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg,
+    std: float = 0.02,
+) -> torch.Tensor:
+    """Ungated Gaussian on the horizontal distance CoM ↔ stance-foot site
+    (``asset_cfg.site_names=["right_foot"]``). Same quantity as
+    ``com_over_support_foot`` minus the kick phase gate."""
+    asset: Entity = env.scene[asset_cfg.name]
+    com_xy = asset.data.root_com_pos_w[:, :2]
+    foot_xy = asset.data.site_pos_w[:, asset_cfg.site_ids[0], :2]
+    dist2 = torch.nan_to_num(((com_xy - foot_xy) ** 2).sum(dim=-1), nan=1.0)
+    return torch.exp(-dist2 / (std ** 2))
+
+
+def foot_height_gaussian(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg,
+    target: float = 0.05,
+    std: float = 0.03,
+    gate_sensor_name: str | None = None,
+    gate_slot: int = 1,
+) -> torch.Tensor:
+    """Gaussian on the swing-foot site height above the terrain around ``target``
+    (m); gated on the stance foot being in contact so hopping cannot farm it."""
+    asset: Entity = env.scene[asset_cfg.name]
+    z = asset.data.site_pos_w[:, asset_cfg.site_ids[0], 2] - env.scene.terrain.env_origins[:, 2]
+    z = torch.nan_to_num(z, nan=0.0)
+    reward = torch.exp(-((z - target) / std) ** 2)
+    if gate_sensor_name is not None:
+        reward = reward * _foot_found(env, gate_sensor_name, gate_slot)
+    return reward
+
+
+def projected_gravity_match(
+    env: ManagerBasedRlEnv,
+    target: tuple = (0.0, 0.0, -1.0),
+    std: float = 0.15,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Gaussian on ‖g_b − target‖: rewards holding a specific trunk lean (the
+    flamingo trunk is tilted ~24°, so a plain upright reward would fight the pose)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    g = torch.nan_to_num(asset.data.projected_gravity_b, nan=0.0)
+    t = torch.tensor(target, device=env.device, dtype=g.dtype).unsqueeze(0)
+    err2 = ((g - t) ** 2).sum(dim=-1)
+    return torch.exp(-err2 / (std ** 2))
+
+
+def lateral_tilt_penalty(
+    env: ManagerBasedRlEnv,
+    threshold: float = 0.45,
+    direction: float = -1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Quadratic penalty (≤ 0, self-negating → POSITIVE weight) when the trunk
+    rolls further toward ``direction`` (sign of g_b,y) than ``threshold``.
+    Falling toward the stance side has no catch — the HARD failure direction —
+    so it is taxed early and steeply, unlike the swing side."""
+    asset: Entity = env.scene[asset_cfg.name]
+    gy = torch.nan_to_num(asset.data.projected_gravity_b[:, 1], nan=0.0)
+    over = torch.clamp(direction * gy - threshold, min=0.0)
+    return -(over ** 2)
+
+
+def joint_vel_gaussian(
+    env: ManagerBasedRlEnv,
+    std: float = 1.0,
+    gate_sensor_name: str | None = None,
+    gate_slot: int = 1,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Stillness: exp(−mean(q̇²)/std²) over the servo joints, optionally gated on
+    the stance-foot contact (quiet balancing pays; lying still on the floor does not
+    because the fall terminates / the stance foot is gone)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    qd = torch.nan_to_num(_servo_joint_vel(env, asset), nan=0.0)
+    reward = torch.exp(-(qd ** 2).mean(dim=-1) / (std ** 2))
+    if gate_sensor_name is not None:
+        reward = reward * _foot_found(env, gate_sensor_name, gate_slot)
+    return reward
+
+
+def reward_param_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_name: str,
+    param_stages: list[dict],
+) -> torch.Tensor:
+    """Mutate a reward term's params at scheduled steps (twin of
+    ``event_param_curriculum``; uses the live RewardManager term cfg)."""
+    del env_ids
+    term_cfg = env.reward_manager.get_term_cfg(reward_name)
+    current = param_stages[0]["params"]
+    for stage in param_stages:
+        if env.common_step_counter >= stage["step"]:
+            current = stage["params"]
+    term_cfg.params.update(current)
+    first_val = next(iter(current.values()))
+    return torch.tensor(float(first_val) if isinstance(first_val, (int, float)) else 0.0)
