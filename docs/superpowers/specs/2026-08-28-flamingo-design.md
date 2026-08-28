@@ -108,3 +108,21 @@ verified hold ≥ H followed by a clean two-foot stand.
 ## Out of scope
 
 Left-foot stance (mirror later), roller model, backlash twin, real-robot deployment.
+
+## Stage 2 as built (2026-08-29, `Mjlab-FlamingoCycle-Flat-MicroDuck`)
+
+Built as a **controller-driven posture command** instead of the fixed phase clock above, because
+the user wants to choose when to lift and when to come back (a button on a controller) and wants
+the robot to give up gracefully when a push is too hard.
+
+| item | decision |
+|---|---|
+| command | twist slots `[flag, side, 0]`: flag 0 = two feet, 1 = one foot; side +1 = right stance (left lifted), −1 = left stance. Obs = raw command. Runtime writes flag/side. |
+| both feet | one policy, side in the command; left pose = exact mirror of the right one (swap legs, negate leg joints, negate head yaw/roll — verified 1.20 cm CoM margin both sides, `notes/poses/flamingo_left.json`) |
+| internal blend | `FlamingoCommand` slews α ∈ [0,1] toward the flag at 1/1.5 s (SitStand idiom). Shaping targets are blends: CoM target midpoint(feet) → stance foot, pose HOME → FLAMINGO(side), gravity upright → pose lean |
+| sequencing | by α-gates: swing-foot contact +1 for α<0.4, −1 for α>0.9; swing-foot clearance asked for α>0.6; stillness only when |flag−α|<0.02. Same in reverse when lowering |
+| dwell | flag resampled every 2.5–5 s (episode 10 s); flamingo prob 0.6; side re-drawn only from STAND |
+| spawn | in the pose of a side drawn by the event (`in_pose_prob` 0.6 → 0.4 (it 600) → 0.3 (it 1200)) or standing at HOME; flag drawn independently → hold / lower / lift / stand all trained. Reset events run BEFORE the command reset in mjlab, so the event pins the side into the command term |
+| fallback | swing-foot touchdown is a −0.5/step tax, never terminal; staying upright is worth far more → step down, then re-lift or wait for the flag to drop |
+| pushes | 0 → 0.08 (it 500) → 0.15 (it 1000) → 0.25 (it 1500) |
+| eval | `duck-result <run> --cycle`: right/left cycles, pushes during the hold (swing side, stance side, forward), a 0.3 m/s too-hard push, lower from a static hold; reports `hold_single_support`, `hold_swing_clear_frac`, `stand_two_feet`, `final_upright` per rollout |
