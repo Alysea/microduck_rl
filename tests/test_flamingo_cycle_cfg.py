@@ -87,7 +87,8 @@ def test_cfg_command_spawn_and_episode():
     assert cfg.curriculum["com_std"].params["reward_name"] == "com_target"
     stages = cfg.curriculum["push_magnitude"].params["push_stages"]
     assert stages[0]["velocity_range"]["x"] == (0.0, 0.0)
-    assert stages[-1]["velocity_range"]["x"][1] == 0.25
+    assert stages[-1]["velocity_range"]["x"][1] == fc.MAX_PUSH == 0.15
+    assert cfg.curriculum["action_rate_weight"].params["weight_stages"][-1]["weight"] == -0.5
     assert "fell_over" in cfg.terminations and "nan_state" in cfg.terminations
 
 

@@ -53,7 +53,6 @@ from mjlab_microduck.tasks.microduck_flamingo_env_cfg import (
     FLAMINGO_Z,
     NUM_STEPS_PER_ENV,
     STANCE_SIDE_TILT_THRESHOLD,
-    VELOCITY_PUSH_RANGE,
     MicroduckFlamingoRlCfg,
     make_microduck_flamingo_env_cfg,
 )
@@ -70,6 +69,8 @@ ZERO_SIDE_PROB = 0.5     # P(observed side = 0 | stand): trains the runtime's al
 # pays 0.5 at 5 cm, 1.0 at 10 cm, 0.26 at 17 cm: clearly lifted, no kicking.
 SWING_CLEAR_TARGET_Z = 0.10
 SWING_CLEAR_STD = 0.06
+MAX_PUSH = 0.15          # m/s, final push stage (0.25 broke stage 1, see curricula)
+MAX_ACTION_RATE_W = -0.5
 
 
 def mirror_pose(pose: list) -> list:
@@ -182,16 +183,18 @@ def make_microduck_flamingo_cycle_env_cfg(play: bool = False) -> ManagerBasedRlE
     )
 
     # ── Curricula: transitions are harder than the hold → later ramps ─────────
+    # Lesson from stage-1 run flamingo-s1-long (2026-08-29): the 0.25 m/s push
+    # stage (it 1000) on top of the −1.0 action-rate tax halved the reward and
+    # the policy never recovered (jittery, saturated actions). Pushes stop at
+    # MAX_PUSH and the smoothness tax at MAX_ACTION_RATE_W here.
     cfg.curriculum["push_magnitude"].params["push_stages"] = [
         {"step": 0,                         "velocity_range": {"x": (0.0, 0.0),    "y": (0.0, 0.0)}},
         {"step": 500 * NUM_STEPS_PER_ENV,   "velocity_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}},
-        {"step": 1000 * NUM_STEPS_PER_ENV,  "velocity_range": {"x": (-0.15, 0.15), "y": (-0.15, 0.15)}},
-        {"step": 1500 * NUM_STEPS_PER_ENV,  "velocity_range": {"x": VELOCITY_PUSH_RANGE, "y": VELOCITY_PUSH_RANGE}},
+        {"step": 1000 * NUM_STEPS_PER_ENV,  "velocity_range": {"x": (-MAX_PUSH, MAX_PUSH), "y": (-MAX_PUSH, MAX_PUSH)}},
     ]
     cfg.curriculum["action_rate_weight"].params["weight_stages"] = [
         {"step": 0,                         "weight": -0.1},
-        {"step": 600 * NUM_STEPS_PER_ENV,   "weight": -0.5},
-        {"step": 1200 * NUM_STEPS_PER_ENV,  "weight": -1.0},
+        {"step": 600 * NUM_STEPS_PER_ENV,   "weight": MAX_ACTION_RATE_W},
     ]
     cfg.curriculum["torque_rate_weight"].params["weight_stages"] = [
         {"step": 0,                         "weight": 0.0},
