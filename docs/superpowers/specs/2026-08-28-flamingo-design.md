@@ -126,3 +126,11 @@ the robot to give up gracefully when a push is too hard.
 | fallback | swing-foot touchdown is a −0.5/step tax, never terminal; staying upright is worth far more → step down, then re-lift or wait for the flag to drop |
 | pushes | 0 → 0.08 (it 500) → 0.15 (it 1000) → 0.25 (it 1500) |
 | eval | `duck-result <run> --cycle`: right/left cycles, pushes during the hold (swing side, stance side, forward), a 0.3 m/s too-hard push, lower from a static hold; reports `hold_single_support`, `hold_swing_clear_frac`, `stand_two_feet`, `final_upright` per rollout |
+
+Review fixes before the first cycle run (2026-08-29 01:10): the CoM rewards now use the
+whole-robot `subtree_com` (mjlab's `root_com_pos_w` is the trunk body's own CoM, centimetres
+off with the head and a lifted leg — stage 1 trained on that proxy and still balanced); the
+rewards use a latched ±1 stance side while the OBSERVED side slot is zeroed half the time in
+STAND so the runtime's `[0,0,0]` idle command is trained; swing-foot clearance target 0.10 ± 0.06
+(0.05 ± 0.03 contradicted the pose's 0.17 m foot); the success diagnostic carries weight 1e-3
+(mjlab skips weight-0 terms entirely).

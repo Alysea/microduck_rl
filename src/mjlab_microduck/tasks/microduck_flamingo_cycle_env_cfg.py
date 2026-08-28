@@ -53,7 +53,6 @@ from mjlab_microduck.tasks.microduck_flamingo_env_cfg import (
     FLAMINGO_Z,
     NUM_STEPS_PER_ENV,
     STANCE_SIDE_TILT_THRESHOLD,
-    SWING_FOOT_TARGET_Z,
     VELOCITY_PUSH_RANGE,
     MicroduckFlamingoRlCfg,
     make_microduck_flamingo_env_cfg,
@@ -65,6 +64,12 @@ POSTURE_DWELL_S = (2.5, 5.0)
 RAMP_S = 1.5             # seconds for α to traverse STAND ↔ FLAMINGO in full
 FLAMINGO_PROB = 0.6      # probability a resample commands ONE foot
 IN_POSE_PROB = 0.6       # spawn bucket: in the one-foot pose (ramped down by curriculum)
+ZERO_SIDE_PROB = 0.5     # P(observed side = 0 | stand): trains the runtime's all-zero idle command
+# Swing-foot clearance target. The pose has the foot ~0.17 m up; stage 1 asked
+# for 0.05 ± 0.03 which contradicts pose_track (exp(−16) at the pose). 0.10 ± 0.06
+# pays 0.5 at 5 cm, 1.0 at 10 cm, 0.26 at 17 cm: clearly lifted, no kicking.
+SWING_CLEAR_TARGET_Z = 0.10
+SWING_CLEAR_STD = 0.06
 
 
 def mirror_pose(pose: list) -> list:
@@ -117,7 +122,7 @@ def make_microduck_flamingo_cycle_env_cfg(play: bool = False) -> ManagerBasedRlE
     cfg.rewards["swing_foot_clear"] = RewardTermCfg(
         func=microduck_mdp.fl_swing_foot_clear, weight=1.5,
         params={"command_name": "twist", "left_cfg": left_site, "right_cfg": right_site,
-                "sensor_name": feet_sensor, "target": SWING_FOOT_TARGET_Z, "std": 0.03,
+                "sensor_name": feet_sensor, "target": SWING_CLEAR_TARGET_Z, "std": SWING_CLEAR_STD,
                 "lo": 0.6, "hi": 1.0},
     )
     cfg.rewards["pose_track"] = RewardTermCfg(
@@ -139,9 +144,10 @@ def make_microduck_flamingo_cycle_env_cfg(play: bool = False) -> ManagerBasedRlE
         func=microduck_mdp.fl_stance_side_tilt, weight=4.0,
         params={"command_name": "twist", "threshold": STANCE_SIDE_TILT_THRESHOLD},
     )
-    # Log-only success indicator (weight 0 keeps it out of the return).
+    # Success indicator. mjlab skips weight-0 terms entirely (nothing logged),
+    # so it carries a token weight: ≤ 0.3 per episode, readable in wandb.
     cfg.rewards["commanded_support"] = RewardTermCfg(
-        func=microduck_mdp.fl_single_support_success, weight=0.0,
+        func=microduck_mdp.fl_single_support_success, weight=1e-3,
         params={"command_name": "twist", "sensor_name": feet_sensor},
     )
 
@@ -150,7 +156,8 @@ def make_microduck_flamingo_cycle_env_cfg(play: bool = False) -> ManagerBasedRlE
     command.resampling_time_range = POSTURE_DWELL_S
     base_kwargs = {k: v for k, v in vars(command).items() if k != "rel_turn_in_place_envs"}
     cfg.commands["twist"] = microduck_mdp.FlamingoCommandCfg(
-        **{**base_kwargs, "flamingo_prob": FLAMINGO_PROB, "ramp_s": RAMP_S}
+        **{**base_kwargs, "flamingo_prob": FLAMINGO_PROB, "ramp_s": RAMP_S,
+           "zero_side_prob": ZERO_SIDE_PROB}
     )
 
     # ── Spawn: in-pose (either side) or standing; flag drawn by the command ───

@@ -33,7 +33,7 @@ def test_mirror_pose_matches_the_verified_left_pose():
 def test_left_pose_keeps_the_joint_limit_margin():
     ranges = {
         1: (-0.384, 0.384), 10: (-0.384, 0.384),
-        0: (-0.436, 0.524), 9: (-0.436, 0.524),
+        0: (-0.436, 0.524), 9: (-0.524, 0.436),           # hip_yaw ranges are mirrored L/R
         2: (-1.571, 1.571), 3: (-1.571, 1.571), 4: (-1.571, 1.571),
         11: (-1.571, 1.571), 12: (-1.571, 1.571), 13: (-1.571, 1.571),
         5: (-1.571, 1.047), 6: (-1.571, 1.571), 7: (-2.967, 2.967), 8: (-0.436, 0.436),
@@ -61,7 +61,8 @@ def test_cfg_rewards_and_signs():
         assert r[name].weight > 0, name
         assert r[name].params["command_name"] == "twist"
     assert r["stance_side_tilt"].func is microduck_mdp.fl_stance_side_tilt and r["stance_side_tilt"].weight > 0
-    assert r["commanded_support"].weight == 0.0
+    assert 0 < r["commanded_support"].weight <= 1e-3      # weight 0 would not be logged at all
+    assert r["swing_foot_clear"].params["target"] >= 0.08 and r["swing_foot_clear"].params["std"] >= 0.05
     for name in ("joint_limit_proximity", "action_rate_l2", "body_ang_vel", "self_collisions"):
         assert r[name].weight < 0, name
     assert r["com_target"].params["left_cfg"].site_names == ["left_foot"]
@@ -108,6 +109,7 @@ class _Term:
     def __init__(self, cmd, alpha):
         self.command = cmd
         self.alpha = alpha
+        self.stance_side = torch.where(cmd[:, 1] < 0.0, -1.0, 1.0)
         self.set_calls = []
 
     def set_alpha(self, env_ids, value):
@@ -126,7 +128,9 @@ def _fake_env(cmd, alpha, *, found, left_xyz, right_xyz, com_xy, gravity, q, qd,
         default_joint_pos=torch.tensor(home).unsqueeze(0).expand(n, -1).clone(),
         joint_pos=q, joint_vel=qd,
     )
-    robot = SimpleNamespace(data=data, joint_names=[f"j{i}" for i in range(14)])
+    robot = SimpleNamespace(data=data, joint_names=[f"j{i}" for i in range(14)],
+                            indexing=SimpleNamespace(root_body_id=0))
+    sim = SimpleNamespace(data=SimpleNamespace(subtree_com=torch.cat([com_xy, torch.zeros(n, 1)], dim=1).unsqueeze(1)))
     sensor = SimpleNamespace(data=SimpleNamespace(found=found))
     class _Scene:
         sensors = {"feet": sensor}
@@ -135,7 +139,7 @@ def _fake_env(cmd, alpha, *, found, left_xyz, right_xyz, com_xy, gravity, q, qd,
         def __getitem__(self, k):
             return {"robot": robot}[k]
 
-    env = SimpleNamespace(scene=_Scene(), command_manager=cm, device="cpu", num_envs=n)
+    env = SimpleNamespace(scene=_Scene(), command_manager=cm, device="cpu", num_envs=n, sim=sim)
     return env, term
 
 
@@ -283,6 +287,8 @@ def _bare_command(n, flamingo_prob=0.6):
     term._alpha = torch.zeros(n)
     term._fresh = torch.ones(n, dtype=torch.bool)
     term._pending_side = torch.zeros(n)
+    term._stance_side = torch.ones(n)
+    term._zero_side_prob = 0.5
     return term
 
 
@@ -299,17 +305,24 @@ def test_command_resample_honours_pending_side_and_keeps_side_during_hold():
     assert torch.equal(term.command[:, 1], side)          # honoured by the resample
     assert (term.command[:, 0] == 1.0).all()
     assert (term._pending_side == 0).all() and not term._fresh.any()
-    # flamingo → flamingo resample (hold): side unchanged
+    # flamingo → flamingo resample (hold): side unchanged, observed = latched
     term._resample_command(ids)
-    assert torch.equal(term.command[:, 1], side)
-    # stand → flamingo: side re-drawn (both values appear)
+    assert torch.equal(term.command[:, 1], side) and torch.equal(term.stance_side, side)
+    # → stand: latched side kept (the lowering rewards still need it), observed side
+    #   zeroed for about half the envs (deployment idle parity)
     term._flamingo_prob = 0.0
     term._resample_command(ids)
     assert (term.command[:, 0] == 0.0).all()
+    assert torch.equal(term.stance_side, side)
+    zeros = (term.command[:, 1] == 0).float().mean().item()
+    assert 0.3 < zeros < 0.7
+    assert ((term.command[:, 1] == 0) | (term.command[:, 1] == side)).all()
+    # stand → flamingo: side re-drawn (both values appear), observed = latched, never 0
     term._flamingo_prob = 1.0
     term._resample_command(ids)
-    assert not torch.equal(term.command[:, 1], side)
-    assert set(term.command[:, 1].unique().tolist()) == {-1.0, 1.0}
+    assert not torch.equal(term.stance_side, side)
+    assert set(term.stance_side.unique().tolist()) == {-1.0, 1.0}
+    assert torch.equal(term.command[:, 1], term.stance_side)
     assert (term.command[:, 2] == 0).all()
 
 

@@ -7283,6 +7283,15 @@ def foot_contact_penalty(env: ManagerBasedRlEnv, sensor_name: str, slot: int) ->
     return -_foot_found(env, sensor_name, slot)
 
 
+def _robot_com_xy(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """Horizontal WHOLE-ROBOT centre of mass (MuJoCo ``subtree_com`` of the root
+    body). ``asset.data.root_com_pos_w`` is the trunk body's own CoM (xipos),
+    which with a 38 %-mass head and a lifted leg sits centimetres away from the
+    true CoM the poses were validated with (notes/tools/duck_pose.py)."""
+    com = env.sim.data.subtree_com[:, asset.indexing.root_body_id, :2]
+    return torch.nan_to_num(com, nan=0.0)
+
+
 def com_over_foot(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg,
@@ -7292,7 +7301,7 @@ def com_over_foot(
     (``asset_cfg.site_names=["right_foot"]``). Same quantity as
     ``com_over_support_foot`` minus the kick phase gate."""
     asset: Entity = env.scene[asset_cfg.name]
-    com_xy = asset.data.root_com_pos_w[:, :2]
+    com_xy = _robot_com_xy(env, asset)
     foot_xy = asset.data.site_pos_w[:, asset_cfg.site_ids[0], :2]
     dist2 = torch.nan_to_num(((com_xy - foot_xy) ** 2).sum(dim=-1), nan=1.0)
     return torch.exp(-dist2 / (std ** 2))
@@ -7419,6 +7428,11 @@ class FlamingoCommand(UniformVelocityCommand):
         # before command_manager.reset(), so the event that teleports the robot
         # into a one-foot pose decides the side and the resample honours it.
         self._pending_side = torch.zeros(self.num_envs, device=self.device)
+        # Latched stance side (±1) the REWARDS use; never 0. The OBSERVED side
+        # slot is zeroed (p = zero_side_prob) while flag = 0 so the runtime's
+        # all-zero idle command [0, 0, 0] is in-distribution.
+        self._stance_side = torch.ones(self.num_envs, device=self.device)
+        self._zero_side_prob = float(getattr(cfg, "zero_side_prob", 0.5))
 
     @property
     def command(self) -> torch.Tensor:
@@ -7434,7 +7448,13 @@ class FlamingoCommand(UniformVelocityCommand):
 
     @property
     def side(self) -> torch.Tensor:
+        """Observed side slot (0 allowed while standing)."""
         return self.vel_command_b[:, 1]
+
+    @property
+    def stance_side(self) -> torch.Tensor:
+        """Latched ±1 stance side for the rewards (last non-zero side)."""
+        return self._stance_side
 
     def set_alpha(self, env_ids: torch.Tensor, value: torch.Tensor) -> None:
         self._alpha[env_ids] = value
@@ -7443,6 +7463,7 @@ class FlamingoCommand(UniformVelocityCommand):
         """Called by the spawn event: pin the side for the upcoming resample and
         expose it immediately in the command buffer."""
         self._pending_side[env_ids] = side
+        self._stance_side[env_ids] = side
         self.vel_command_b[env_ids, 1] = side
 
     def reset(self, env_ids=None):
@@ -7455,17 +7476,23 @@ class FlamingoCommand(UniformVelocityCommand):
         if n == 0:
             return
         prev_flag = self.vel_command_b[env_ids, 0]
-        prev_side = self.vel_command_b[env_ids, 1]
+        prev_side = self._stance_side[env_ids]
         new_flag = (torch.rand(n, device=self.device) < self._flamingo_prob).float()
         new_side = torch.where(torch.rand(n, device=self.device) < 0.5, -1.0, 1.0)
-        redraw = self._fresh[env_ids] | (prev_flag < 0.5) | (prev_side.abs() < 0.5)
+        # Re-draw the side only from STAND (or at episode start); a hold keeps it.
+        redraw = self._fresh[env_ids] | (prev_flag < 0.5)
         side = torch.where(redraw, new_side, prev_side)
         pending = self._pending_side[env_ids]
         side = torch.where(pending.abs() > 0.5, pending, side)
         self._pending_side[env_ids] = 0.0
+        self._stance_side[env_ids] = side
+        # Observed side: the latched side on one foot; while standing, zero it
+        # with p = zero_side_prob (deployment idle parity) else keep it.
+        zero = (new_flag < 0.5) & (torch.rand(n, device=self.device) < self._zero_side_prob)
+        obs_side = torch.where(zero, torch.zeros_like(side), side)
         self.vel_command_b[env_ids] = 0.0
         self.vel_command_b[env_ids, 0] = new_flag
-        self.vel_command_b[env_ids, 1] = side
+        self.vel_command_b[env_ids, 1] = obs_side
         self._fresh[env_ids] = False
 
     def compute(self, dt: float) -> None:
@@ -7486,6 +7513,8 @@ class FlamingoCommandCfg(UniformVelocityCommandCfg):
     class_type: type = FlamingoCommand
     flamingo_prob: float = 0.6
     ramp_s: float = 1.5
+    # P(observed side slot = 0 | flag = 0): trains the all-zero idle command.
+    zero_side_prob: float = 0.5
 
     def build(self, env: ManagerBasedRlEnv) -> "FlamingoCommand":
         return FlamingoCommand(self, env)
@@ -7497,11 +7526,14 @@ def _smoothstep(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
 
 
 def _fl_ctx(env: ManagerBasedRlEnv, command_name: str):
-    """(flag, side, alpha) of the FlamingoCommand term (falls back to raw cmd)."""
+    """(flag, latched ±1 stance side, alpha) of the FlamingoCommand term
+    (falls back to the raw command slots)."""
     term = env.command_manager.get_term(command_name)
     cmd = env.command_manager.get_command(command_name)
     flag = cmd[:, 0]
-    side = torch.where(cmd[:, 1] < 0.0, -1.0, 1.0)
+    side = getattr(term, "stance_side", None)
+    if side is None:
+        side = torch.where(cmd[:, 1] < 0.0, -1.0, 1.0)
     alpha = getattr(term, "alpha", None)
     if alpha is None:
         alpha = flag
@@ -7619,7 +7651,7 @@ def fl_com_target(
     mid = 0.5 * (left + right)
     a = alpha.unsqueeze(1)
     target_xy = (1.0 - a) * mid[:, :2] + a * stance[:, :2]
-    com_xy = torch.nan_to_num(asset.data.root_com_pos_w[:, :2], nan=0.0)
+    com_xy = _robot_com_xy(env, asset)
     dist2 = ((com_xy - target_xy) ** 2).sum(dim=-1)
     return torch.exp(-dist2 / (std ** 2))
 
