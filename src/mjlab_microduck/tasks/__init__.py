@@ -164,6 +164,13 @@ register_mjlab_task(
     rl_cfg=MicroduckFlamingoBalletRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+register_mjlab_task(
+    task_id="Mjlab-FlamingoBalletV2-Flat-MicroDuck",
+    env_cfg=make_microduck_flamingo_ballet_env_cfg(v2=True),
+    play_env_cfg=make_microduck_flamingo_ballet_env_cfg(play=True, v2=True),
+    rl_cfg=MicroduckFlamingoBalletRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 register_mjlab_task(
     task_id="Mjlab-StandUp-Rough-MicroDuck",

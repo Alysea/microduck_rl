@@ -49,11 +49,17 @@ PASSE_POSE_RIGHT = list(FLAMINGO_POSE_RIGHT)
 POSES_RIGHT = [ARABESQUE_POSE_RIGHT, PASSE_POSE_RIGHT, DEVELOPPE_POSE_RIGHT]
 POSES_LEFT = [mirror_pose(ARABESQUE_POSE_RIGHT), list(FLAMINGO_POSE_LEFT), mirror_pose(DEVELOPPE_POSE_RIGHT)]
 CLEAR_TARGETS = (0.05, 0.10, 0.08)     # swing-foot height targets per pose (m)
+CLEAR_TARGETS_V2 = (0.06, 0.10, 0.09)  # v2: the développé foot must clearly leave the floor
 POSE_PROBS = (0.25, 0.5, 0.25)          # P(arabesque), P(passé), P(développé) per resample
 POSE_RAMP_S = 1.5                       # seconds per unit of pose blend
 
 
-def make_microduck_flamingo_ballet_env_cfg(play: bool = False, hard: bool = False) -> ManagerBasedRlEnvCfg:
+def make_microduck_flamingo_ballet_env_cfg(play: bool = False, hard: bool = False, v2: bool = False) -> ManagerBasedRlEnvCfg:
+    """``v2`` (after ballet run 1, 2026-08-29 05:20): run 1 held the arabesque but
+    parked the développé foot ON the floor (tripod) and lifted every pose only
+    ~4 cm — pose tracking beat clearance. v2 taxes the lifted-foot contact 3×,
+    doubles the clearance reward with per-pose targets ≥ 6 cm, tightens the
+    pose std a little, and compresses the curricula to a 2200-it run."""
     cfg = make_microduck_flamingo_cycle_env_cfg(play=play, hard=hard)
 
     cfg.rewards["pose_track"] = RewardTermCfg(
@@ -95,6 +101,27 @@ def make_microduck_flamingo_ballet_env_cfg(play: bool = False, hard: bool = Fals
             {"step": 0,                               "velocity_range": {"x": (0.0, 0.0),    "y": (0.0, 0.0)}},
             {"step": 600 * NUM_STEPS_PER_ENV,         "velocity_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}},
             {"step": 1200 * NUM_STEPS_PER_ENV,        "velocity_range": {"x": (-0.15, 0.15), "y": (-0.15, 0.15)}},
+        ]
+    if v2:
+        cfg.rewards["swing_foot_contact"].weight = 1.5
+        cfg.rewards["swing_foot_clear"].weight = 3.0
+        cfg.rewards["swing_foot_clear"].params["targets"] = CLEAR_TARGETS_V2
+        cfg.rewards["swing_foot_clear"].params["std"] = 0.05
+        cfg.rewards["pose_track"].params["std"] = 0.4
+        cfg.curriculum["in_pose_prob"].params["param_stages"] = [
+            {"step": 0,                               "params": {"in_pose_prob": 0.6}},
+            {"step": 500 * NUM_STEPS_PER_ENV,         "params": {"in_pose_prob": 0.5}},
+            {"step": 1000 * NUM_STEPS_PER_ENV,        "params": {"in_pose_prob": 0.4}},
+            {"step": 1500 * NUM_STEPS_PER_ENV,        "params": {"in_pose_prob": 0.3}},
+        ]
+        cfg.curriculum["push_magnitude"].params["push_stages"] = [
+            {"step": 0,                               "velocity_range": {"x": (0.0, 0.0),    "y": (0.0, 0.0)}},
+            {"step": 500 * NUM_STEPS_PER_ENV,         "velocity_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}},
+            {"step": 1000 * NUM_STEPS_PER_ENV,        "velocity_range": {"x": (-0.15, 0.15), "y": (-0.15, 0.15)}},
+        ]
+        cfg.curriculum["action_rate_weight"].params["weight_stages"] = [
+            {"step": 0,                               "weight": -0.1},
+            {"step": 500 * NUM_STEPS_PER_ENV,         "weight": -0.5},
         ]
     return cfg
 

@@ -180,3 +180,12 @@ def test_ballet_curricula_are_gentler():
     assert [s["params"]["in_pose_prob"] for s in ip] == [0.6, 0.5, 0.4, 0.3]
     ps = cfg.curriculum["push_magnitude"].params["push_stages"]
     assert ps[-1]["velocity_range"]["x"][1] == 0.15 and ps[-1]["step"] == 1200 * 24
+
+
+def test_v2_weights_and_pacing():
+    cfg = make_microduck_flamingo_ballet_env_cfg(v2=True)
+    assert cfg.rewards["swing_foot_contact"].weight == 1.5 and cfg.rewards["swing_foot_clear"].weight == 3.0
+    assert cfg.rewards["swing_foot_clear"].params["targets"] == fb.CLEAR_TARGETS_V2 and min(fb.CLEAR_TARGETS_V2) >= 0.06
+    assert cfg.rewards["pose_track"].params["std"] == 0.4
+    assert cfg.curriculum["in_pose_prob"].params["param_stages"][-1]["step"] == 1500 * 24
+    assert cfg.curriculum["push_magnitude"].params["push_stages"][-1]["velocity_range"]["x"][1] == 0.15
