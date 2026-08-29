@@ -93,10 +93,14 @@ FLAMINGO_GRAVITY_RIGHT = tuple(FLAMINGO_GRAVITY_B)
 FLAMINGO_GRAVITY_LEFT = (FLAMINGO_GRAVITY_B[0], -FLAMINGO_GRAVITY_B[1], FLAMINGO_GRAVITY_B[2])
 
 
-def make_microduck_flamingo_cycle_env_cfg(play: bool = False, hard: bool = False) -> ManagerBasedRlEnvCfg:
+def make_microduck_flamingo_cycle_env_cfg(play: bool = False, hard: bool = False, gentle: bool = False) -> ManagerBasedRlEnvCfg:
     """``hard``: run-2 variant — pushes ramp on to HARD_PUSH m/s at HARD_PUSH_IT
     (run 1 topped out at 0.15 and fell, rather than stepping down, for pushes
-    ≥ 0.18 m/s backward / toward the stance side in the CPU stress test)."""
+    ≥ 0.18 m/s backward / toward the stance side in the CPU stress test).
+    ``gentle``: run-3 pacing for a 3000-it run — both cycle runs stepped DOWN in
+    reward / episode length at the in-pose 0.4 → 0.3 spawn step (it 1200) and
+    at the 0.25 m/s stage (it 1400); spread the spawn ramp over 2100 it, pushes
+    0.08 / 0.15 at it 600 / 1200 and (with ``hard``) 0.25 at it 2400."""
     cfg = make_microduck_flamingo_env_cfg(play=play)
     cfg.episode_length_s = EPISODE_LENGTH_S
 
@@ -221,6 +225,18 @@ def make_microduck_flamingo_cycle_env_cfg(play: bool = False, hard: bool = False
             ],
         },
     )
+    if gentle:
+        cfg.curriculum["in_pose_prob"].params["param_stages"] = [
+            {"step": 0,                        "params": {"in_pose_prob": 0.6}},
+            {"step": 700 * NUM_STEPS_PER_ENV,  "params": {"in_pose_prob": 0.5}},
+            {"step": 1400 * NUM_STEPS_PER_ENV, "params": {"in_pose_prob": 0.4}},
+            {"step": 2100 * NUM_STEPS_PER_ENV, "params": {"in_pose_prob": 0.3}},
+        ]
+        cfg.curriculum["push_magnitude"].params["push_stages"] = [
+            {"step": 0,                        "velocity_range": {"x": (0.0, 0.0),    "y": (0.0, 0.0)}},
+            {"step": 600 * NUM_STEPS_PER_ENV,  "velocity_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}},
+            {"step": 1200 * NUM_STEPS_PER_ENV, "velocity_range": {"x": (-MAX_PUSH, MAX_PUSH), "y": (-MAX_PUSH, MAX_PUSH)}},
+        ] + ([{"step": 2400 * NUM_STEPS_PER_ENV, "velocity_range": {"x": (-HARD_PUSH, HARD_PUSH), "y": (-HARD_PUSH, HARD_PUSH)}}] if hard else [])
     return cfg
 
 

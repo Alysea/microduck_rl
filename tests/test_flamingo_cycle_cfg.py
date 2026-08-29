@@ -347,3 +347,13 @@ def test_hard_variant_adds_the_025_push_stage():
     assert len(hs) == len(ss) + 1 and hs[-1]["velocity_range"]["x"][1] == fc.HARD_PUSH == 0.25
     assert hs[-1]["step"] > hs[-2]["step"]
     assert soft.rewards.keys() == hard.rewards.keys()
+
+
+def test_gentle_variant_pacing():
+    cfg = make_microduck_flamingo_cycle_env_cfg(hard=True, gentle=True)
+    ip = [s_["params"]["in_pose_prob"] for s_ in cfg.curriculum["in_pose_prob"].params["param_stages"]]
+    assert ip == [0.6, 0.5, 0.4, 0.3]
+    ps = cfg.curriculum["push_magnitude"].params["push_stages"]
+    assert [round(s_["velocity_range"]["x"][1], 2) for s_ in ps] == [0.0, 0.08, 0.15, 0.25]
+    assert ps[-1]["step"] == 2400 * 24
+    assert make_microduck_flamingo_cycle_env_cfg(hard=False, gentle=True).curriculum["push_magnitude"].params["push_stages"][-1]["velocity_range"]["x"][1] == 0.15

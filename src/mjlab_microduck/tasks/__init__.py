@@ -148,6 +148,14 @@ register_mjlab_task(
     rl_cfg=MicroduckFlamingoCycleRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+register_mjlab_task(
+    task_id="Mjlab-FlamingoCycleGentle-Flat-MicroDuck",
+    env_cfg=make_microduck_flamingo_cycle_env_cfg(hard=True, gentle=True),
+    play_env_cfg=make_microduck_flamingo_cycle_env_cfg(play=True, hard=True, gentle=True),
+    rl_cfg=MicroduckFlamingoCycleRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
 # Flamingo ballet — cycle env + pose choice (arabesque / passé / développé) in the third twist slot
 register_mjlab_task(
     task_id="Mjlab-FlamingoBallet-Flat-MicroDuck",
