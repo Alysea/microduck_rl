@@ -103,7 +103,7 @@ but `policy.onnx`, `manifest.json`, `README.md` and `media/*`.
 a policy with a new command scheme gets a mode there (a few lines: session, command-block encoding, a key).
 On macOS the MuJoCo viewer must be launched with `uv run mjpython scripts/infer_policy.py …`; if that fails with
 `Library not loaded: @rpath/libpython3.12.dylib`, symlink the interpreter's `libpython3.12.dylib` into the venv root
-(`ln -s "$(uv python find --managed-python 3.12 | xargs dirname)/../lib/libpython3.12.dylib" .venv/libpython3.12.dylib`).
+(`ln -s "$(.venv/bin/python -c 'import sys; print(sys.base_prefix)')/lib/libpython3.12.dylib" .venv/libpython3.12.dylib`).
 A card's "Try it in simulation" recipe must be complete from a fresh laptop: clone + branch, `uv sync`, fetch the
 policy, the exact command, the keys. Keep the robot recipe in a separate block.
 Headless timelines / pushes / videos: the training workspace's `notes/tools/duck_rollout.py`.
