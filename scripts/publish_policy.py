@@ -105,12 +105,16 @@ def build_manifest(user: dict, name: str) -> dict:
 
 # ── card ──────────────────────────────────────────────────────────────────────
 
-def build_card(manifest: dict, repo_id: str, extra_md: str, has_media: bool) -> str:
+def build_card(manifest: dict, repo_id: str, extra_md: str, has_media: bool, media_name: str = "preview.mp4", extra_files: list | None = None) -> str:
     tpl = TEMPLATE.read_text()
     t = manifest["training"]
     cmd = manifest["command"]
     twist_rows = "\n".join(f"| twist[{i}] | {s} |" for i, s in enumerate(cmd["twist"]))
+    video = (f'<video controls muted loop src="https://huggingface.co/{repo_id}/resolve/main/media/{media_name}" style="max-width:640px;width:100%"></video>'
+             if has_media else "")
     fields = {
+        "VIDEO": video,
+        "EXTRA_FILES": "".join(f" · `{n}`" for n in (extra_files or [])),
         "REPO_ID": repo_id, "NAME": manifest["name"], "DESCRIPTION": manifest["description"],
         "KIND": manifest["kind"], "ENTRY_POSE": manifest["entry_pose"],
         "TAGS": ", ".join(TAGS), "TWIST_ROWS": twist_rows,
@@ -118,7 +122,7 @@ def build_card(manifest: dict, repo_id: str, extra_md: str, has_media: bool) -> 
         "IDLE": json.dumps(cmd["idle"]), "EXTRA": extra_md.strip(),
         "TASK_ID": t["task_id"], "TRAIN_REPO": t["repo"], "COMMIT": t["commit"], "RUN": t["run"],
         "ACTION_SCALE": manifest["action_scale"],
-        "MEDIA_LINE": "- `media/preview.mp4` — a sim rollout" if has_media else "",
+        "MEDIA_LINE": f" · `media/{media_name}` (sim rollout)" if has_media else "",
     }
     for k, v in fields.items():
         tpl = tpl.replace("{{" + k + "}}", str(v))
@@ -145,7 +149,8 @@ def cmd_publish(a):
     repo_id = f"{a.namespace}/microduck-{a.name}"
     extra = Path(a.card_extra).read_text() if a.card_extra else ""
     media = Path(a.media).expanduser().resolve() if a.media else None
-    card = build_card(manifest, repo_id, extra, media is not None)
+    extra_files = [Path(e).name for e in (a.extra or [])]
+    card = build_card(manifest, repo_id, extra, media is not None, "preview" + (media.suffix if media else ".mp4"), extra_files)
     out = Path(a.build_dir).expanduser().resolve() if a.build_dir else onnx.parent / f"hub-{a.name}"
     out.mkdir(parents=True, exist_ok=True)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
