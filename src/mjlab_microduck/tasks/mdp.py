@@ -7792,3 +7792,218 @@ def fl_single_support_success(
     one_foot = stance * (1.0 - swing)
     two_feet = stance * swing
     return torch.where(flag > 0.5, one_foot, two_feet)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Flamingo BALLET — several one-foot poses, selected by the third twist slot
+# (2026-08-29). cmd = [flag, side, pose]; pose ∈ {-1 arabesque, 0 passé, +1 développé}.
+# A slewed continuous ``pose_u`` (rate 1/pose_ramp_s) interpolates the joint
+# target piecewise-linearly between the three validated poses, so switching the
+# pose during a hold is a smooth "artistic transition" the policy must track.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class FlamingoBalletCommand(FlamingoCommand):
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._pose_ramp_s = float(getattr(cfg, "pose_ramp_s", 1.5))
+        self._pose_probs = list(getattr(cfg, "pose_probs", (0.25, 0.5, 0.25)))   # P(-1), P(0), P(+1)
+        self._pose_u = torch.zeros(self.num_envs, device=self.device)         # slewed pose blend ∈ [-1, 1]
+        self._pose_id = torch.zeros(self.num_envs, device=self.device)        # latched commanded pose (-1/0/1)
+        self._pending_pose = torch.full((self.num_envs,), float("nan"), device=self.device)
+
+    @property
+    def pose_u(self) -> torch.Tensor:
+        return self._pose_u
+
+    @property
+    def pose_id(self) -> torch.Tensor:
+        return self._pose_id
+
+    def request_pose(self, env_ids: torch.Tensor, pose_id: torch.Tensor) -> None:
+        """Spawn event: pin the pose for the upcoming resample and start the blend there."""
+        self._pending_pose[env_ids] = pose_id
+        self._pose_id[env_ids] = pose_id
+        self._pose_u[env_ids] = pose_id
+        self.vel_command_b[env_ids, 2] = pose_id
+
+    def _draw_pose(self, n: int) -> torch.Tensor:
+        r = torch.rand(n, device=self.device)
+        p0, p1 = self._pose_probs[0], self._pose_probs[0] + self._pose_probs[1]
+        return torch.where(r < p0, -1.0, torch.where(r < p1, 0.0, 1.0))
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        super()._resample_command(env_ids)
+        n = len(env_ids)
+        pending = self._pending_pose[env_ids]
+        pose = torch.where(torch.isnan(pending), self._draw_pose(n), pending)
+        self._pending_pose[env_ids] = float("nan")
+        flag = self.vel_command_b[env_ids, 0]
+        # Standing: the pose slot reads 0 (idle parity); the latched pose is kept
+        # for the lowering blend.
+        self._pose_id[env_ids] = torch.where(flag > 0.5, pose, self._pose_id[env_ids])
+        self.vel_command_b[env_ids, 2] = torch.where(flag > 0.5, pose, torch.zeros_like(pose))
+
+    def compute(self, dt: float) -> None:
+        super().compute(dt)
+        step = dt / max(self._pose_ramp_s, 1e-6)
+        delta = self._pose_id - self._pose_u
+        self._pose_u += torch.clamp(delta, -step, step)
+
+
+@_dataclass(kw_only=True)
+class FlamingoBalletCommandCfg(FlamingoCommandCfg):
+    class_type: type = FlamingoBalletCommand
+    pose_ramp_s: float = 1.5
+    pose_probs: tuple = (0.25, 0.5, 0.25)
+
+    def build(self, env: ManagerBasedRlEnv) -> "FlamingoBalletCommand":
+        return FlamingoBalletCommand(self, env)
+
+
+def _flb_pose_u(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    term = env.command_manager.get_term(command_name)
+    u = getattr(term, "pose_u", None)
+    if u is None:
+        u = env.command_manager.get_command(command_name)[:, 2]
+    return torch.clamp(u, -1.0, 1.0)
+
+
+def _flb_interp(u: torch.Tensor, lo, mid, hi) -> torch.Tensor:
+    """Piecewise-linear blend over u ∈ [-1, 1]: -1 → lo, 0 → mid, +1 → hi. Tensors broadcast over the last dim."""
+    if u.dim() < lo.dim():
+        u = u.unsqueeze(-1)
+    w = u.abs()
+    other = torch.where(u < 0, lo, hi)
+    return (1.0 - w) * mid + w * other
+
+
+def set_flamingo_ballet_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    poses_right: list,
+    poses_left: list,
+    base_roll: float,
+    base_pitch: float,
+    z_min: float,
+    z_max: float,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_noise: float = 0.0,
+    joint_noise_std: float = 0.0,
+    in_pose_prob: float = 0.5,
+    standing_z_min: float = 0.11,
+    standing_z_max: float = 0.12,
+    pose_probs: tuple = (0.25, 0.5, 0.25),
+):
+    """Cycle spawn with a pose draw: ``poses_*`` = [arabesque, passé, développé]
+    (pose ids -1, 0, +1). Pins side AND pose into the command term."""
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.int)
+    num = len(env_ids)
+    dev = env.device
+    term = env.command_manager.get_term(command_name)
+    r = torch.rand(num, device=dev)
+    pose_id = torch.where(r < pose_probs[0], -1.0, torch.where(r < pose_probs[0] + pose_probs[1], 0.0, 1.0))
+    idx = (pose_id + 1).long()
+    pr = torch.tensor(poses_right, device=dev, dtype=torch.float32)[idx]
+    pl = torch.tensor(poses_left, device=dev, dtype=torch.float32)[idx]
+    # Reuse the cycle spawn for the side/pose placement by passing per-env poses.
+    _set_cycle_state_with_poses(env, env_ids, pr, pl, base_roll, base_pitch, z_min, z_max, term, asset_cfg,
+                                tilt_noise, joint_noise_std, in_pose_prob, standing_z_min, standing_z_max)
+    if hasattr(term, "request_pose"):
+        term.request_pose(env_ids.long(), pose_id)
+
+
+def _set_cycle_state_with_poses(env, env_ids, pr, pl, base_roll, base_pitch, z_min, z_max, term, asset_cfg,
+                                tilt_noise, joint_noise_std, in_pose_prob, standing_z_min, standing_z_max):
+    num = len(env_ids)
+    dev = env.device
+    side = torch.where(torch.rand(num, device=dev) < 0.5, -1.0, 1.0)
+    if hasattr(term, "request_side"):
+        term.request_side(env_ids.long(), side)
+    in_pose = torch.rand(num, device=dev) < in_pose_prob
+    yaw = torch.rand(num, device=dev) * 2 * np.pi - np.pi
+    roll = side * float(base_roll)
+    pitch = torch.full((num,), float(base_pitch), device=dev)
+    if tilt_noise > 0.0:
+        roll = roll + (torch.rand(num, device=dev) * 2 - 1) * tilt_noise
+        pitch = pitch + (torch.rand(num, device=dev) * 2 - 1) * tilt_noise
+    roll = torch.where(in_pose, roll, torch.zeros_like(roll))
+    pitch = torch.where(in_pose, pitch, torch.zeros_like(pitch))
+    cy, sy = torch.cos(yaw * 0.5), torch.sin(yaw * 0.5)
+    cp, sp = torch.cos(pitch * 0.5), torch.sin(pitch * 0.5)
+    cr, sr = torch.cos(roll * 0.5), torch.sin(roll * 0.5)
+    quat = torch.stack([cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
+                        cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy], dim=1)
+    z = torch.rand(num, device=dev) * (z_max - z_min) + z_min
+    z_stand = torch.rand(num, device=dev) * (standing_z_max - standing_z_min) + standing_z_min
+    z = torch.where(in_pose, z, z_stand)
+    env.sim.data.qpos[env_ids, 2] = z
+    env.sim.data.qpos[env_ids, 3:7] = quat
+    env.sim.data.qvel[env_ids, :6] = 0.0
+    asset: Entity = env.scene[asset_cfg.name]
+    servo_ids = _servo_joint_ids(env, asset)
+    cols = torch.tensor([7 + j for j in servo_ids], device=dev, dtype=torch.long)
+    pose = torch.where((side > 0).unsqueeze(1), pr, pl).clone()
+    home = asset.data.default_joint_pos[env_ids.long()][:, servo_ids]
+    pose = torch.where(in_pose.unsqueeze(1), pose, home)
+    if joint_noise_std > 0.0:
+        pose = pose + torch.randn_like(pose) * joint_noise_std
+    env.sim.data.qpos[env_ids.unsqueeze(1).long(), cols.unsqueeze(0)] = pose
+    vcols = torch.tensor([6 + j for j in servo_ids], device=dev, dtype=torch.long)
+    env.sim.data.qvel[env_ids.unsqueeze(1).long(), vcols.unsqueeze(0)] = 0.0
+    if hasattr(term, "set_alpha"):
+        term.set_alpha(env_ids.long(), in_pose.float())
+
+
+def flb_pose_track(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    poses_right: list,
+    poses_left: list,
+    std: float = 0.5,
+    mid_attenuation: float = 0.75,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """fl_pose_track with the flamingo target interpolated over the slewed pose
+    blend u (-1 arabesque, 0 passé, +1 développé), per side."""
+    _, side, alpha = _fl_ctx(env, command_name)
+    u = _flb_pose_u(env, command_name)
+    asset = env.scene[asset_cfg.name]
+    home = _servo_default_joint_pos(env, asset)
+    pr = torch.tensor(poses_right, device=env.device, dtype=home.dtype)   # (3, 14)
+    pl = torch.tensor(poses_left, device=env.device, dtype=home.dtype)
+    P = torch.where((side > 0).view(-1, 1, 1), pr.unsqueeze(0), pl.unsqueeze(0))   # (N, 3, 14)
+    fl_pose = _flb_interp(u, P[:, 0], P[:, 1], P[:, 2])
+    a = alpha.unsqueeze(1)
+    target = (1.0 - a) * home + a * fl_pose
+    q = torch.nan_to_num(_servo_joint_pos(env, asset), nan=0.0)
+    match = torch.exp(-((q - target) / std) ** 2).mean(dim=-1)
+    factor = 1.0 - mid_attenuation * 4.0 * alpha * (1.0 - alpha)
+    return match * factor
+
+
+def flb_swing_foot_clear(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    left_cfg: SceneEntityCfg,
+    right_cfg: SceneEntityCfg,
+    sensor_name: str,
+    targets: tuple = (0.05, 0.10, 0.08),
+    std: float = 0.06,
+    lo: float = 0.6,
+    hi: float = 1.0,
+) -> torch.Tensor:
+    """fl_swing_foot_clear with a per-pose height target (arabesque, passé, développé) blended over u."""
+    _, side, alpha = _fl_ctx(env, command_name)
+    u = _flb_pose_u(env, command_name)
+    t = torch.tensor(targets, device=env.device, dtype=torch.float32)
+    target = _flb_interp(u, t[0].expand_as(u), t[1].expand_as(u), t[2].expand_as(u))
+    _, left, right = _fl_site_xyz(env, left_cfg, right_cfg)
+    swing = torch.where((side > 0).unsqueeze(1), left, right)
+    z = swing[:, 2] - env.scene.terrain.env_origins[:, 2]
+    reward = torch.exp(-((z - target) / std) ** 2)
+    stance_found, _ = _fl_feet_found(env, sensor_name, side)
+    return reward * stance_found * _smoothstep(alpha, lo, hi)
