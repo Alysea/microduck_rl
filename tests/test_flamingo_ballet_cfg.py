@@ -172,3 +172,11 @@ def test_flb_swing_clear_target_follows_the_pose(monkeypatch):
     env2 = _env(cmd, torch.ones(3), u, torch.zeros(3, 14), [0.10, 0.10, 0.10], [0.0] * 3, found)
     r2 = microduck_mdp.flb_swing_foot_clear(env2, "twist", _site("left"), _site("right"), "feet", targets=fb.CLEAR_TARGETS, std=0.06)
     assert r2[1] > 0.999 and r2[0] < 0.6 and r2[2] < 0.95
+
+
+def test_ballet_curricula_are_gentler():
+    cfg = make_microduck_flamingo_ballet_env_cfg()
+    ip = cfg.curriculum["in_pose_prob"].params["param_stages"]
+    assert [s["params"]["in_pose_prob"] for s in ip] == [0.6, 0.5, 0.4, 0.3]
+    ps = cfg.curriculum["push_magnitude"].params["push_stages"]
+    assert ps[-1]["velocity_range"]["x"][1] == 0.15 and ps[-1]["step"] == 1200 * 24

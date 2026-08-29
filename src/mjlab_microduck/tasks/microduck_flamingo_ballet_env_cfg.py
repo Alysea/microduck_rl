@@ -23,6 +23,7 @@ from mjlab.managers import EventTermCfg, RewardTermCfg
 
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_flamingo_cycle_env_cfg import (
+    NUM_STEPS_PER_ENV,
     FLAMINGO_POSE_LEFT,
     FLAMINGO_POSE_RIGHT,
     MicroduckFlamingoCycleRlCfg,
@@ -80,6 +81,21 @@ def make_microduck_flamingo_ballet_env_cfg(play: bool = False, hard: bool = Fals
         params={**params, "poses_right": POSES_RIGHT, "poses_left": POSES_LEFT, "pose_probs": POSE_PROBS},
     )
     cfg.curriculum["in_pose_prob"].params["event_name"] = "set_flamingo_ballet_state"
+    # Gentler pacing than the cycle runs (both cycle runs stepped DOWN in reward /
+    # episode length at the in-pose 0.4 → 0.3 step and at the 0.25 m/s push stage):
+    # three poses to learn → slower spawn-mix ramp, later pushes, no 0.25 stage.
+    cfg.curriculum["in_pose_prob"].params["param_stages"] = [
+        {"step": 0,                                   "params": {"in_pose_prob": 0.6}},
+        {"step": 700 * NUM_STEPS_PER_ENV,             "params": {"in_pose_prob": 0.5}},
+        {"step": 1400 * NUM_STEPS_PER_ENV,            "params": {"in_pose_prob": 0.4}},
+        {"step": 2100 * NUM_STEPS_PER_ENV,            "params": {"in_pose_prob": 0.3}},
+    ]
+    if not hard:
+        cfg.curriculum["push_magnitude"].params["push_stages"] = [
+            {"step": 0,                               "velocity_range": {"x": (0.0, 0.0),    "y": (0.0, 0.0)}},
+            {"step": 600 * NUM_STEPS_PER_ENV,         "velocity_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}},
+            {"step": 1200 * NUM_STEPS_PER_ENV,        "velocity_range": {"x": (-0.15, 0.15), "y": (-0.15, 0.15)}},
+        ]
     return cfg
 
 
