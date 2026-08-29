@@ -9,7 +9,8 @@ publish under their own namespace; the Hub tag `microduck-policy` is the registr
 ├── policy.onnx                       # obs[1,61] f32 → actions[1,14] f32, obs normalizer baked in
 ├── manifest.json                     # schema below — what the policy is, what it reads, where it came from
 ├── README.md                         # model card (front-matter tags + the sections below)
-└── media/preview.mp4                 # optional, one short sim clip
+├── media/preview.mp4                 # optional, one short sim clip
+└── control.py                        # optional: one-file driver for a physical duck over robotd's IPC (see below)
 ```
 
 Publish with `scripts/publish_policy.py` — it validates the ONNX against the daemon contract,
@@ -96,10 +97,47 @@ uv run scripts/publish_policy.py publish /path/to/policy.onnx \
 The script refuses to publish an ONNX that fails the contract, and it never uploads anything
 but `policy.onnx`, `manifest.json`, `README.md` and `media/*`.
 
+## In sim
+
+`scripts/infer_policy.py` is the keyboard driver (`--walking`, `--standing`, `--sitstand`, `--flamingo`, …);
+a policy with a new command scheme gets a mode there (a few lines: session, command-block encoding, a key).
+Headless timelines / pushes / videos: the training workspace's `notes/tools/duck_rollout.py`.
+
 ## On the robot
 
 The daemon does not read the manifest yet: point a `[policy]` role in `deploy/robotd.toml` at the
 downloaded `policy.onnx` (absolute path) and restart `robotd`. The `[policy]` roles are what the
 daemon knows how to drive (walk, stand, sitstand, ground_pick, kicks, roulade …); a policy with a
-new command scheme needs a matching role in the daemon. The updater's planned `model` component
-(`microduck/policies/README.md`) is meant to install exactly these repos.
+new command scheme eventually needs a matching role in the daemon. The updater's planned `model`
+component (`microduck/policies/README.md`) is meant to install exactly these repos.
+
+**Testing a twist-driven policy without touching the daemon.** `robot.move {vx, vy, vyaw}` is written
+verbatim into the network's twist slots (only an EMA and a 500 ms deadman in between, no magnitude
+clamp), and `stand = "none"` removes the "twist ≤ 0.05 → standing network" switch. So a policy whose
+command lives in the twist slots can run under the `walk` role:
+
+```toml
+[control]
+cmd_alpha = 1.0            # pass the flag through unsmoothed (default 0.2 = a 0.4 s ramp through fractional values)
+
+[policy]
+walk = "/home/radxa/policies/flamingo/policy.onnx"
+stand = "none"             # no "twist ≤ 0.05 → standing network" diversion
+sitstand = "none"          # no skill may take the command block over
+ground_pick = "none"
+kick_left = "none"
+kick_right = "none"
+roulade = "none"
+
+[safety]
+# limp_fall stays on: its sequence holds the twist at zero, which for a posture policy is "stand".
+# But its "already tilted" gate is gravity-z −0.90 (≈ 26°) and a one-foot hold leans ≈ 24°: widen it
+# so a wobble in the hold is not mistaken for a fall.
+limp_fall_tilt_z = -0.80   # ≈ 37°
+```
+
+then drive it with the repo's optional `control.py` (JSON-RPC over `/run/robotd.sock`, forwarded to a
+laptop with `ssh -L /tmp/robotd.sock:/run/robotd.sock radxa@<robot>`). A `control.py` must: take
+`--socket`, send `robot.enable {on: true}`, resend its command faster than the deadman (10 Hz), and put
+the robot back into the policy's idle command for a couple of seconds before exiting. It is a test aid,
+not a product: no pad, no supervision beyond what `robot.state` reports.

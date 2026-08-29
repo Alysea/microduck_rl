@@ -153,6 +153,11 @@ def cmd_publish(a):
     files = [(onnx, "policy.onnx"), (out / "manifest.json", "manifest.json"), (out / "README.md", "README.md")]
     if media:
         files.append((media, "media/preview" + media.suffix))
+    for extra in a.extra or []:
+        ep = Path(extra).expanduser().resolve()
+        if ep.suffix not in (".py", ".md", ".json", ".toml", ".txt"):
+            raise SystemExit(f"--extra {ep.name}: only small text files (.py/.md/.json/.toml/.txt) belong in a policy repo")
+        files.append((ep, ep.name))
     print(f"\nrepo: https://huggingface.co/{repo_id} ({'public' if a.public else 'private'})")
     for local, remote in files:
         print(f"  {remote:22s} <- {local}")
@@ -191,6 +196,7 @@ def main():
     p.add_argument("--namespace", required=True); p.add_argument("--manifest", required=True, help="json with the user-provided manifest fields")
     p.add_argument("--card-extra", default=None, help="markdown: What it does / Command notes / Known limits / Try it sections")
     p.add_argument("--media", default=None, help="mp4/gif uploaded as media/preview.<ext>")
+    p.add_argument("--extra", action="append", default=None, help="optional small text file uploaded at its basename, e.g. control.py (repeatable)")
     p.add_argument("--public", action="store_true"); p.add_argument("--dry-run", action="store_true")
     p.add_argument("--build-dir", default=None, help="where manifest.json/README.md are written (default next to the onnx)")
     p.set_defaults(fn=cmd_publish)
