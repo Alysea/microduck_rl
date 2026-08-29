@@ -337,3 +337,13 @@ def test_command_alpha_slews_at_ramp_rate():
     delta = term.vel_command_b[:, 0] - term._alpha
     term._alpha += torch.clamp(delta, -step, step)
     assert abs(term._alpha[0].item() - step) < 1e-7 and abs(term._alpha[1].item() - (1 - step)) < 1e-7
+
+
+def test_hard_variant_adds_the_025_push_stage():
+    soft = make_microduck_flamingo_cycle_env_cfg()
+    hard = make_microduck_flamingo_cycle_env_cfg(hard=True)
+    ss = soft.curriculum["push_magnitude"].params["push_stages"]
+    hs = hard.curriculum["push_magnitude"].params["push_stages"]
+    assert len(hs) == len(ss) + 1 and hs[-1]["velocity_range"]["x"][1] == fc.HARD_PUSH == 0.25
+    assert hs[-1]["step"] > hs[-2]["step"]
+    assert soft.rewards.keys() == hard.rewards.keys()

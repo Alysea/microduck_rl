@@ -137,6 +137,13 @@ register_mjlab_task(
     rl_cfg=MicroduckFlamingoCycleRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+register_mjlab_task(
+    task_id="Mjlab-FlamingoCycleHard-Flat-MicroDuck",
+    env_cfg=make_microduck_flamingo_cycle_env_cfg(hard=True),
+    play_env_cfg=make_microduck_flamingo_cycle_env_cfg(play=True, hard=True),
+    rl_cfg=MicroduckFlamingoCycleRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 register_mjlab_task(
     task_id="Mjlab-StandUp-Rough-MicroDuck",

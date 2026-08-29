@@ -71,6 +71,8 @@ SWING_CLEAR_TARGET_Z = 0.10
 SWING_CLEAR_STD = 0.06
 MAX_PUSH = 0.15          # m/s, final push stage (0.25 broke stage 1, see curricula)
 MAX_ACTION_RATE_W = -0.5
+HARD_PUSH = 0.25         # hard variant: extra push stage
+HARD_PUSH_IT = 1400
 
 
 def mirror_pose(pose: list) -> list:
@@ -91,7 +93,10 @@ FLAMINGO_GRAVITY_RIGHT = tuple(FLAMINGO_GRAVITY_B)
 FLAMINGO_GRAVITY_LEFT = (FLAMINGO_GRAVITY_B[0], -FLAMINGO_GRAVITY_B[1], FLAMINGO_GRAVITY_B[2])
 
 
-def make_microduck_flamingo_cycle_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+def make_microduck_flamingo_cycle_env_cfg(play: bool = False, hard: bool = False) -> ManagerBasedRlEnvCfg:
+    """``hard``: run-2 variant — pushes ramp on to HARD_PUSH m/s at HARD_PUSH_IT
+    (run 1 topped out at 0.15 and fell, rather than stepping down, for pushes
+    ≥ 0.18 m/s backward / toward the stance side in the CPU stress test)."""
     cfg = make_microduck_flamingo_env_cfg(play=play)
     cfg.episode_length_s = EPISODE_LENGTH_S
 
@@ -191,7 +196,7 @@ def make_microduck_flamingo_cycle_env_cfg(play: bool = False) -> ManagerBasedRlE
         {"step": 0,                         "velocity_range": {"x": (0.0, 0.0),    "y": (0.0, 0.0)}},
         {"step": 500 * NUM_STEPS_PER_ENV,   "velocity_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}},
         {"step": 1000 * NUM_STEPS_PER_ENV,  "velocity_range": {"x": (-MAX_PUSH, MAX_PUSH), "y": (-MAX_PUSH, MAX_PUSH)}},
-    ]
+    ] + ([{"step": HARD_PUSH_IT * NUM_STEPS_PER_ENV, "velocity_range": {"x": (-HARD_PUSH, HARD_PUSH), "y": (-HARD_PUSH, HARD_PUSH)}}] if hard else [])
     cfg.curriculum["action_rate_weight"].params["weight_stages"] = [
         {"step": 0,                         "weight": -0.1},
         {"step": 600 * NUM_STEPS_PER_ENV,   "weight": MAX_ACTION_RATE_W},
