@@ -42,6 +42,9 @@ uv run scripts/export.py Mjlab-Velocity-Flat-MicroDuck --wandb-run-path <...>
 
 # drive the exported policy in CPU MuJoCo with the keyboard
 uv run scripts/infer_policy.py --walking output.onnx
+
+# share a policy on the Hub (validates the daemon contract, writes manifest + model card)
+uv run scripts/publish_policy.py publish output.onnx --name my-trick --namespace <you> --manifest manifest.json --public   # docs/sharing-policies.md
 ```
 
 Resume from a checkpoint:
