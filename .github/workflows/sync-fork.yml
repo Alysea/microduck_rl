@@ -14,11 +14,14 @@ jobs:
     runs-on: ubuntu-latest
     if: github.repository != 'pollen-robotics/microduck_rl'
     steps:
-      - name: Sync default branch from upstream
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+      - name: Merge upstream/develop into fork
         run: |
-          gh repo sync "${{ github.repository }}" \
-            --source "pollen-robotics/microduck_rl" \
-            --branch "develop" \
-            --force
+          git remote add upstream "https://github.com/pollen-robotics/microduck_rl.git"
+          git fetch upstream develop
+          git -c user.name="fork-sync-bot" -c user.email="actions@users.noreply.github.com" \
+            merge --no-edit -m "Merge upstream/develop into fork (scheduled sync)" upstream/develop
+          git push origin "HEAD:develop"
