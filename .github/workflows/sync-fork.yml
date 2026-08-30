@@ -1,0 +1,24 @@
+name: Sync fork from upstream
+
+on:
+  schedule:
+    # Runs daily; GitHub may delay this by a few minutes under load.
+    - cron: "17 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.repository != 'pollen-robotics/microduck_rl'
+    steps:
+      - name: Sync default branch from upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh repo sync "${{ github.repository }}" \
+            --source "pollen-robotics/microduck_rl" \
+            --branch "develop" \
+            --force
