@@ -204,6 +204,16 @@ uv run publish --onnx output.onnx --repo <user>/microduck-flamingo \
 # A new gait for a slot
 uv run publish --onnx output.onnx --repo <user>/microduck-my-walk --kind perpetual --slot walk
 
+# Ship a rollout video too: uploaded as replay.mp4, which the Hub's replay widget plays
+uv run scripts/render_policy.py output.onnx --seconds 10 --video media/bow.mp4
+uv run publish --onnx output.onnx --repo <user>/microduck-bow --kind episodic --duration-s 4.0 \
+    --video media/bow.mp4
+
+# A remix (warm-started / fine-tuned from someone's published policy): name the parent so the
+# model card sets `base_model` and the Hub links the two
+uv run publish --onnx output.onnx --repo <user>/microduck-deep-bow --kind episodic --duration-s 5.0 \
+    --base-model <owner>/microduck-polite-bow
+
 # See what would be uploaded without touching the Hub
 uv run publish --onnx output.onnx --repo <user>/microduck-bow --kind episodic --duration-s 4.0 --dry-run
 ```
