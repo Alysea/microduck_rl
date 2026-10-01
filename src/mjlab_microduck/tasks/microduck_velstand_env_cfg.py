@@ -326,6 +326,23 @@ BODY_POSE_STD = {
     r".*ankle.*": 0.3,
 }
 
+# Yaw dead zone fix (2026-10-01). Robot: "still very bad at turning". j4i6yoq2@1250
+# in sim: in-place 0.3 / 0.6 rad/s → 0.00 / 0.07, 1.0 → 0.45. Counterfactual (same
+# policy fed a bigger yaw cmd so it steps + turns, reward at the TRUE cmd): standing
+# still WAS the reward optimum at 0.3 (8.52 vs 8.28) and turning won by only 4 % at
+# 0.6 — yaw std 0.71 makes ignoring 0.3 rad/s cost 16 %, and mjlab's term mixes the
+# roll/pitch rates that stepping creates into the yaw error. Fixes:
+#   - yaw-only sharp std (roll/pitch part keeps the old 0.71): turning at 0.6 now wins
+#     +0.79/step (was +0.33); zero command unchanged; straight-line yaw drift now priced;
+#   - turn-in-place bucket samples |wz| from 0.1 (was 0.4: in-place yaw < 0.4 never trained);
+#   - turn-in-place frames off the walk anchor (alpha_walking has this exact dead zone;
+#     coef-1.0 BC is why every earlier velstand yaw fix moved nothing).
+ENABLE_YAW_FIX = True
+TRACK_YAW_STD = 0.35
+TRACK_XY_RATE_STD = math.sqrt(0.5)       # = the old track_angular_velocity std
+TURN_IN_PLACE_FRACTION_VELSTAND = 0.2    # velocity recipe: 0.15
+TURN_IN_PLACE_MIN_FRAC = 0.1             # velocity recipe: 0.4
+
 # Run-1 fix (1): smoothness taxes scaled down while fallen so get-up attempts
 # are affordable; full weight while upright (the walk's smoothness is untouched).
 FALLEN_SMOOTHNESS_SCALE = 0.1
@@ -485,6 +502,16 @@ def make_microduck_velstand_env_cfg(play: bool = False, rough: bool = False) -> 
 
     if ENABLE_BODY_CONTROL:
         _add_body_control(cfg, play)
+    if ENABLE_YAW_FIX:
+        tw = cfg.commands["twist"]
+        tw.rel_turn_in_place_envs = TURN_IN_PLACE_FRACTION_VELSTAND
+        tw.turn_in_place_min_frac = TURN_IN_PLACE_MIN_FRAC
+        ang = cfg.rewards["track_angular_velocity"]
+        cfg.rewards["track_angular_velocity"] = RewardTermCfg(
+            func=microduck_mdp.track_angular_velocity_yaw_sharp,
+            weight=ang.weight,
+            params={"std_yaw": TRACK_YAW_STD, "std_xy": TRACK_XY_RATE_STD, "command_name": ang.params["command_name"]},
+        )
 
     # True full-collision model: the robot can lie on / push off any part, and
     # the servo housings are named so the impact sensor below can single them
@@ -832,6 +859,7 @@ MicroduckVelStandRlCfg = RslRlOnPolicyRunnerCfg(
         bc_cfg={
             **default_bc_cfg(), "coef": EXPERT_BC_COEF, "gate_tilt_deg": EXPERT_BC_GATE_TILT_DEG,
             **({"body_slice": (55, 61)} if ENABLE_BODY_CONTROL else {}),
+            **({"unanchor_turn_in_place": True} if ENABLE_YAW_FIX else {}),
         } if ENABLE_EXPERT_BC else None,
     ),
     wandb_project="mjlab_microduck",

@@ -4728,7 +4728,8 @@ class VelocityCommandCommandOnly(UniformVelocityCommand):
         maxr = max(abs(lo), abs(hi))
         rr = torch.empty(len(turn_ids), device=self.device)
         sign = torch.where(rr.uniform_(0.0, 1.0) < 0.5, -1.0, 1.0)
-        mag = torch.empty(len(turn_ids), device=self.device).uniform_(0.4 * maxr, maxr)
+        lo_frac = getattr(self.cfg, "turn_in_place_min_frac", 0.4)
+        mag = torch.empty(len(turn_ids), device=self.device).uniform_(lo_frac * maxr, maxr)
         self.vel_command_b[turn_ids, 2] = sign * mag
         # These envs must actually turn — un-mark them as standing (which would
         # zero the command) and refresh the world-frame reference copy.
@@ -4771,6 +4772,10 @@ class VelocityCommandCommandOnlyCfg(UniformVelocityCommandCfg):
     # Fraction of envs commanded to turn in place (lin=0, |ang| forced to
     # [0.4·max, max]) each resample. 0 = disabled (base uniform sampling only).
     rel_turn_in_place_envs: float = 0.0
+    # Lower bound of the forced turn-in-place |wz|, as a fraction of the range max.
+    # 0.4 (historical) means in-place yaw below 0.4 rad/s is never trained (standing
+    # envs zero the whole command; uniform sampling never gives lin == 0).
+    turn_in_place_min_frac: float = 0.4
 
     def build(self, env: ManagerBasedRlEnv) -> "VelocityCommandCommandOnly":
         return VelocityCommandCommandOnly(self, env)
@@ -5410,6 +5415,30 @@ class variable_posture_body_relaxed(_variable_posture):
                + self.std_running * running.float().unsqueeze(1))
         err2 = torch.square(asset.data.joint_pos[:, asset_cfg.joint_ids] - self.default_joint_pos[:, asset_cfg.joint_ids])
         return torch.exp(-torch.mean(err2 / (std ** 2), dim=1))
+
+
+def track_angular_velocity_yaw_sharp(
+    env: ManagerBasedRlEnv,
+    std_yaw: float,
+    std_xy: float,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """mjlab ``track_angular_velocity`` with SEPARATE stds for the yaw error and the
+    roll/pitch-rate term: exp(-((wz_cmd - wz)²/std_yaw² + |w_xy|²/std_xy²)).
+
+    Why (velstand yaw dead zone, measured 2026-10-01 by counterfactual: the same policy
+    fed a bigger yaw command so it really steps and turns, reward scored at the true
+    command): at std 0.71 for both, ignoring a 0.3 rad/s command costs 16 % of the term
+    and turning in place at 0.6 rad/s gained 0.04/step on this term, because stepping
+    rocks the trunk and the xy part takes the gain back. Standing still was the reward
+    optimum at 0.3 (8.52 vs 8.28 total). Sharpening yaw ONLY keeps the walking
+    roll/pitch pressure exactly as before (std_xy = the old std)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    w = asset.data.root_link_ang_vel_b
+    err = torch.square(cmd[:, 2] - w[:, 2]) / std_yaw**2 + torch.sum(torch.square(w[:, :2]), dim=1) / std_xy**2
+    return torch.exp(-err)
 
 
 def upright_body_cmd_relative(

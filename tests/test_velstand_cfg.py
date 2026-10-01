@@ -445,3 +445,24 @@ def test_body_control_wired():
     assert cfg.rewards["pose"].func.__name__ == "variable_posture_body_relaxed"
     bc = vs.MicroduckVelStandRlCfg.algorithm.bc_cfg
     assert tuple(bc["body_slice"]) == (55, 61) and tuple(bc["body_no_teacher_axes"]) == (2,)
+
+
+def test_turn_in_place_mask():
+    from mjlab_microduck.tasks.distill import turn_in_place_mask
+    obs = torch.zeros(4, 61)
+    obs[0, 50] = 0.3                   # turn in place → unanchored
+    obs[1, 48] = 0.2; obs[1, 50] = 0.6  # walking + turning → stays anchored
+    obs[2, 48] = 0.2                   # walking straight
+    assert turn_in_place_mask(obs, (48, 51)).tolist() == [True, False, False, False]
+
+
+def test_yaw_fix_wired():
+    if not vs.ENABLE_YAW_FIX:
+        return
+    cfg = vs.make_microduck_velstand_env_cfg()
+    r = cfg.rewards["track_angular_velocity"]
+    assert r.func.__name__ == "track_angular_velocity_yaw_sharp" and r.weight == 2.0
+    assert r.params["std_yaw"] < r.params["std_xy"] and math.isclose(r.params["std_xy"], math.sqrt(0.5))
+    tw = cfg.commands["twist"]
+    assert tw.turn_in_place_min_frac == vs.TURN_IN_PLACE_MIN_FRAC and tw.rel_turn_in_place_envs == vs.TURN_IN_PLACE_FRACTION_VELSTAND
+    assert vs.MicroduckVelStandRlCfg.algorithm.bc_cfg["unanchor_turn_in_place"] is True
