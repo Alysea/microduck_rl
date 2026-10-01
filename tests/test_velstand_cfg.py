@@ -460,9 +460,12 @@ def test_yaw_fix_wired():
     if not vs.ENABLE_YAW_FIX:
         return
     cfg = vs.make_microduck_velstand_env_cfg()
-    r = cfg.rewards["track_angular_velocity"]
-    assert r.func.__name__ == "track_angular_velocity_yaw_sharp" and r.weight == 2.0
-    assert r.params["std_yaw"] < r.params["std_xy"] and math.isclose(r.params["std_xy"], math.sqrt(0.5))
+    # stock term untouched (its far-error gradient is what run sape62zb lost), fine term added
+    base = make_microduck_velocity_env_cfg()
+    assert cfg.rewards["track_angular_velocity"].func is base.rewards["track_angular_velocity"].func
+    assert cfg.rewards["track_angular_velocity"].params["std"] == base.rewards["track_angular_velocity"].params["std"]
+    f = cfg.rewards["track_yaw_fine"]
+    assert f.func.__name__ == "track_yaw_rate_fine" and f.weight > 0 and f.params["std"] < base.rewards["track_angular_velocity"].params["std"]
     tw = cfg.commands["twist"]
     assert tw.turn_in_place_min_frac == vs.TURN_IN_PLACE_MIN_FRAC and tw.rel_turn_in_place_envs == vs.TURN_IN_PLACE_FRACTION_VELSTAND
     assert vs.MicroduckVelStandRlCfg.algorithm.bc_cfg["unanchor_turn_in_place"] is True

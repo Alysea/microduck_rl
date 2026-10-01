@@ -5417,28 +5417,26 @@ class variable_posture_body_relaxed(_variable_posture):
         return torch.exp(-torch.mean(err2 / (std ** 2), dim=1))
 
 
-def track_angular_velocity_yaw_sharp(
+def track_yaw_rate_fine(
     env: ManagerBasedRlEnv,
-    std_yaw: float,
-    std_xy: float,
+    std: float,
     command_name: str,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """mjlab ``track_angular_velocity`` with SEPARATE stds for the yaw error and the
-    roll/pitch-rate term: exp(-((wz_cmd - wz)²/std_yaw² + |w_xy|²/std_xy²)).
+    """Yaw-rate-only Gaussian, exp(-(wz_cmd - wz)²/std²), ADDED next to the stock
+    track_angular_velocity (which stays as is).
 
-    Why (velstand yaw dead zone, measured 2026-10-01 by counterfactual: the same policy
-    fed a bigger yaw command so it really steps and turns, reward scored at the true
-    command): at std 0.71 for both, ignoring a 0.3 rad/s command costs 16 % of the term
-    and turning in place at 0.6 rad/s gained 0.04/step on this term, because stepping
-    rocks the trunk and the xy part takes the gain back. Standing still was the reward
-    optimum at 0.3 (8.52 vs 8.28 total). Sharpening yaw ONLY keeps the walking
-    roll/pitch pressure exactly as before (std_xy = the old std)."""
+    Why (velstand yaw dead zone, 2026-10-01): counterfactual scoring (policy fed a bigger
+    yaw command so it really steps + turns, reward at the true command) showed turning in
+    place barely beat standing still (+0.33/step at 0.6 rad/s) — the stock term's std
+    0.71 is loose at small errors and it folds the roll/pitch rates that stepping creates
+    into the yaw error. REPLACING it with a sharp yaw term (run sape62zb) made turning
+    WORSE (1.0 rad/s: 0.42 → 0.16): a std-0.35 Gaussian has ~no gradient at the policy's
+    0.6 rad/s error. Adding a fine term keeps the stock term's far-error gradient and
+    prices small errors: margin at 0.6 rad/s +0.33 → +0.97, at 1.0 +0.62 → +1.05."""
     asset: Entity = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_command(command_name)
-    w = asset.data.root_link_ang_vel_b
-    err = torch.square(cmd[:, 2] - w[:, 2]) / std_yaw**2 + torch.sum(torch.square(w[:, :2]), dim=1) / std_xy**2
-    return torch.exp(-err)
+    return torch.exp(-torch.square(cmd[:, 2] - asset.data.root_link_ang_vel_b[:, 2]) / std**2)
 
 
 def upright_body_cmd_relative(
