@@ -120,7 +120,11 @@ def test_warm_start_collapses_inherited_curricula_only():
         pytest.skip("warm start disabled")
     base = make_microduck_velocity_env_cfg()
     cfg = vs.make_microduck_velstand_env_cfg()
+    # body_pose_range is REPLACED by velstand's own body-control ramp (ENABLE_BODY_CONTROL)
+    replaced = {"body_pose_range"} if vs.ENABLE_BODY_CONTROL else set()
     for name, term in base.curriculum.items():
+        if name in replaced:
+            continue
         for key, val in cfg.curriculum[name].params.items():
             if key.endswith("_stages"):
                 assert len(val) == 1 and val[0]["step"] == 0, (name, key)
@@ -406,3 +410,38 @@ def test_prone_spawn_adds_terrain_origin_z():
     z = env.sim.data.qpos[:, 2]
     assert torch.allclose(z, torch.tensor([0.07, 0.37, 0.19, 0.12]), atol=1e-6)
     assert (torch.rad2deg(torch.acos((1 - 2 * (env.sim.data.qpos[:, 4] ** 2 + env.sim.data.qpos[:, 5] ** 2)).clamp(-1, 1))) > 89).all()
+
+
+def test_body_frame_masks():
+    """Standing + tilt-only → stand expert; standing + z → off-anchor, no teacher; walking or zero body → untouched."""
+    from mjlab_microduck.tasks.distill import body_frame_masks
+    obs = torch.zeros(5, 61)
+    obs[0, 55 + 3] = 0.1                       # standing, roll only → teach
+    obs[1, 55 + 2] = -0.02; obs[1, 55 + 4] = 0.1  # standing, z + pitch → free
+    obs[2, 48] = 0.3; obs[2, 55 + 3] = 0.1     # walking with a (stale) body value → untouched
+    obs[3, 55 + 0] = 0.002                     # standing, x/y alive noise only → untouched (stays anchored)
+    frames, teach = body_frame_masks(obs, (48, 51), (55, 61), (2, 3, 4), (2,))
+    assert frames.tolist() == [True, True, False, False, False]
+    assert teach.tolist() == [True, False, False, False, False]
+
+
+def test_body_control_wired():
+    if not vs.ENABLE_BODY_CONTROL:
+        return
+    cfg = vs.make_microduck_velstand_env_cfg()
+    cmds = list(cfg.commands)
+    assert cmds.index("twist") < cmds.index("body_pose")  # gate reads the twist term computed this step
+    b = cfg.commands["body_pose"]
+    assert type(b).__name__ == "StandingGatedPoseCommandCfg" and b.zero_command_prob == vs.BODY_ZERO_CMD_PROB
+    assert len(b.ranges) == 6 and b.axis_zero_prob[2] == vs.BODY_Z_ZERO_PROB
+    # final stage covers the full range; x/y/yaw stay inside alpha_stand's normalizer comfort zone
+    final = cfg.curriculum["body_pose_range"].params["range_stages"][-1]["ranges"]
+    assert final[3][1] == pytest.approx(vs.BODY_CMD_MAX_ANGLE) and final[2] == pytest.approx(vs.BODY_CMD_Z_RANGE)
+    assert abs(final[0][1]) <= 0.005 and abs(final[5][1]) <= 0.05
+    r = cfg.rewards["body_pose_tracking"]
+    assert r.weight > 0 and r.params["standing_gate_command_name"] == "twist"
+    assert r.params["axis_weights"] == (0.0, 0.0, 1.0, 1.0, 1.0, 0.0) and r.params["nominal_height"] == vs.BODY_NOMINAL_Z
+    assert cfg.rewards["upright"].func.__name__ == "upright_body_cmd_relative" and cfg.rewards["upright"].weight == 2.0
+    assert cfg.rewards["pose"].func.__name__ == "variable_posture_body_relaxed"
+    bc = vs.MicroduckVelStandRlCfg.algorithm.bc_cfg
+    assert tuple(bc["body_slice"]) == (55, 61) and tuple(bc["body_no_teacher_axes"]) == (2,)

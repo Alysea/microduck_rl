@@ -16,9 +16,9 @@ from mjlab.entity import Entity
 from mjlab.tasks.velocity.mdp.velocity_command import UniformVelocityCommand, UniformVelocityCommandCfg
 from mjlab.tasks.velocity.mdp import observations as _velocity_obs
 from mjlab.managers.command_manager import CommandTerm
-from mjlab.managers import CommandTermCfg
+from mjlab.managers import CommandTermCfg, RewardTermCfg
 from mjlab.managers.event_manager import requires_model_fields
-from mjlab.utils.lab_api.math import matrix_from_quat, wrap_to_pi, quat_apply, quat_from_angle_axis
+from mjlab.utils.lab_api.math import matrix_from_quat, wrap_to_pi, quat_apply, quat_apply_inverse, quat_from_angle_axis
 from rsl_rl.algorithms.ppo import PPO as _PPO
 
 # ---------------------------------------------------------------------------
@@ -5315,6 +5315,126 @@ class UniformPoseCommandCfg(CommandTermCfg):
         return UniformPoseCommand(self, env)
 
 
+class StandingGatedPoseCommand(UniformPoseCommand):
+    """UniformPoseCommand that is only ACTIVE while the twist command is standing.
+
+    Body control is a standing feature at deployment: while walking the runtime
+    sends a zero body command. Sampled values live in ``_raw``; the exposed command
+    is ``_raw × is_standing_env`` of the twist term, re-applied every step (the twist
+    term can flip an env between standing and walking at its own resample). Requires
+    the twist command to be registered BEFORE this one (CommandManager computes in
+    insertion order; the base velocity cfg inserts twist first).
+
+    ``axis_zero_prob[i]``: per-axis probability that a resample zeroes that axis —
+    on top of ``zero_command_prob`` (all-zero). VelStand uses it so that a share of
+    tilt commands carries z == 0 (those frames are taught by the stand expert, which
+    cannot crouch; see distill.py body routing).
+    """
+
+    cfg: "StandingGatedPoseCommandCfg"
+
+    def __init__(self, cfg: "StandingGatedPoseCommandCfg", env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._raw = torch.zeros_like(self._command)
+
+    def _gate(self) -> None:
+        twist = self._env.command_manager.get_term(self.cfg.twist_command_name)
+        standing = getattr(twist, "is_standing_env", None)
+        if standing is None:
+            self._command[:] = 0.0
+        else:
+            self._command[:] = self._raw * standing.float().unsqueeze(1)
+
+    def _update_command(self) -> None:
+        self._gate()
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        n = len(env_ids)
+        if n == 0:
+            return
+        super()._resample_command(env_ids)  # writes self._command[env_ids] (incl. zero bucket)
+        raw = self._command[env_ids].clone()
+        for i, p in enumerate(self.cfg.axis_zero_prob):
+            if p > 0.0:
+                raw[torch.rand(n, device=self.device) < p, i] = 0.0
+        self._raw[env_ids] = raw
+        self._gate()  # resets don't run _update_command: keep the walking-zero invariant
+
+
+@dataclass(kw_only=True)
+class StandingGatedPoseCommandCfg(UniformPoseCommandCfg):
+    twist_command_name: str = "twist"
+    axis_zero_prob: tuple[float, ...] = ()
+
+    def build(self, env: ManagerBasedRlEnv) -> "StandingGatedPoseCommand":
+        return StandingGatedPoseCommand(self, env)
+
+
+from mjlab.tasks.velocity.mdp.rewards import variable_posture as _variable_posture  # noqa: E402
+from mjlab.utils.lab_api.string import resolve_matching_names_values as _resolve_names_values  # noqa: E402
+
+
+class variable_posture_body_relaxed(_variable_posture):
+    """mjlab ``variable_posture`` + a 4th regime: standing envs with an ACTIVE body
+    command (any of ``body_active_axes`` non-zero) use ``std_body``.
+
+    Why (velstand body control, measured 2026-10): the standing stds are tight on
+    purpose (hip_roll 0.05 holds the 5° stance), but a commanded 10° trunk roll IS a
+    hip_roll change — pose fell 0.92 → 0.07/step while alpha_stand tracked it, and a
+    2 cm crouch costs about the whole z-tracking margin. Walking and zero-command
+    standing see exactly the old term."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        asset: Entity = env.scene[cfg.params["asset_cfg"].name]
+        _, joint_names = asset.find_joints(cfg.params["asset_cfg"].joint_names)
+        _, _, std_body = _resolve_names_values(data=cfg.params["std_body"], list_of_strings=joint_names)
+        self.std_body = torch.tensor(std_body, device=env.device, dtype=torch.float32)
+
+    def __call__(self, env, std_standing, std_walking, std_running, asset_cfg, command_name,
+                 walking_threshold: float = 0.5, running_threshold: float = 1.5,
+                 std_body=None, body_command_name: str = "body_pose",
+                 body_active_axes: tuple[int, ...] = (2, 3, 4)) -> torch.Tensor:
+        del std_standing, std_walking, std_running, std_body
+        asset: Entity = env.scene[asset_cfg.name]
+        command = env.command_manager.get_command(command_name)
+        speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+        standing = speed < walking_threshold
+        walking = (speed >= walking_threshold) & (speed < running_threshold)
+        running = speed >= running_threshold
+        body = env.command_manager.get_command(body_command_name)[:, list(body_active_axes)]
+        body_active = standing & (body.abs().amax(dim=1) > 0.0)
+        std = (self.std_standing * (standing & ~body_active).float().unsqueeze(1)
+               + self.std_body * body_active.float().unsqueeze(1)
+               + self.std_walking * walking.float().unsqueeze(1)
+               + self.std_running * running.float().unsqueeze(1))
+        err2 = torch.square(asset.data.joint_pos[:, asset_cfg.joint_ids] - self.default_joint_pos[:, asset_cfg.joint_ids])
+        return torch.exp(-torch.mean(err2 / (std ** 2), dim=1))
+
+
+def upright_body_cmd_relative(
+    env: ManagerBasedRlEnv,
+    std: float,
+    command_name: str = "body_pose",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """mjlab's flat-ground ``upright`` (exp(-|g_b,xy|²/std²)), measured against the
+    COMMANDED roll/pitch instead of level: target g_b = (sin θ, -sin φ·cos θ) for body
+    command roll φ = cmd[3], pitch θ = cmd[4] (ZYX, same convention as
+    body_pose_tracking_locomotion). Identical to ``upright`` at zero command, so the
+    walk and plain standing see exactly the old term; a commanded tilt is no longer
+    taxed by the strongest posture term in the stack (2.0, std²=0.05 → a 10° tilt
+    would cost 0.9/step, about what tracking that tilt pays)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    quat = asset.data.body_link_quat_w[:, asset_cfg.body_ids, :].squeeze(1) if asset_cfg.body_ids else asset.data.root_link_quat_w
+    g_b = quat_apply_inverse(quat, asset.data.gravity_vec_w)
+    cmd = env.command_manager.get_command(command_name)
+    roll, pitch = cmd[:, 3], cmd[:, 4]
+    target = torch.stack([torch.sin(pitch), -torch.sin(roll) * torch.cos(pitch)], dim=1)
+    err = torch.sum(torch.square(g_b[:, :2] - target), dim=1)
+    return torch.exp(-err / std**2)
+
+
 def zero_command_padding(
     env: ManagerBasedRlEnv,
     dim: int,
@@ -5615,6 +5735,7 @@ def body_pose_tracking_locomotion(
     axis_weights: tuple[float, float, float, float, float, float] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
     vel_gate_command_name: str | None = None,
     vel_gate_std: float = 0.1,
+    standing_gate_command_name: str | None = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     feet_cfg: SceneEntityCfg = SceneEntityCfg("robot", site_names=("left_foot", "right_foot")),
 ) -> torch.Tensor:
@@ -5708,6 +5829,12 @@ def body_pose_tracking_locomotion(
         vel_mag = torch.linalg.vector_norm(vel_cmd[:, :2], dim=-1)
         gate = torch.exp(-(vel_mag / vel_gate_std) ** 2)
         reward = reward * gate
+    # Hard standing gate (pairs with StandingGatedPoseCommand): pays only in envs whose
+    # twist command is a standing env — walking and turn-in-place envs get exactly 0,
+    # so body tracking never taxes the gait.
+    if standing_gate_command_name is not None:
+        standing = getattr(env.command_manager.get_term(standing_gate_command_name), "is_standing_env", None)
+        reward = reward * (standing.float() if standing is not None else 0.0)
 
     return reward
 

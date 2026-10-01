@@ -293,6 +293,39 @@ ENABLE_EXPERT_BC = True
 EXPERT_BC_COEF = 1.0
 EXPERT_BC_GATE_TILT_DEG = 35.0
 
+# Body control (2026-10, branch improve_velstand2). The deployed velstand ignores
+# body commands entirely (measured: 0 mm / 0° response — the inherited velocity
+# recipe keeps body_pose at weight 0 with ±5 mm/±0.05 alive ranges, and the walk
+# anchor pins standing to alpha_walking, which never learned it). The old pipeline's
+# alpha_stand tracks roll/pitch (9.2-9.5° for 10°) but not z (+1 cm → +3.7 mm,
+# crouch → 0). So:
+#   - command only while STANDING (StandingGatedPoseCommand: exact zero while
+#     walking = deployment), 30 % all-zero bucket so plain standing stays trained;
+#   - tilt-only frames (z == 0, BODY_Z_ZERO_PROB of them) → stand-expert BC;
+#     z frames → PPO only (alpha_stand cannot crouch); both off the walk anchor
+#     (distill.py body routing — separable: the command is in the obs);
+#   - standing-gated z/roll/pitch tracking reward + upright made command-relative
+#     (identical for walking / zero command).
+ENABLE_BODY_CONTROL = True
+BODY_NOMINAL_Z = 0.116             # measured: standing trunk z on allcollisions (fhathosb 0.1158, alpha_stand 0.1157)
+BODY_CMD_MAX_ANGLE = math.radians(12)   # ≈ alpha_stand's trained range (normalizer std 0.10 rad)
+BODY_CMD_Z_RANGE = (-0.025, 0.010)      # crouch room below HOME, ~1 cm extension above
+BODY_ALIVE_XY = 0.002              # x/y/yaw untracked: tiny ranges inside alpha_stand's normalizer
+BODY_ALIVE_YAW = 0.02
+BODY_ZERO_CMD_PROB = 0.3
+BODY_Z_ZERO_PROB = 0.5             # share of body commands that are tilt-only (→ teachable)
+BODY_TRACK_WEIGHT = 2.0
+BODY_RANGE_STAGES_ITERS = (0, 300)  # half range → full range (warm start: iters of THIS run)
+# Leg pose stds while a body command is active (standing). The standing stds (hip_roll
+# 0.05, knee/hip_pitch 0.15, ankle 0.1) priced a 10° commanded roll at -0.85/step.
+BODY_POSE_STD = {
+    r".*hip_yaw.*": 0.1,
+    r".*hip_roll.*": 0.25,
+    r".*hip_pitch.*": 0.4,
+    r".*knee.*": 0.4,
+    r".*ankle.*": 0.3,
+}
+
 # Run-1 fix (1): smoothness taxes scaled down while fallen so get-up attempts
 # are affordable; full weight while upright (the walk's smoothness is untouched).
 FALLEN_SMOOTHNESS_SCALE = 0.1
@@ -374,6 +407,68 @@ def _collapse_curricula_to_final(cfg: ManagerBasedRlEnvCfg) -> None:
                     cfg.rewards[term.params["reward_name"]].weight = final["weight"]
 
 
+def _body_ranges(frac: float) -> tuple[tuple[float, float], ...]:
+    a = BODY_CMD_MAX_ANGLE * frac
+    return (
+        (-BODY_ALIVE_XY, BODY_ALIVE_XY),
+        (-BODY_ALIVE_XY, BODY_ALIVE_XY),
+        (BODY_CMD_Z_RANGE[0] * frac, BODY_CMD_Z_RANGE[1] * frac),
+        (-a, a),
+        (-a, a),
+        (-BODY_ALIVE_YAW, BODY_ALIVE_YAW),
+    )
+
+
+def _add_body_control(cfg: ManagerBasedRlEnvCfg, play: bool) -> None:
+    """Standing-only body pose control (see ENABLE_BODY_CONTROL). Call AFTER the
+    warm-start collapse: it replaces the inherited body_pose command/curriculum."""
+    old = cfg.commands["body_pose"]
+    cfg.commands["body_pose"] = microduck_mdp.StandingGatedPoseCommandCfg(
+        resampling_time_range=old.resampling_time_range,
+        ranges=_body_ranges(1.0 if play else 0.5),
+        zero_command_prob=BODY_ZERO_CMD_PROB,
+        axis_zero_prob=(0.0, 0.0, BODY_Z_ZERO_PROB, 0.0, 0.0, 0.0),
+        twist_command_name="twist",
+    )
+    assert list(cfg.commands).index("twist") < list(cfg.commands).index("body_pose"), "twist must be computed first"
+    cfg.curriculum.pop("body_pose_range", None)
+    if not play:
+        cfg.curriculum["body_pose_range"] = CurriculumTermCfg(
+            func=microduck_mdp.pose_command_range_curriculum,
+            params={
+                "command_name": "body_pose",
+                "range_stages": [
+                    {"step": it * NUM_STEPS_PER_ENV, "ranges": _body_ranges(f)}
+                    for it, f in zip(BODY_RANGE_STAGES_ITERS, (0.5, 1.0))
+                ],
+            },
+        )
+    cfg.rewards["body_pose_tracking"] = RewardTermCfg(
+        func=microduck_mdp.body_pose_tracking_locomotion,
+        weight=BODY_TRACK_WEIGHT,
+        params={
+            "command_name": "body_pose",
+            "nominal_height": BODY_NOMINAL_Z,
+            "z_std": 0.01,
+            "angle_std": math.radians(5),
+            "axis_weights": (0.0, 0.0, 1.0, 1.0, 1.0, 0.0),
+            "standing_gate_command_name": "twist",
+        },
+    )
+    pose = cfg.rewards["pose"]
+    cfg.rewards["pose"] = RewardTermCfg(
+        func=microduck_mdp.variable_posture_body_relaxed,
+        weight=pose.weight,
+        params={**pose.params, "std_body": BODY_POSE_STD, "body_command_name": "body_pose"},
+    )
+    up = cfg.rewards["upright"]
+    cfg.rewards["upright"] = RewardTermCfg(
+        func=microduck_mdp.upright_body_cmd_relative,
+        weight=up.weight,
+        params={"std": up.params["std"], "command_name": "body_pose", "asset_cfg": up.params["asset_cfg"]},
+    )
+
+
 def make_microduck_velstand_env_cfg(play: bool = False, rough: bool = False) -> ManagerBasedRlEnvCfg:
     # Walk layer: the PROVEN velocity recipe, verbatim.
     cfg = make_microduck_velocity_env_cfg(play=play, rough=rough)
@@ -387,6 +482,9 @@ def make_microduck_velstand_env_cfg(play: bool = False, rough: bool = False) -> 
     # BEFORE adding velstand's own (which must still ramp).
     if WARM_START and not play:
         _collapse_curricula_to_final(cfg)
+
+    if ENABLE_BODY_CONTROL:
+        _add_body_control(cfg, play)
 
     # True full-collision model: the robot can lie on / push off any part, and
     # the servo housings are named so the impact sensor below can single them
@@ -731,7 +829,10 @@ MicroduckVelStandRlCfg = RslRlOnPolicyRunnerCfg(
         desired_kl=0.01,
         max_grad_norm=1.0,
         symmetry_cfg=None,
-        bc_cfg={**default_bc_cfg(), "coef": EXPERT_BC_COEF, "gate_tilt_deg": EXPERT_BC_GATE_TILT_DEG} if ENABLE_EXPERT_BC else None,
+        bc_cfg={
+            **default_bc_cfg(), "coef": EXPERT_BC_COEF, "gate_tilt_deg": EXPERT_BC_GATE_TILT_DEG,
+            **({"body_slice": (55, 61)} if ENABLE_BODY_CONTROL else {}),
+        } if ENABLE_EXPERT_BC else None,
     ),
     wandb_project="mjlab_microduck",
     experiment_name="velstand",
