@@ -6794,6 +6794,132 @@ def trunk_upward_velocity_penalty(
     asset = env.scene[asset_cfg.name]
     vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
     return -torch.clamp(vz - max_up_vel, min=0.0)
+
+
+# ── Seated fall-back hardening (sitstand, 2026-10) ────────────────────────────
+# Real-robot report: an abrupt head move while seated tips the robot BACKWARD;
+# it stays leaned (~30°) in the sit pose and the neck servo overloads. Sim
+# battery (claude_experiments/sitstand_head_bench.py) reproduced it: fast head
+# wiggles / pitch-down+yaw jumps tip 30-45% of seated robots, none recover,
+# neck |τ| 5-8× the calm value. Training never had (a) fast head commands —
+# the head command only resamples every few seconds — nor (b) any leaned-back
+# seated state to recover from. The three terms below supply both + price the
+# overload directly.
+
+
+def _seated_mask(env: ManagerBasedRlEnv, command_name: str, min_alpha: float) -> torch.Tensor:
+    """Envs whose posture target is (nearly) fully SIT: flag on and slew done."""
+    sit = env.command_manager.get_command(command_name)[:, 0] > 0.5
+    return sit & (_posture_blend(env, command_name) >= min_alpha)
+
+
+def seated_head_command_jerk(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    prob: float,
+    flip_frac: float = 0.5,
+    posture_command_name: str = "twist",
+    head_command_name: str = "head_pose",
+    min_alpha: float = 0.98,
+) -> None:
+    """Interval event: abrupt head-command changes for SEATED envs.
+
+    Each fire, each selected env (seated, with probability ``prob``) gets
+    either a sign flip of its current head command (``flip_frac`` of them —
+    the fast stick wiggle, a full-range swing in one step) or a fresh
+    uniform sample in the command's live ranges (an abrupt jump). With a
+    short interval this produces the sub-second head motion the real robot
+    gets from a gamepad, which the dwell-resampled command never trains.
+    ``prob`` is ramped by event_param_curriculum (0 until the sit exists).
+    Mutates the UniformPoseCommand's held value; its own resample timer is
+    untouched.
+    """
+    if prob <= 0.0 or env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    seated = _seated_mask(env, posture_command_name, min_alpha)[env_ids]
+    pick = seated & (torch.rand(len(env_ids), device=env.device) < prob)
+    ids = env_ids[pick]
+    if len(ids) == 0:
+        return
+    term = env.command_manager.get_term(head_command_name)
+    flip = torch.rand(len(ids), device=env.device) < flip_frac
+    fresh = torch.empty(len(ids), term.dim, device=env.device)
+    for i, (lo, hi) in enumerate(term.cfg.ranges):
+        fresh[:, i].uniform_(lo, hi)
+    cur = term._command[ids]
+    term._command[ids] = torch.where(flip.unsqueeze(1), -cur, fresh)
+
+
+def seated_backward_tip(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    ang_vel_range: tuple[float, float],
+    prob: float = 1.0,
+    lateral_frac: float = 0.3,
+    posture_command_name: str = "twist",
+    min_alpha: float = 0.98,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Interval event: backward pitch kick for SEATED envs.
+
+    Adds |ω| ∈ ang_vel_range about the trunk's lateral axis in the nose-up
+    (backward) direction — trunk_base +x is forward, +ω_y pitches nose-down,
+    so the kick is −ω along body y (in world frame). ``lateral_frac`` mixes a
+    random ± roll component (backward-diagonal falls). Generates physically
+    consistent leaned-back seated states — the recovery frontier that no
+    spawn covers (teleporting into a lean at sit height penetrates the floor).
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    seated = _seated_mask(env, posture_command_name, min_alpha)[env_ids]
+    pick = seated & (torch.rand(len(env_ids), device=env.device) < prob)
+    ids = env_ids[pick]
+    if len(ids) == 0 or ang_vel_range[1] <= 0.0:
+        return
+    asset: Entity = env.scene[asset_cfg.name]
+    n = len(ids)
+    mag = torch.empty(n, device=env.device).uniform_(*ang_vel_range)
+    roll = (torch.rand(n, device=env.device) * 2 - 1) * lateral_frac
+    omega_b = torch.stack([roll * mag, -mag, torch.zeros_like(mag)], dim=1)
+    omega_w = quat_apply(asset.data.root_link_quat_w[ids], omega_b)
+    vel = asset.data.root_link_vel_w[ids].clone()
+    vel[:, 3:6] += omega_w
+    asset.write_root_link_velocity_to_sim(vel, env_ids=ids)
+
+
+def neck_torque_when_tilted(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    tilt_start_deg: float = 12.0,
+    tilt_full_deg: float = 25.0,
+    torque_scale: float = 0.1,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Cost (≥ 0 → NEGATIVE weight): mean (|τ_neck| / torque_scale)² × gate.
+
+    The overload symptom: leaned back in the sit pose, the neck holds the
+    heavy head cantilevered against gravity at near-stall torque. Gate =
+    posture blend (SIT target) × BACKWARD lean (projected gravity x < 0;
+    trunk +x is forward) × tilt ramp (0 below ``tilt_start_deg``, full above
+    ``tilt_full_deg``). Upright head control (seated ~3-5°), standing, the
+    rise (blend → 0) and forward head-assisted descents pay nothing; once
+    leaned back, straining the neck costs and either recovering upright or
+    relaxing the head wins. ``torque_scale`` ≈ the calm-vs-overload boundary
+    (seated calm |τ| ≈ 0.02 Nm, leaned overload ≈ 0.15 Nm).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    if not hasattr(env, "_neck_actuator_ids"):
+        ids, _ = asset.find_actuators(_NECK_JOINT_PATTERNS, preserve_order=True)
+        env._neck_actuator_ids = torch.tensor(ids, device=env.device, dtype=torch.long)
+    tau = torch.nan_to_num(asset.data.actuator_force[:, env._neck_actuator_ids], nan=0.0)
+    cost = torch.square(tau / torque_scale).mean(dim=1)
+    g = torch.nan_to_num(asset.data.projected_gravity_b, nan=0.0)
+    tilt = torch.rad2deg(torch.acos(torch.clamp(-g[:, 2], -1.0, 1.0)))
+    gate = torch.clamp((tilt - tilt_start_deg) / max(tilt_full_deg - tilt_start_deg, 1e-6), 0.0, 1.0)
+    gate = gate * (g[:, 0] < 0.0).float() * _posture_blend(env, command_name)
+    return cost * gate
 # ==============================================================================
 # Roulade (forward roll) task — episodic dynamic maneuver
 # ==============================================================================
