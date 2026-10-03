@@ -30,7 +30,7 @@ class HandCfg:
     pickup_rate_hz: float = 0.08        # idle envs start a pick-up at this rate
     min_idle_s: float = 1.0             # after a release / episode start
     lift_z: tuple = (0.03, 0.35)        # above the trunk height at pick-up
-    lift_s: tuple = (0.25, 1.2)
+    lift_s: tuple = (0.25, 3.0)          # v2: slow lifts too (a head grab is a gentle pull)
     hold_s: tuple = (0.5, 8.0)
     # tilt amplitude buckets (deg, probability): mostly casual, sometimes wild
     tilt_buckets: tuple = ((15.0, 0.35), (45.0, 0.30), (90.0, 0.25), (160.0, 0.10))
@@ -51,6 +51,15 @@ class HandCfg:
     max_lower_s: float = 6.0
     pickup_fallen: bool = True          # people pick fallen robots up too
     touch_press: tuple = (0.0, 0.01)    # m the hand keeps pushing down after touchdown
+    # v2 (robot feedback 2026-10-03: lifted by the HEAD it never paused, turned 180° it resumed)
+    head_grip_prob: float = 0.35        # grab the head (jaw_soft) instead of the trunk
+    orient_prob: float = 0.35           # carry at a sustained orientation anywhere on the sphere
+    orient_pitch: tuple = (-math.pi, math.pi)
+    orient_roll: tuple = (-math.pi / 2, math.pi / 2)
+    orient_ramp_s: tuple = (0.4, 2.0)   # how fast the hand turns the duck there
+    yaw_turn_prob: float = 0.35         # a quick turn about the vertical, up to ±180°
+    yaw_turn: tuple = (-math.pi, math.pi)
+    yaw_turn_s: tuple = (0.4, 1.5)
 
 
 def _u(n, lo_hi, device):
@@ -123,6 +132,10 @@ class VirtualHand:
         self.press = z(); self.z_touch = z()
         self.cur_tilt = z(2)
         self.forced = torch.zeros_like(self.drop)
+        self.grip = torch.zeros(num_envs, dtype=torch.long, device=device)  # 0 trunk, 1 head
+        self.base_q = torch.zeros(num_envs, 4, device=device); self.base_q[:, 0] = 1.0  # yaw-free frame at grasp
+        self.orient = z(2); self.orient_s = z()
+        self.yaw0 = z(); self.yaw_turn = z(); self.yaw_turn_t0 = z(); self.yaw_turn_s = z()
 
     # ------------------------------------------------------------------ api
     @property
@@ -134,13 +147,39 @@ class VirtualHand:
         self.t[env_ids] = 0.0
         self.idle_t[env_ids] = 0.0
 
-    def start(self, mask: torch.Tensor, pos: torch.Tensor, quat: torch.Tensor):
-        """Begin a pick-up on ``mask`` envs (also used to force one in demos)."""
+    def select(self, pos, quat, pos_head=None, quat_head=None):
+        """The pose of the body each env is gripped by (trunk, or head where ``grip`` is 1)."""
+        if pos_head is None:
+            return pos, quat
+        head = (self.grip == 1).unsqueeze(-1)
+        return torch.where(head, pos_head, pos), torch.where(head, quat_head, quat)
+
+    def start(self, mask: torch.Tensor, pos: torch.Tensor, quat: torch.Tensor, pos_head=None, quat_head=None):
+        """Begin a pick-up on ``mask`` envs (also used to force one in demos).
+        ``pos/quat`` are the trunk's; ``pos_head/quat_head`` the head's, needed for head grips."""
         mask = mask & (self.phase == IDLE)
         n = int(mask.sum())
         if n == 0:
             return
         c, d = self.cfg, self.dev
+        can_head = pos_head is not None
+        self.grip[mask] = ((torch.rand(n, device=d) < c.head_grip_prob) & can_head).long()
+        pos, quat = self.select(pos, quat, pos_head, quat_head)
+        # yaw-free orientation of the gripped body at the grasp: the hand's tilts are relative to
+        # it, so a head grip starts from the head's own pose instead of snapping it level. A trunk
+        # grip stays absolute (identity) — picking a fallen robot up sets it back on its feet.
+        yq = _quat_from_euler_xyz(torch.zeros(n, device=d), torch.zeros(n, device=d), -yaw_of(quat[mask]))
+        bq = _quat_mul(yq, quat[mask])
+        ident = torch.zeros_like(bq); ident[:, 0] = 1.0
+        self.base_q[mask] = torch.where((self.grip[mask] == 1).unsqueeze(-1), bq, ident)
+        orient = torch.rand(n, device=d) < c.orient_prob
+        o = torch.stack([_u(n, c.orient_roll, d), _u(n, c.orient_pitch, d)], -1)
+        self.orient[mask] = o * orient.unsqueeze(-1).float()
+        self.orient_s[mask] = _u(n, c.orient_ramp_s, d)
+        turn = torch.rand(n, device=d) < c.yaw_turn_prob
+        self.yaw_turn[mask] = _u(n, c.yaw_turn, d) * turn.float()
+        self.yaw_turn_s[mask] = _u(n, c.yaw_turn_s, d)
+        self.yaw_turn_t0[mask] = _u(n, (0.5, 4.0), d)
         self.phase[mask] = CARRY
         self.t[mask] = 0.0
         self.t_hold[mask] = _u(n, c.hold_s, d)
@@ -149,7 +188,7 @@ class VirtualHand:
         anc = pos[mask].clone()
         anc[:, 2] = pos[mask, 2] + _u(n, c.lift_z, d)
         self.anchor[mask] = anc
-        self.yaw[mask] = yaw_of(quat[mask])
+        self.yaw[mask] = yaw_of(quat[mask]); self.yaw0[mask] = self.yaw[mask]
         self.yaw_rate[mask] = _u(n, c.yaw_rate, d) * (torch.rand(n, device=d) < 0.6).float()
         # tilt bucket
         amps = torch.tensor([b[0] for b in c.tilt_buckets], device=d)
@@ -184,9 +223,10 @@ class VirtualHand:
         m = mask & (self.phase == CARRY)
         self.t_hold[m] = self.t[m]
 
-    def step(self, dt, pos, quat, feet_force, mass, upright):
+    def step(self, dt, pos, quat, feet_force, mass, upright, pos_head=None, quat_head=None):
         """Advance the hand one control step. Returns (target_pos (N,3),
-        target_quat (N,4) wxyz, active (N,) bool) for the welded mocap hand.
+        target_quat (N,4) wxyz, active (N,) bool) for the welded mocap hand —
+        the target pose of the GRIPPED body (``grip``: 0 trunk, 1 head).
         ``feet_force`` = total normal force on the feet (N), ``mass`` = robot
         mass per env, ``upright`` = mask used to gate pick-ups of fallen robots."""
         c, d, N = self.cfg, self.dev, self.N
@@ -195,11 +235,14 @@ class VirtualHand:
         idle = self.phase == IDLE
         self.idle_t = torch.where(idle, self.idle_t + dt, torch.zeros_like(self.idle_t))
         elig = idle & (self.idle_t >= c.min_idle_s) & (upright | c.pickup_fallen)
-        self.start(elig & (torch.rand(N, device=d) < c.pickup_rate_hz * dt), pos, quat)
+        self.start(elig & (torch.rand(N, device=d) < c.pickup_rate_hz * dt), pos, quat, pos_head, quat_head)
+        pos, quat = self.select(pos, quat, pos_head, quat_head)
 
         self.t = self.t + dt
         carry = self.phase == CARRY
-        self.yaw = self.yaw + torch.where(carry, self.yaw_rate * dt, torch.zeros_like(self.yaw))
+        turn_a = ((self.t - self.yaw_turn_t0) / self.yaw_turn_s).clamp(0, 1)
+        turn_a = 0.5 - 0.5 * torch.cos(math.pi * turn_a)
+        self.yaw = torch.where(carry, self.yaw0 + self.yaw_rate * self.t + self.yaw_turn * turn_a, self.yaw)
 
         # ── carry → lower / drop ──
         done = carry & (self.t >= self.t_hold)
@@ -231,12 +274,14 @@ class VirtualHand:
         lift_a = (self.t / self.t_lift).clamp(0, 1)
         lift_a = 0.5 - 0.5 * torch.cos(math.pi * lift_a)  # smooth
         ramp = lift_a.unsqueeze(-1)
-        tilt = self.tilt_amp.unsqueeze(-1) * sn[:, :2] * ramp
+        orient_a = ((self.t - self.t_lift) / self.orient_s).clamp(0, 1)
+        orient_a = (0.5 - 0.5 * torch.cos(math.pi * orient_a)).unsqueeze(-1)
+        tilt = self.tilt_amp.unsqueeze(-1) * sn[:, :2] * ramp + self.orient * orient_a
         tgt = self.anchor.clone()
         tgt[:, :2] = tgt[:, :2] + self.drift_amp.unsqueeze(-1) * sn[:, 2:4] * ramp
         tgt[:, 2] = self.z0 + lift_a * (self.anchor[:, 2] - self.z0) + 0.3 * self.drift_amp * sn[:, 4] * lift_a
         # lowering: descend from the current carry pose at lower_v, tilt → end_tilt
-        lo_a = (lt / 0.6).clamp(0, 1)
+        lo_a = (lt / 1.0).clamp(0, 1)
         tilt_lo = self.lower_from_tilt + (self.end_tilt - self.lower_from_tilt) * lo_a.unsqueeze(-1)
         z_lo = self.anchor[:, 2] - self.lower_v * lt
         z_lo = torch.where(self.touched, torch.maximum(z_lo, self.z_touch - self.press), z_lo)
@@ -250,6 +295,7 @@ class VirtualHand:
         tgt = tgt + (self.trem_amp * tph).unsqueeze(-1) * self.trem_dir[:, :3]
         rot_trem = (self.trem_rot * tph).unsqueeze(-1) * self.trem_dir[:, 3:]
         q_tgt = _quat_from_euler_xyz(tilt[:, 0] + rot_trem[:, 0], tilt[:, 1] + rot_trem[:, 1], self.yaw + rot_trem[:, 2])
+        q_tgt = _quat_mul(q_tgt, self.base_q)
         if lower.any():  # keep the robot's own yaw during set-down
             self.yaw = torch.where(lower, yaw_of(quat), self.yaw)
 
@@ -257,18 +303,23 @@ class VirtualHand:
         return tgt, q_tgt, active
 
 
-def add_hand_to_spec(spec, trunk_body: str = "robot/trunk_base", timeconst: float = 0.03, dampratio: float = 1.0):
-    """Add the mocap hand + an (inactive) soft weld hand↔trunk to a MjSpec.
-    The weld's relative pose is identity, so the hand pose IS the trunk target pose."""
+def add_hand_to_spec(spec, trunk_body: str = "robot/trunk_base", timeconst: float = 0.03, dampratio: float = 1.0,
+                     head_body: str | None = None):
+    """Add the mocap hand + (inactive) soft welds hand↔trunk ("pickup_hand_weld") and, if
+    ``head_body`` is given (default: the trunk's prefix + "jaw_soft"), hand↔head
+    ("pickup_hand_weld_head"). Relative pose identity: the hand pose IS the gripped body's target."""
     import mujoco
     hand = spec.worldbody.add_body(name="pickup_hand", mocap=True)
     hand.add_geom(type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[0.012, 0, 0], contype=0, conaffinity=0,
                   rgba=[1.0, 0.6, 0.2, 0.0], group=5)
-    eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_WELD, objtype=mujoco.mjtObj.mjOBJ_BODY,
-                           name1="pickup_hand", name2=trunk_body, active=False)
-    eq.name = "pickup_hand_weld"
-    eq.solref = [timeconst, dampratio]
-    eq.data[:] = 0.0
-    eq.data[6] = 1.0   # relpose quat (w) = identity
-    eq.data[10] = 1.0  # torquescale
+    if head_body is None:
+        head_body = trunk_body.rsplit("trunk_base", 1)[0] + "jaw_soft"
+    for name, body in (("pickup_hand_weld", trunk_body), ("pickup_hand_weld_head", head_body)):
+        eq = spec.add_equality(type=mujoco.mjtEq.mjEQ_WELD, objtype=mujoco.mjtObj.mjOBJ_BODY,
+                               name1="pickup_hand", name2=body, active=False)
+        eq.name = name
+        eq.solref = [timeconst, dampratio]
+        eq.data[:] = 0.0
+        eq.data[6] = 1.0   # relpose quat (w) = identity
+        eq.data[10] = 1.0  # torquescale
     return spec

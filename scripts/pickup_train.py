@@ -79,6 +79,9 @@ def main():
     ap.add_argument("--val", nargs="+", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-current", action="store_true")
+    ap.add_argument("--drop-current", action="store_true", help="remove current channels from the graph (cheaper than --no-current's mask)")
+    ap.add_argument("--ch", type=int, default=32)
+    ap.add_argument("--init", default=None, help="model.pt to start from (same architecture)")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=2048)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -94,13 +97,18 @@ def main():
     idx = [valid_index(meta, i) for i in range(len(feats))]
     sizes = torch.tensor([len(t) for t, _ in idx], dtype=torch.float)
 
-    net = PickupNet().to(dev)
+    keep = [i for i in range(FEAT_DIM) if not (args.drop_current and CURRENT_SLICE.start <= i < CURRENT_SLICE.stop)]
+    net_kwargs = {"ch": args.ch, "keep": keep}
+    net = PickupNet(**net_kwargs).to(dev)
     # normalizer from a random tick sample
     smp = torch.cat([f[torch.randint(0, f.shape[0], (50_000,), device=dev), torch.randint(0, f.shape[1], (50_000,), device=dev)].float() for f in feats])
     net.mean.copy_(smp.mean(0)); net.std.copy_(smp.std(0).clamp_min(1e-3))
     net.mean[PAUSED_IDX] = 0.0; net.std[PAUSED_IDX] = 1.0
-    if args.no_current:
+    if args.no_current or args.drop_current:
         net.mask[CURRENT_SLICE] = 0.0
+    if args.init:
+        net.load_state_dict(torch.load(args.init, map_location=dev)["state_dict"])
+        print("initialised from", args.init)
     print(f"params {sum(p.numel() for p in net.parameters())}")
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -130,7 +138,7 @@ def main():
                 print(f"    {k:38s} {'detected' if k.startswith('held') else 'correct (no pause)'} {100 * v:6.2f}%")
 
     os.makedirs(args.out, exist_ok=True)
-    ck = {"state_dict": net.state_dict(), "net_kwargs": {}, "sm_cfg": vars(StateMachineCfg()),
+    ck = {"state_dict": net.state_dict(), "net_kwargs": net_kwargs, "sm_cfg": vars(StateMachineCfg()),
           "no_current": args.no_current, "train": args.train}
     torch.save(ck, os.path.join(args.out, "model.pt"))
     export_onnx(net, os.path.join(args.out, "pickup_detector.onnx"))

@@ -77,6 +77,8 @@ class Demo:
         self.trunk = m.body("trunk_base").id
         self.gyro_adr = m.sensor_adr[m.sensor("imu_ang_vel").id]
         self.eq = m.equality("pickup_hand_weld").id
+        self.eq_head = m.equality("pickup_hand_weld_head").id
+        self.head = m.body("jaw_soft").id
         self.mocap = m.body_mocapid[m.body("pickup_hand").id]
         self.lfoot = [g for g in range(m.ngeom) if "foot" in (m.geom(g).name or "")]
         self.mass = float(m.body_subtreemass[0])
@@ -141,9 +143,12 @@ class Demo:
         # hand
         pos = torch.tensor(self.d.xpos[self.trunk])[None]; quat = torch.tensor(self.d.xquat[self.trunk])[None]
         up = torch.tensor([self.grav()[2] < -0.5])
-        hp, hq, active = self.hand.step(CTRL_DT, pos.float(), quat.float(), torch.tensor([self.feet_force()]), torch.tensor([self.mass]), up)
+        hp, hq, active = self.hand.step(CTRL_DT, pos.float(), quat.float(), torch.tensor([self.feet_force()]),
+                                        torch.tensor([self.mass]), up, *self.head_pose())
         self.d.mocap_pos[self.mocap] = hp[0].numpy(); self.d.mocap_quat[self.mocap] = hq[0].numpy()
-        self.d.eq_active[self.eq] = bool(active[0])
+        head = bool(self.hand.grip[0] == 1)
+        self.d.eq_active[self.eq] = bool(active[0]) and not head
+        self.d.eq_active[self.eq_head] = bool(active[0]) and head
         for _ in range(DECIM):
             self.bam.update(); mujoco.mj_step(self.m, self.d)
         self.t += CTRL_DT
@@ -170,11 +175,14 @@ class Demo:
         c = self.hand.cfg
         defaults = dict(hold_s=(1e4, 1e4), lift_z=(0.18, 0.25), lift_s=(0.6, 0.6), tilt_buckets=((30.0, 1.0),),
                         shake_prob=0.0, drop_prob=0.0, yaw_rate=(-0.5, 0.5), drift_amp=(0.03, 0.08), lower_speed=(0.15, 0.15),
-                        touch_release_s=(0.3, 0.3))
+                        touch_release_s=(0.3, 0.3), head_grip_prob=0.0, orient_prob=0.0, yaw_turn_prob=0.0)
         for k, v in {**defaults, **kw}.items():
             setattr(c, k, v)
         pos = torch.tensor(self.d.xpos[self.trunk])[None].float(); quat = torch.tensor(self.d.xquat[self.trunk])[None].float()
-        self.hand.start(torch.tensor([True]), pos, quat)
+        self.hand.start(torch.tensor([True]), pos, quat, *self.head_pose())
+
+    def head_pose(self):
+        return torch.tensor(self.d.xpos[self.head])[None].float(), torch.tensor(self.d.xquat[self.head])[None].float()
 
     def put_down(self, drop=False):
         self.hand.drop[:] = drop
@@ -195,8 +203,24 @@ SCENARIO = [  # (t, what, kwargs)
     (36.0, "end", {}),
 ]
 
+# The two cases the first model missed on the robot: lifted by the head, and turned 180°.
+SCENARIO_V2 = [
+    (0.0, "cmd", dict(vx=0.2)),
+    (3.0, "pick", dict(head_grip_prob=1.0, tilt_buckets=((20.0, 1.0),), lift_z=(0.15, 0.15))),
+    (9.0, "put", {}),
+    (12.0, "cmd", dict(vx=0.0)),
+    (14.0, "pick", dict(orient_prob=1.0, orient_pitch=(3.1, 3.1), orient_roll=(0.0, 0.0), orient_ramp_s=(1.5, 1.5),
+                        tilt_buckets=((5.0, 1.0),), lift_z=(0.25, 0.25), yaw_rate=(0.0, 0.0))),
+    (21.0, "put", {}),
+    (24.0, "pick", dict(yaw_turn_prob=1.0, yaw_turn=(3.14, 3.14), yaw_turn_s=(1.0, 1.0), tilt_buckets=((10.0, 1.0),),
+                        yaw_rate=(0.0, 0.0))),
+    (30.0, "put", {}),
+    (32.0, "cmd", dict(vx=0.2)),
+    (35.0, "end", {}),
+]
 
-def run_scenario(demo: Demo, video: str | None, width=720, height=540):
+
+def run_scenario(demo: Demo, video: str | None, width=720, height=540, scenario=SCENARIO):
     from PIL import Image, ImageDraw, ImageFont
     import imageio
     renderer = mujoco.Renderer(demo.m, height, width) if video else None
@@ -207,8 +231,8 @@ def run_scenario(demo: Demo, video: str | None, width=720, height=540):
     except OSError:
         font = small = ImageFont.load_default()
     frames, hist = [], []
-    ev = list(SCENARIO); log = []
-    n_ticks = int(SCENARIO[-1][0] / CTRL_DT)
+    ev = list(scenario); log = []
+    n_ticks = int(scenario[-1][0] / CTRL_DT)
     caption = ""
     for k in range(n_ticks):
         while ev and ev[0][0] <= demo.t + 1e-9:
@@ -217,7 +241,9 @@ def run_scenario(demo: Demo, video: str | None, width=720, height=540):
                 demo.cmd[0] = kw.get("vx", 0.0); demo.cmd[2] = kw.get("wz", 0.0)
                 caption = f"command vx={demo.cmd[0]:.2f} m/s wz={demo.cmd[2]:.1f} rad/s"
             elif what == "pick":
-                demo.pick(**kw); caption = "hand picks the duck up"
+                demo.pick(**kw)
+                caption = "hand picks the duck up" + (" BY THE HEAD" if kw.get("head_grip_prob") else "") + \
+                    (" and turns it upside down" if kw.get("orient_prob") else "") + (" and spins it 180°" if kw.get("yaw_turn_prob") else "")
             elif what == "put":
                 for kk, v in kw.items():
                     setattr(demo.hand.cfg, kk, v)
@@ -314,13 +340,14 @@ def main():
     ap.add_argument("--video", default=None)
     ap.add_argument("--interactive", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--scenario", choices=["v1", "v2"], default="v1", help="v2 = head grip, upside down, spun 180°")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     demo = Demo(args)
     if args.interactive:
         interactive(demo)
     else:
-        summarize(run_scenario(demo, args.video))
+        summarize(run_scenario(demo, args.video, scenario=SCENARIO_V2 if args.scenario == "v2" else SCENARIO))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """End to end: the real `robotd --sim` with `[pickup] enabled`, against a duck-body world that has
 the training's welded hand in it.
 
-    uv run python scripts/pickup_e2e_robotd.py [--video logs/pickup/e2e_robotd.mp4]
+    uv run python scripts/pickup_e2e_robotd.py [--video logs/pickup/e2e_robotd.mp4] [--scenario v2]
 
 Needs the microduck checkout at ~/Pollen/microduck with `target/debug/robotd` built (the branch
 carrying `[pickup]`). Walks the duck with velstand, picks it up mid-walk (shaken), sets it down,
@@ -45,6 +45,8 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 
 m, d = world.model, world.data
 eq = m.equality("pickup_hand_weld").id
+eq_head = m.equality("pickup_hand_weld_head").id
+head = m.body("jaw_soft").id
 mocap = m.body_mocapid[m.body("pickup_hand").id]
 trunk = m.body("trunk_base").id
 feet = {m.geom("left_foot_collision").id, m.geom("right_foot_collision").id}
@@ -101,7 +103,18 @@ EVENTS = [  # seconds after the policy has the robot
     (22.0, "cmd", (0.15, 0.5)), (25.0, "pick", dict(tilt_buckets=((120.0, 1.0),), lift_z=(0.3, 0.3), tilt_freq_hz=(0.25, 0.35))),
     (30.0, "put", {}), (33.0, "cmd", (0.2, 0.0)), (38.0, "end", None),
 ]
-DEFAULTS = dict(hold_s=(1e4, 1e4), lift_z=(0.18, 0.25), lift_s=(0.6, 0.6), shake_prob=0.0, drop_prob=0.0,
+if "--scenario" in sys.argv and sys.argv[sys.argv.index("--scenario") + 1] == "v2":
+    # the two cases the first model missed on the robot: lifted by the head, turned 180°
+    EVENTS = [
+        (0.0, "cmd", (0.2, 0.0)), (3.0, "pick", dict(head_grip_prob=1.0, tilt_buckets=((20.0, 1.0),), lift_z=(0.15, 0.15), lift_s=(1.5, 1.5))),
+        (9.0, "put", {}), (12.0, "cmd", (0.0, 0.0)),
+        (14.0, "pick", dict(orient_prob=1.0, orient_pitch=(3.1, 3.1), orient_roll=(0.0, 0.0), orient_ramp_s=(1.5, 1.5),
+                            tilt_buckets=((5.0, 1.0),), lift_z=(0.25, 0.25), yaw_rate=(0.0, 0.0))),
+        (21.0, "put", {}),
+        (24.0, "pick", dict(yaw_turn_prob=1.0, yaw_turn=(3.14, 3.14), yaw_turn_s=(1.0, 1.0), tilt_buckets=((10.0, 1.0),), yaw_rate=(0.0, 0.0))),
+        (30.0, "put", {}), (32.0, "cmd", (0.2, 0.0)), (37.0, "end", None),
+    ]
+DEFAULTS = dict(head_grip_prob=0.0, orient_prob=0.0, yaw_turn_prob=0.0, hold_s=(1e4, 1e4), lift_z=(0.18, 0.25), lift_s=(0.6, 0.6), shake_prob=0.0, drop_prob=0.0,
                 yaw_rate=(-0.5, 0.5), drift_amp=(0.03, 0.08), lower_speed=(0.15, 0.15), touch_release_s=(0.3, 0.3),
                 tilt_freq_hz=(0.05, 0.6))
 
@@ -156,7 +169,8 @@ while True:
             elif what == "pick":
                 for kk, v in {**DEFAULTS, **arg}.items(): setattr(hand.cfg, kk, v)
                 with world.lock:
-                    hand.start(torch.tensor([True]), torch.tensor(d.xpos[trunk])[None].float(), torch.tensor(d.xquat[trunk])[None].float())
+                    hand.start(torch.tensor([True]), torch.tensor(d.xpos[trunk])[None].float(), torch.tensor(d.xquat[trunk])[None].float(),
+                               torch.tensor(d.xpos[head])[None].float(), torch.tensor(d.xquat[head])[None].float())
                 caption = "hand picks it up"
             elif what == "put":
                 for kk, v in arg.items(): setattr(hand.cfg, kk, v)
@@ -169,8 +183,11 @@ while True:
         ff = feet_force()
         up = torch.tensor([d.xmat[trunk][8] > 0.5])
         hp, hq, act = hand.step(0.02, torch.tensor(d.xpos[trunk])[None].float(), torch.tensor(d.xquat[trunk])[None].float(),
-                                torch.tensor([ff]), torch.tensor([mass]), up)
-        d.mocap_pos[mocap] = hp[0].numpy(); d.mocap_quat[mocap] = hq[0].numpy(); d.eq_active[eq] = bool(act[0])
+                                torch.tensor([ff]), torch.tensor([mass]), up,
+                                torch.tensor(d.xpos[head])[None].float(), torch.tensor(d.xquat[head])[None].float())
+        by_head = bool(hand.grip[0] == 1)
+        d.mocap_pos[mocap] = hp[0].numpy(); d.mocap_quat[mocap] = hq[0].numpy()
+        d.eq_active[eq] = bool(act[0]) and not by_head; d.eq_active[eq_head] = bool(act[0]) and by_head
         tilt = math.degrees(math.acos(max(-1, min(1, d.xmat[trunk][8]))))
         truth.append((now, bool(act[0]) and ff < 0.5 * mass * 9.81, tilt, float(d.xpos[trunk][2])))
         if renderer is not None and k % 2 == 0 and t_start is not None:

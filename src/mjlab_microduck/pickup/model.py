@@ -19,25 +19,32 @@ WINDOW = 50  # 1 s at 50 Hz
 
 
 class PickupNet(nn.Module):
-    def __init__(self, feat_dim: int = FEAT_DIM, window: int = WINDOW, ch: int = 32, hidden: int = 32):
+    def __init__(self, feat_dim: int = FEAT_DIM, window: int = WINDOW, ch: int = 32, hidden: int = 32,
+                 keep: list[int] | None = None):
         super().__init__()
+        # Channels the network actually reads, selected INSIDE the graph so the input contract stays
+        # 63-D. Dropping a feature here (rather than masking it to zero) also drops its compute:
+        # the first convolution is most of the cost, and it scales with its input width.
+        keep = list(range(feat_dim)) if keep is None else list(keep)
+        self.register_buffer("keep", torch.tensor(keep, dtype=torch.long), persistent=False)  # from net_kwargs
+        self.keep_list = keep
         self.register_buffer("mean", torch.zeros(feat_dim))
         self.register_buffer("std", torch.ones(feat_dim))
         # 0 = feature ignored (e.g. servo current, whose sim2real is doubtful);
         # the input contract stays 63-D either way
         self.register_buffer("mask", torch.ones(feat_dim))
         self.conv = nn.Sequential(
-            nn.Conv1d(feat_dim, ch, 5, stride=2), nn.ELU(),
+            nn.Conv1d(len(keep), ch, 5, stride=2), nn.ELU(),
             nn.Conv1d(ch, ch, 5, stride=2), nn.ELU(),
             nn.Conv1d(ch, ch, 5, stride=2), nn.ELU(),
         )
         with torch.no_grad():
-            n = self.conv(torch.zeros(1, feat_dim, window)).numel()
+            n = self.conv(torch.zeros(1, len(keep), window)).numel()
         self.head = nn.Sequential(nn.Linear(n, hidden), nn.ELU(), nn.Linear(hidden, 1))
         self.window = window
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, W, F) → (B,)
-        x = (x - self.mean) / self.std * self.mask
+        x = ((x - self.mean) / self.std * self.mask)[..., self.keep]
         x = self.conv(x.transpose(1, 2))
         return self.head(x.flatten(1)).squeeze(-1)
 

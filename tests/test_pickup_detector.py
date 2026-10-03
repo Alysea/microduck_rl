@@ -106,3 +106,32 @@ def test_net_shapes_and_onnx_contract(tmp_path):
     assert s.get_inputs()[0].shape == [1, WINDOW, FEAT_DIM]
     p = s.run(None, {"features": x[:1].numpy()})[0]
     np.testing.assert_allclose(p, torch.sigmoid(net(x[:1])).detach().numpy(), atol=1e-5)
+
+
+def test_head_grip_tracks_the_head_pose_and_starts_from_it():
+    """v2: a head grip targets the HEAD's pose, relative to how it was grabbed — the hand must not
+    snap a tilted head level at the grasp (that would be a yank no person does)."""
+    cfg = HandCfg(pickup_rate_hz=0.0, head_grip_prob=1.0, orient_prob=0.0, yaw_turn_prob=0.0,
+                  tilt_buckets=((0.0, 1.0),), drift_amp=(0.0, 0.0), tremor_amp=(0.0, 0.0),
+                  tremor_rot_deg=(0.0, 0.0), yaw_rate=(0.0, 0.0), lift_z=(0.1, 0.1), shake_prob=0.0)
+    h = VirtualHand(1, "cpu", cfg)
+    trunk_pos, trunk_q = torch.tensor([[0.0, 0.0, 0.12]]), torch.tensor([[1.0, 0, 0, 0]])
+    head_pos = torch.tensor([[0.02, 0.0, 0.22]])
+    s, c = math.sin(0.35), math.cos(0.35)  # head pitched 40° (two 20° joints), yaw 0
+    head_q = torch.tensor([[c, 0.0, s, 0.0]])
+    h.start(torch.tensor([True]), trunk_pos, trunk_q, head_pos, head_q)
+    assert int(h.grip[0]) == 1
+    tgt, q, _ = h.step(0.02, trunk_pos, trunk_q, torch.tensor([0.0]), torch.tensor([0.75]),
+                       torch.tensor([True]), head_pos, head_q)
+    torch.testing.assert_close(tgt[0, :2], head_pos[0, :2], atol=1e-4, rtol=0)
+    torch.testing.assert_close(q[0].abs(), head_q[0].abs(), atol=1e-4, rtol=0)
+
+
+def test_sustained_orientation_reaches_upside_down():
+    cfg = HandCfg(pickup_rate_hz=0.0, orient_prob=1.0, orient_pitch=(math.pi, math.pi), orient_roll=(0.0, 0.0),
+                  orient_ramp_s=(0.5, 0.5), head_grip_prob=0.0, yaw_turn_prob=0.0, tilt_buckets=((0.0, 1.0),),
+                  tremor_rot_deg=(0.0, 0.0), lift_s=(0.3, 0.3), hold_s=(10.0, 10.0))
+    _, h = _hand_rollout(cfg, 100, lambda k, h: 0.0)
+    w, x, y, z = h.tgt_quat[0].tolist()
+    up_z = 1 - 2 * (x * x + y * y)  # world z of the body's z axis
+    assert up_z < -0.99, up_z

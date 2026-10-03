@@ -65,7 +65,7 @@ class OnnxMLP(torch.nn.Module):
         return x
 
 
-def build_env(num_envs, device, seed):
+def build_env(num_envs, device, seed, keep_held_tilted=False):
     cfg = make_microduck_velstand_env_cfg(play=False, rough=True)
     cfg = make_backlash_variant(cfg, MICRODUCK_ALLCOLLISIONS_BACKLASH_ROBOT_CFG)
     cfg.scene.num_envs = num_envs
@@ -77,6 +77,11 @@ def build_env(num_envs, device, seed):
     # held robots are tilted way past that and falls must stay in the data
     cfg.terminations.pop("fell_over", None)
     cfg.curriculum.pop("fell_over_disable", None)
+    if keep_held_tilted:
+        # fallen_too_long resets anything tilted >40° for 8 s — including a robot somebody is
+        # holding upside down. For training data that only shortens long flipped holds; for the
+        # battery (one long forced hold) it would end the scenario.
+        cfg.terminations.pop("fallen_too_long", None)
     prev_fn = cfg.scene.spec_fn  # rough terrain softens its contacts here
 
     def spec_fn(spec):
@@ -89,22 +94,33 @@ def build_env(num_envs, device, seed):
 
 
 class HandSim:
-    """Binds VirtualHand to the welded mocap hand of a mjlab env."""
+    """Binds VirtualHand to the welded mocap hand of a mjlab env (trunk or head grip)."""
 
     def __init__(self, env, hand):
         import mujoco
         self.env, self.hand = env, hand
         mj = env.sim.mj_model
         self.eq = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_EQUALITY, "pickup_hand_weld")
+        self.eq_head = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_EQUALITY, "pickup_hand_weld_head")
         self.mocap = int(mj.body_mocapid[mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_BODY, "pickup_hand")])
-        assert self.eq >= 0 and self.mocap >= 0
+        assert self.eq >= 0 and self.eq_head >= 0 and self.mocap >= 0
+        self.head = int(env.scene["robot"].find_bodies("jaw_soft")[0][0])
+
+    def head_pose(self, robot):
+        return robot.data.body_link_pos_w[:, self.head], robot.data.body_link_quat_w[:, self.head]
+
+    def start(self, mask, robot):
+        self.hand.start(mask, robot.data.root_link_pos_w, robot.data.root_link_quat_w, *self.head_pose(robot))
 
     def step(self, dt, robot, feet_force, mass, upright):
-        pos, quat, active = self.hand.step(dt, robot.data.root_link_pos_w, robot.data.root_link_quat_w, feet_force, mass, upright)
+        pos, quat, active = self.hand.step(dt, robot.data.root_link_pos_w, robot.data.root_link_quat_w, feet_force,
+                                           mass, upright, *self.head_pose(robot))
         d = self.env.sim.data
         d.mocap_pos[:, self.mocap] = pos
         d.mocap_quat[:, self.mocap] = quat
-        d.eq_active[:, self.eq] = active
+        head = self.hand.grip == 1
+        d.eq_active[:, self.eq] = active & ~head
+        d.eq_active[:, self.eq_head] = active & head
 
 
 def main():
@@ -117,19 +133,29 @@ def main():
     ap.add_argument("--detector", default=None, help="closed-loop: model.pt from pickup_train.py")
     ap.add_argument("--pickup-rate", type=float, default=0.08)
     ap.add_argument("--sm", default="", help="state-machine overrides, e.g. p_resume=0.35,n_resume=4")
+    ap.add_argument("--hand", default="", help="HandCfg overrides as python literals, e.g. 'head_grip_prob=1.0;orient_prob=0'")
+    ap.add_argument("--force-pickup-at", type=float, default=None, help="battery: every env picked up at this time, held to the end")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     torch.manual_seed(args.seed); np.random.seed(args.seed)
 
     dev = args.device
-    env = build_env(args.num_envs, dev, args.seed)
+    env = build_env(args.num_envs, dev, args.seed, keep_held_tilted=args.force_pickup_at is not None)
     N, dt = env.num_envs, env.step_dt
     robot = env.scene["robot"]
     sids = m._servo_joint_ids(env, robot)
     from bam.model import load_model
     kt = load_model(motor_name="xl330", model="m6").kt.value
     policy = OnnxMLP(args.policy, dev)
-    hand = VirtualHand(N, dev, HandCfg(pickup_rate_hz=args.pickup_rate))
+    hcfg = HandCfg(pickup_rate_hz=args.pickup_rate)
+    for kv in filter(None, args.hand.split(";")):
+        k, v = kv.split("=", 1)
+        assert hasattr(hcfg, k.strip()), k
+        setattr(hcfg, k.strip(), eval(v, {"math": math, "pi": math.pi}))
+    if args.force_pickup_at is not None:
+        hcfg.pickup_rate_hz = 0.0
+        hcfg.hold_s = (1e4, 1e4)
+    hand = VirtualHand(N, dev, hcfg)
     hsim = HandSim(env, hand)
     cur_dr = CurrentSensorDR(N, dev)
     feet = env.scene.sensors["feet_ground_contact"]
@@ -176,6 +202,8 @@ def main():
         q = robot.data.root_link_quat_w
         up = (1 - 2 * (q[:, 1] ** 2 + q[:, 2] ** 2)) > 0.5
         ff = torch.nan_to_num(feet.data.force).norm(dim=-1).sum(-1)
+        if args.force_pickup_at is not None and step == int(args.force_pickup_at / dt):
+            hsim.start(torch.ones(N, dtype=torch.bool, device=dev), robot)
         hsim.step(dt, robot, ff, mass, up)
 
         obs, _, term, trunc, _ = env.step(action)
@@ -245,6 +273,7 @@ def main():
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     out = {k: torch.stack(v).numpy() for k, v in rec.items()}
+    out["grip"] = hand.grip.cpu().numpy()
     np.savez_compressed(args.out, **out)
     print(f"saved {args.out}: {T} ticks x {N} envs, held {out['held'].mean():.3f} paused {out['paused'].mean():.3f}")
     assert out["feat"].shape[-1] == FEAT_DIM and PAUSED_IDX == FEAT_DIM - 1
