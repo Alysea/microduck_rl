@@ -1,5 +1,17 @@
 """Microduck VelStand environment: walking + protective fall + recovery, one policy.
 
+CURRENT POLICY (Hub v7, 2026-10-05): wandb j4i6yoq2 @ model_1250, trained from this
+file at commit 53fb7d1 — warm-started from fhathosb@3750 with ENABLE_BODY_CONTROL.
+Lineage, launch commands and eval numbers: docs/velstand_policy.md.
+
+BODY CONTROL (2026-10, ENABLE_BODY_CONTROL): body_pose roll/pitch (± z) commanded
+only while standing (StandingGatedPoseCommand: exact zero while walking, as
+deployed). Tilt-only frames are distilled from alpha_stand, z frames left to PPO,
+both taken off the walk anchor (distill.py body routing); standing-gated tracking
+reward + command-relative upright + relaxed leg-pose stds. Roll/pitch ≈ ±8-10° for
+±10° on the robot; z (crouch) is NOT learned. ENABLE_YAW_FIX is a documented
+failed experiment (OFF) — see its comment.
+
 PROTECTIVE-FALL REBUILD (2026-09, branch protective_fall). Motivation: the real
 robots keep breaking XL330 gearboxes. The daemon's fall-detect limp (kp→50)
 helped but is imperfect, and the limp→standup hand-off produces "convulsions".
@@ -338,7 +350,15 @@ BODY_POSE_STD = {
 #     Additive margins: 0.6 rad/s +0.33 → +0.97/step, 1.0 +0.62 → +1.05;
 #   - turn-in-place bucket samples |wz| from 0.1 (was 0.4: in-place yaw < 0.4 never trained);
 #   - turn-in-place frames off the walk anchor (alpha_walking has this exact dead zone).
-ENABLE_YAW_FIX = True
+# OFF — both runs with it LOST turning (sape62zb: replaced term; brkpcnn8: additive term;
+# in-place ±1.0 rad/s 0.39/−0.36 → ~0.2-0.3 within 250 iters, 0.3/0.6 still ≈0). Common
+# factor = the unanchored turn frames: the walk anchor is the turning floor and PPO does
+# not discover slow turning even with positive reward margins. What actually works is a
+# COMMAND REMAP: the policy turns monotonically when fed a larger yaw (fed 1.0/1.5/2.0 →
+# 0.40/0.80/1.09 rad/s in place, no falls); runtime fed = sign(c)·(0.33 + |c|/0.6) makes
+# v7 (j4i6yoq2@1250) track 0.5-1.0 rad/s in sim (see docs/velstand_policy.md). Kept OFF
+# so this file reproduces the published v7 recipe (commit 53fb7d1).
+ENABLE_YAW_FIX = False
 TRACK_YAW_FINE_STD = 0.35
 TRACK_YAW_FINE_WEIGHT = 2.0
 TURN_IN_PLACE_FRACTION_VELSTAND = 0.2    # velocity recipe: 0.15
