@@ -79,6 +79,23 @@ def default_bc_cfg() -> dict:
         "anchor_checkpoint_path": None,
         "anchor_coef": 1.0,
         "anchor_tilt_deg": 25.0,
+        # Body-control routing (2026-10, branch improve_velstand2). When body_slice is set,
+        # STANDING frames (twist obs exactly 0) with a non-zero body command on
+        # body_active_axes are taken off the walk anchor (the walk expert ignores body
+        # commands and would pin them to a level stance). Of those, frames whose
+        # body_no_teacher_axes are all zero (tilt-only) are taught by the stand expert,
+        # which tracks roll/pitch (9.2-9.5° for 10° commanded); frames commanding any of
+        # body_no_teacher_axes (z: the stand expert does not crouch) are left to PPO.
+        # The command is in the obs, so these frames are separable — unlike the
+        # rise-catch / push-stumble split that leaked in run rqunethx.
+        "body_slice": None,
+        # Turn-in-place frames (linear command exactly 0, |yaw command| > 0) are taken
+        # off the walk anchor: alpha_walking stands still below ~0.6 rad/s (the dead zone
+        # being trained out), and coef-1.0 BC pinned every earlier yaw fix. Separable:
+        # the command is in the obs.
+        "unanchor_turn_in_place": False,
+        "body_active_axes": (2, 3, 4),
+        "body_no_teacher_axes": (2,),
     }
 
 
@@ -96,6 +113,29 @@ def fallen_mask_from_obs(obs: torch.Tensor, gravity_slice: tuple[int, int], gate
     g = g / g.norm(dim=1, keepdim=True).clamp_min(1e-6)  # obs noise / IMU DR: renormalize
     cos_tilt = -g[:, 2]
     return cos_tilt < torch.cos(torch.deg2rad(torch.tensor(gate_tilt_deg, device=obs.device)))
+
+
+def turn_in_place_mask(obs: torch.Tensor, twist_slice: tuple[int, int], eps: float = 1e-6) -> torch.Tensor:
+    """Linear command exactly 0 and a non-zero yaw command (command obs carry no noise)."""
+    tw = obs[:, twist_slice[0]:twist_slice[1]]
+    return (tw[:, :2].abs().amax(dim=1) <= eps) & (tw[:, 2].abs() > eps)
+
+
+def body_frame_masks(
+    obs: torch.Tensor, twist_slice: tuple[int, int], body_slice: tuple[int, int],
+    active_axes: tuple[int, ...], no_teacher_axes: tuple[int, ...], eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(body frames → off the walk anchor, teach frames → stand expert). Command obs carry
+    no noise, so "twist == 0" and "axis == 0" are exact tests."""
+    standing = obs[:, twist_slice[0]:twist_slice[1]].abs().amax(dim=1) <= eps
+    body = obs[:, body_slice[0]:body_slice[1]]
+    active = body[:, list(active_axes)].abs().amax(dim=1) > eps
+    frames = standing & active
+    if no_teacher_axes:
+        frames_teach = frames & (body[:, list(no_teacher_axes)].abs().amax(dim=1) <= eps)
+    else:
+        frames_teach = frames
+    return frames, frames_teach
 
 
 def expert_input(obs: torch.Tensor, twist_slice: tuple[int, int]) -> torch.Tensor:
@@ -160,7 +200,20 @@ class PpoWithExpertBc(PPO):
         gsl = tuple(cfg["gravity_slice"])
         fallen = fallen_mask_from_obs(flat, gsl, cfg["gate_tilt_deg"])
         upright = ~fallen_mask_from_obs(flat, gsl, cfg["anchor_tilt_deg"]) if self.anchor is not None else torch.zeros_like(fallen)
-        stats = {"expert_bc_fallen_frac": fallen.float().mean().item(), "expert_bc_anchor_frac": upright.float().mean().item()}
+        body_teach = torch.zeros_like(fallen)
+        if cfg.get("body_slice") is not None:
+            body_frames, body_teach = body_frame_masks(flat, tuple(cfg["twist_slice"]), tuple(cfg["body_slice"]),
+                                                       tuple(cfg["body_active_axes"]), tuple(cfg["body_no_teacher_axes"]))
+            upright = upright & ~body_frames
+            body_teach = body_teach & ~fallen
+        turn_free = torch.zeros_like(fallen)
+        if cfg.get("unanchor_turn_in_place"):
+            turn_free = turn_in_place_mask(flat, tuple(cfg["twist_slice"]))
+            upright = upright & ~turn_free
+        stats = {"expert_bc_fallen_frac": fallen.float().mean().item(), "expert_bc_anchor_frac": upright.float().mean().item(),
+                 "expert_bc_body_teach_frac": body_teach.float().mean().item(),
+                 "expert_bc_turn_free_frac": turn_free.float().mean().item()}
+        fallen = fallen | body_teach
         if fallen.sum().item() < cfg["min_samples"]:
             fallen = torch.zeros_like(fallen)  # too few fallen frames: anchor-only pass (or nothing)
         use = fallen | upright

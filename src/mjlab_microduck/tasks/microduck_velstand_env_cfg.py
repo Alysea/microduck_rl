@@ -1,5 +1,17 @@
 """Microduck VelStand environment: walking + protective fall + recovery, one policy.
 
+CURRENT POLICY (Hub v7, 2026-10-05): wandb j4i6yoq2 @ model_1250, trained from this
+file at commit 53fb7d1 — warm-started from fhathosb@3750 with ENABLE_BODY_CONTROL.
+Lineage, launch commands and eval numbers: docs/velstand_policy.md.
+
+BODY CONTROL (2026-10, ENABLE_BODY_CONTROL): body_pose roll/pitch (± z) commanded
+only while standing (StandingGatedPoseCommand: exact zero while walking, as
+deployed). Tilt-only frames are distilled from alpha_stand, z frames left to PPO,
+both taken off the walk anchor (distill.py body routing); standing-gated tracking
+reward + command-relative upright + relaxed leg-pose stds. Roll/pitch ≈ ±8-10° for
+±10° on the robot; z (crouch) is NOT learned. ENABLE_YAW_FIX is a documented
+failed experiment (OFF) — see its comment.
+
 PROTECTIVE-FALL REBUILD (2026-09, branch protective_fall). Motivation: the real
 robots keep breaking XL330 gearboxes. The daemon's fall-detect limp (kp→50)
 helped but is imperfect, and the limp→standup hand-off produces "convulsions".
@@ -293,6 +305,65 @@ ENABLE_EXPERT_BC = True
 EXPERT_BC_COEF = 1.0
 EXPERT_BC_GATE_TILT_DEG = 35.0
 
+# Body control (2026-10, branch improve_velstand2). The deployed velstand ignores
+# body commands entirely (measured: 0 mm / 0° response — the inherited velocity
+# recipe keeps body_pose at weight 0 with ±5 mm/±0.05 alive ranges, and the walk
+# anchor pins standing to alpha_walking, which never learned it). The old pipeline's
+# alpha_stand tracks roll/pitch (9.2-9.5° for 10°) but not z (+1 cm → +3.7 mm,
+# crouch → 0). So:
+#   - command only while STANDING (StandingGatedPoseCommand: exact zero while
+#     walking = deployment), 30 % all-zero bucket so plain standing stays trained;
+#   - tilt-only frames (z == 0, BODY_Z_ZERO_PROB of them) → stand-expert BC;
+#     z frames → PPO only (alpha_stand cannot crouch); both off the walk anchor
+#     (distill.py body routing — separable: the command is in the obs);
+#   - standing-gated z/roll/pitch tracking reward + upright made command-relative
+#     (identical for walking / zero command).
+ENABLE_BODY_CONTROL = True
+BODY_NOMINAL_Z = 0.116             # measured: standing trunk z on allcollisions (fhathosb 0.1158, alpha_stand 0.1157)
+BODY_CMD_MAX_ANGLE = math.radians(12)   # ≈ alpha_stand's trained range (normalizer std 0.10 rad)
+BODY_CMD_Z_RANGE = (-0.025, 0.010)      # crouch room below HOME, ~1 cm extension above
+BODY_ALIVE_XY = 0.002              # x/y/yaw untracked: tiny ranges inside alpha_stand's normalizer
+BODY_ALIVE_YAW = 0.02
+BODY_ZERO_CMD_PROB = 0.3
+BODY_Z_ZERO_PROB = 0.5             # share of body commands that are tilt-only (→ teachable)
+BODY_TRACK_WEIGHT = 2.0
+BODY_RANGE_STAGES_ITERS = (0, 300)  # half range → full range (warm start: iters of THIS run)
+# Leg pose stds while a body command is active (standing). The standing stds (hip_roll
+# 0.05, knee/hip_pitch 0.15, ankle 0.1) priced a 10° commanded roll at -0.85/step.
+BODY_POSE_STD = {
+    r".*hip_yaw.*": 0.1,
+    r".*hip_roll.*": 0.25,
+    r".*hip_pitch.*": 0.4,
+    r".*knee.*": 0.4,
+    r".*ankle.*": 0.3,
+}
+
+# Yaw dead zone fix (2026-10-01). Robot: "still very bad at turning". j4i6yoq2@1250
+# in sim: in-place 0.3 / 0.6 rad/s → 0.00 / 0.07, 1.0 → 0.45. Counterfactual (same
+# policy fed a bigger yaw cmd so it steps + turns, reward at the TRUE cmd): standing
+# still WAS the reward optimum at 0.3 and turning won by only 4 % at 0.6 — the stock
+# yaw std 0.71 is loose at small errors and mjlab's term mixes in the roll/pitch rates
+# stepping creates. Fixes:
+#   - ADD a yaw-only fine term (std 0.35, weight 2) next to the unchanged stock term.
+#     Run sape62zb REPLACED the stock term with the sharp one instead: turning got WORSE
+#     (1.0 rad/s 0.42 → 0.16 @1500) — no gradient at the policy's 0.6 rad/s error.
+#     Additive margins: 0.6 rad/s +0.33 → +0.97/step, 1.0 +0.62 → +1.05;
+#   - turn-in-place bucket samples |wz| from 0.1 (was 0.4: in-place yaw < 0.4 never trained);
+#   - turn-in-place frames off the walk anchor (alpha_walking has this exact dead zone).
+# OFF — both runs with it LOST turning (sape62zb: replaced term; brkpcnn8: additive term;
+# in-place ±1.0 rad/s 0.39/−0.36 → ~0.2-0.3 within 250 iters, 0.3/0.6 still ≈0). Common
+# factor = the unanchored turn frames: the walk anchor is the turning floor and PPO does
+# not discover slow turning even with positive reward margins. What actually works is a
+# COMMAND REMAP: the policy turns monotonically when fed a larger yaw (fed 1.0/1.5/2.0 →
+# 0.40/0.80/1.09 rad/s in place, no falls); runtime fed = sign(c)·(0.33 + |c|/0.6) makes
+# v7 (j4i6yoq2@1250) track 0.5-1.0 rad/s in sim (see docs/velstand_policy.md). Kept OFF
+# so this file reproduces the published v7 recipe (commit 53fb7d1).
+ENABLE_YAW_FIX = False
+TRACK_YAW_FINE_STD = 0.35
+TRACK_YAW_FINE_WEIGHT = 2.0
+TURN_IN_PLACE_FRACTION_VELSTAND = 0.2    # velocity recipe: 0.15
+TURN_IN_PLACE_MIN_FRAC = 0.1             # velocity recipe: 0.4
+
 # Run-1 fix (1): smoothness taxes scaled down while fallen so get-up attempts
 # are affordable; full weight while upright (the walk's smoothness is untouched).
 FALLEN_SMOOTHNESS_SCALE = 0.1
@@ -374,6 +445,68 @@ def _collapse_curricula_to_final(cfg: ManagerBasedRlEnvCfg) -> None:
                     cfg.rewards[term.params["reward_name"]].weight = final["weight"]
 
 
+def _body_ranges(frac: float) -> tuple[tuple[float, float], ...]:
+    a = BODY_CMD_MAX_ANGLE * frac
+    return (
+        (-BODY_ALIVE_XY, BODY_ALIVE_XY),
+        (-BODY_ALIVE_XY, BODY_ALIVE_XY),
+        (BODY_CMD_Z_RANGE[0] * frac, BODY_CMD_Z_RANGE[1] * frac),
+        (-a, a),
+        (-a, a),
+        (-BODY_ALIVE_YAW, BODY_ALIVE_YAW),
+    )
+
+
+def _add_body_control(cfg: ManagerBasedRlEnvCfg, play: bool) -> None:
+    """Standing-only body pose control (see ENABLE_BODY_CONTROL). Call AFTER the
+    warm-start collapse: it replaces the inherited body_pose command/curriculum."""
+    old = cfg.commands["body_pose"]
+    cfg.commands["body_pose"] = microduck_mdp.StandingGatedPoseCommandCfg(
+        resampling_time_range=old.resampling_time_range,
+        ranges=_body_ranges(1.0 if play else 0.5),
+        zero_command_prob=BODY_ZERO_CMD_PROB,
+        axis_zero_prob=(0.0, 0.0, BODY_Z_ZERO_PROB, 0.0, 0.0, 0.0),
+        twist_command_name="twist",
+    )
+    assert list(cfg.commands).index("twist") < list(cfg.commands).index("body_pose"), "twist must be computed first"
+    cfg.curriculum.pop("body_pose_range", None)
+    if not play:
+        cfg.curriculum["body_pose_range"] = CurriculumTermCfg(
+            func=microduck_mdp.pose_command_range_curriculum,
+            params={
+                "command_name": "body_pose",
+                "range_stages": [
+                    {"step": it * NUM_STEPS_PER_ENV, "ranges": _body_ranges(f)}
+                    for it, f in zip(BODY_RANGE_STAGES_ITERS, (0.5, 1.0))
+                ],
+            },
+        )
+    cfg.rewards["body_pose_tracking"] = RewardTermCfg(
+        func=microduck_mdp.body_pose_tracking_locomotion,
+        weight=BODY_TRACK_WEIGHT,
+        params={
+            "command_name": "body_pose",
+            "nominal_height": BODY_NOMINAL_Z,
+            "z_std": 0.01,
+            "angle_std": math.radians(5),
+            "axis_weights": (0.0, 0.0, 1.0, 1.0, 1.0, 0.0),
+            "standing_gate_command_name": "twist",
+        },
+    )
+    pose = cfg.rewards["pose"]
+    cfg.rewards["pose"] = RewardTermCfg(
+        func=microduck_mdp.variable_posture_body_relaxed,
+        weight=pose.weight,
+        params={**pose.params, "std_body": BODY_POSE_STD, "body_command_name": "body_pose"},
+    )
+    up = cfg.rewards["upright"]
+    cfg.rewards["upright"] = RewardTermCfg(
+        func=microduck_mdp.upright_body_cmd_relative,
+        weight=up.weight,
+        params={"std": up.params["std"], "command_name": "body_pose", "asset_cfg": up.params["asset_cfg"]},
+    )
+
+
 def make_microduck_velstand_env_cfg(play: bool = False, rough: bool = False) -> ManagerBasedRlEnvCfg:
     # Walk layer: the PROVEN velocity recipe, verbatim.
     cfg = make_microduck_velocity_env_cfg(play=play, rough=rough)
@@ -387,6 +520,18 @@ def make_microduck_velstand_env_cfg(play: bool = False, rough: bool = False) -> 
     # BEFORE adding velstand's own (which must still ramp).
     if WARM_START and not play:
         _collapse_curricula_to_final(cfg)
+
+    if ENABLE_BODY_CONTROL:
+        _add_body_control(cfg, play)
+    if ENABLE_YAW_FIX:
+        tw = cfg.commands["twist"]
+        tw.rel_turn_in_place_envs = TURN_IN_PLACE_FRACTION_VELSTAND
+        tw.turn_in_place_min_frac = TURN_IN_PLACE_MIN_FRAC
+        cfg.rewards["track_yaw_fine"] = RewardTermCfg(
+            func=microduck_mdp.track_yaw_rate_fine,
+            weight=TRACK_YAW_FINE_WEIGHT,
+            params={"std": TRACK_YAW_FINE_STD, "command_name": cfg.rewards["track_angular_velocity"].params["command_name"]},
+        )
 
     # True full-collision model: the robot can lie on / push off any part, and
     # the servo housings are named so the impact sensor below can single them
@@ -731,7 +876,11 @@ MicroduckVelStandRlCfg = RslRlOnPolicyRunnerCfg(
         desired_kl=0.01,
         max_grad_norm=1.0,
         symmetry_cfg=None,
-        bc_cfg={**default_bc_cfg(), "coef": EXPERT_BC_COEF, "gate_tilt_deg": EXPERT_BC_GATE_TILT_DEG} if ENABLE_EXPERT_BC else None,
+        bc_cfg={
+            **default_bc_cfg(), "coef": EXPERT_BC_COEF, "gate_tilt_deg": EXPERT_BC_GATE_TILT_DEG,
+            **({"body_slice": (55, 61)} if ENABLE_BODY_CONTROL else {}),
+            **({"unanchor_turn_in_place": True} if ENABLE_YAW_FIX else {}),
+        } if ENABLE_EXPERT_BC else None,
     ),
     wandb_project="mjlab_microduck",
     experiment_name="velstand",
